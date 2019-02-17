@@ -1,3 +1,10 @@
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- | Sizes on this architecture
 -- 	A Size is a combination of width and class
 -- 
@@ -12,17 +19,18 @@
 --		properly. eg SPARC doesn't care about FF80.
 --
 module Size (
-	Size(..),
-	intSize,
-	floatSize,
-	isFloatSize,
-	cmmTypeSize,
-	sizeToWidth
+    Size(..),
+    intSize,
+    floatSize,
+    isFloatSize,
+    cmmTypeSize,
+    sizeToWidth,
+    sizeInBytes
 )
 
 where
 
-import OldCmm
+import Cmm
 import Outputable
 
 -- It looks very like the old MachRep, but it's now of purely local
@@ -99,5 +107,6 @@ sizeToWidth size
 	FF32		-> W32
 	FF64		-> W64
 	FF80		-> W80
-	
 
+sizeInBytes :: Size -> Int
+sizeInBytes = widthInBytes . sizeToWidth

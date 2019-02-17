@@ -5,6 +5,13 @@
 \section{@Vars@: Variables}
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- |
 -- #name_types#
 -- GHC uses several kinds of name internally:
@@ -32,7 +39,8 @@
 
 module Var (
         -- * The main data type and synonyms
-	Var, TyVar, CoVar, Id, DictId, DFunId, EvVar, EvId, IpId,
+        Var, CoVar, Id, DictId, DFunId, EvVar, EqVar, EvId, IpId,
+        TyVar, TypeVar, KindVar, TKVar,
 
 	-- ** Taking 'Var's apart
 	varName, varUnique, varType, 
@@ -41,44 +49,34 @@ module Var (
 	setVarName, setVarUnique, setVarType,
 
 	-- ** Constructing, taking apart, modifying 'Id's
-	mkGlobalVar, mkLocalVar, mkExportedLocalVar, 
+	mkGlobalVar, mkLocalVar, mkExportedLocalVar, mkCoVar,
 	idInfo, idDetails,
 	lazySetIdInfo, setIdDetails, globaliseId,
 	setIdExported, setIdNotExported,
 
         -- ** Predicates
-        isCoVar, isId, isTyCoVar, isTyVar, isTcTyVar,
+        isId, isTKVar, isTyVar, isTcTyVar,
         isLocalVar, isLocalId,
 	isGlobalId, isExportedId,
 	mustHaveLocalBinding,
 
 	-- ** Constructing 'TyVar's
-	mkTyVar, mkTcTyVar, mkWildCoVar,
+	mkTyVar, mkTcTyVar, mkKindVar,
 
 	-- ** Taking 'TyVar's apart
         tyVarName, tyVarKind, tcTyVarDetails, setTcTyVarDetails,
 
 	-- ** Modifying 'TyVar's
-	setTyVarName, setTyVarUnique, setTyVarKind,
-
-        -- ** Constructing 'CoVar's
-        mkCoVar,
-
-        -- ** Taking 'CoVar's apart
-        coVarName,
-
-        -- ** Modifying 'CoVar's
-        setCoVarUnique, setCoVarName
+	setTyVarName, setTyVarUnique, setTyVarKind, updateTyVarKind,
+        updateTyVarKindM
 
     ) where
 
 #include "HsVersions.h"
-#include "Typeable.h"
 
-import {-# SOURCE #-}	TypeRep( Type, Kind )
+import {-# SOURCE #-}	TypeRep( Type, Kind, SuperKind )
 import {-# SOURCE #-}	TcType( TcTyVarDetails, pprTcTyVarDetails )
-import {-# SOURCE #-}	IdInfo( IdDetails, IdInfo, pprIdDetails )
-import {-# SOURCE #-}	TypeRep( isCoercionKind )
+import {-# SOURCE #-}	IdInfo( IdDetails, IdInfo, coVarDetails, vanillaIdInfo, pprIdDetails )
 
 import Name hiding (varName)
 import Unique
@@ -100,20 +98,49 @@ import Data.Data
 -- large number of SOURCE imports of Id.hs :-(
 
 \begin{code}
-type EvVar = Var	-- An evidence variable: dictionary or equality constraint
-     	       		-- Could be an DictId or a CoVar
+type Id    = Var       -- A term-level identifier
 
-type Id     = Var       -- A term-level identifier
+type TyVar   = Var     -- Type *or* kind variable (historical)
+
+type TKVar   = Var     -- Type *or* kind variable (historical)
+type TypeVar = Var     -- Definitely a type variable
+type KindVar = Var     -- Definitely a kind variable
+     	       	       -- See Note [Kind and type variables]
+
+-- See Note [Evidence: EvIds and CoVars]
+type EvId   = Id        -- Term-level evidence: DictId, IpId, or EqVar
+type EvVar  = EvId	-- ...historical name for EvId
 type DFunId = Id	-- A dictionary function
-type EvId   = Id        -- Term-level evidence: DictId or IpId
 type DictId = EvId	-- A dictionary variable
 type IpId   = EvId      -- A term-level implicit parameter
+type EqVar  = EvId      -- Boxed equality evidence
 
-type TyVar = Var
-type CoVar = TyVar	-- A coercion variable is simply a type 
-			-- variable of kind @ty1 ~ ty2@. Hence its
-			-- 'varType' is always @PredTy (EqPred t1 t2)@
+type CoVar = Id		-- See Note [Evidence: EvIds and CoVars]
 \end{code}
+
+Note [Evidence: EvIds and CoVars]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* An EvId (evidence Id) is a *boxed*, term-level evidence variable 
+  (dictionary, implicit parameter, or equality).
+
+* A CoVar (coercion variable) is an *unboxed* term-level evidence variable
+  of type (t1 ~# t2).  So it's the unboxed version of an EqVar.
+
+* Only CoVars can occur in Coercions, EqVars appear in TcCoercions.
+
+* DictId, IpId, and EqVar are synonyms when we know what kind of
+  evidence we are talking about.  For example, an EqVar has type (t1 ~ t2).
+
+Note [Kind and type variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Before kind polymorphism, TyVar were used to mean type variables. Now
+they are use to mean kind *or* type variables. KindVar is used when we
+know for sure that it is a kind variable. In future, we might want to
+go over the whole compiler code to use:
+   - TKVar   to mean kind or type variables
+   - TypeVar to mean         type variables only
+   - KindVar to mean kind         variables
+
 
 %************************************************************************
 %*									*
@@ -131,13 +158,13 @@ in its @VarDetails@.
 -- | Essentially a typed 'Name', that may also contain some additional information
 -- about the 'Var' and it's use sites.
 data Var
-  = TyVar {
+  = TyVar {  -- Type and kind variables
+             -- see Note [Kind and type variables]
 	varName    :: !Name,
-	realUnique :: FastInt,		-- Key for fast comparison
-					-- Identical to the Unique in the name,
-					-- cached here for speed
-	varType       :: Kind,          -- ^ The type or kind of the 'Var' in question
-        isCoercionVar :: Bool
+	realUnique :: FastInt,	     -- Key for fast comparison
+				     -- Identical to the Unique in the name,
+				     -- cached here for speed
+	varType    :: Kind           -- ^ The type or kind of the 'Var' in question
  }
 
   | TcTyVar { 				-- Used only during type inference
@@ -186,20 +213,20 @@ After CoreTidy, top-level LocalIds are turned into GlobalIds
 \begin{code}
 instance Outputable Var where
   ppr var = ppr (varName var) <+> ifPprDebug (brackets (ppr_debug var))
+-- Printing the type on every occurrence is too much!
+--            <+> if (not (gopt Opt_SuppressVarKinds dflags))
+--                then ifPprDebug (text "::" <+> ppr (tyVarKind var) <+> text ")")
+--                else empty
 
 ppr_debug :: Var -> SDoc
-ppr_debug (TyVar { isCoercionVar = False })   = ptext (sLit "tv")
-ppr_debug (TyVar { isCoercionVar = True })    = ptext (sLit "co")
-ppr_debug (TcTyVar {tc_tv_details = d})       = pprTcTyVarDetails d
+ppr_debug (TyVar {})                           = ptext (sLit "tv")
+ppr_debug (TcTyVar {tc_tv_details = d})        = pprTcTyVarDetails d
 ppr_debug (Id { idScope = s, id_details = d }) = ppr_id_scope s <> pprIdDetails d
 
 ppr_id_scope :: IdScope -> SDoc
 ppr_id_scope GlobalId              = ptext (sLit "gid")
 ppr_id_scope (LocalId Exported)    = ptext (sLit "lidx")
 ppr_id_scope (LocalId NotExported) = ptext (sLit "lid")
-
-instance Show Var where
-  showsPrec p var = showsPrecSDoc p (ppr var)
 
 instance NamedThing Var where
   getName = varName
@@ -246,7 +273,7 @@ setVarType id ty = id { varType = ty }
 
 %************************************************************************
 %*									*
-\subsection{Type variables}
+\subsection{Type and kind variables}
 %*									*
 %************************************************************************
 
@@ -265,15 +292,21 @@ setTyVarName   = setVarName
 
 setTyVarKind :: TyVar -> Kind -> TyVar
 setTyVarKind tv k = tv {varType = k}
+
+updateTyVarKind :: (Kind -> Kind) -> TyVar -> TyVar
+updateTyVarKind update tv = tv {varType = update (tyVarKind tv)}
+
+updateTyVarKindM :: (Monad m) => (Kind -> m Kind) -> TyVar -> m TyVar
+updateTyVarKindM update tv
+  = do { k' <- update (tyVarKind tv)
+       ; return $ tv {varType = k'} }
 \end{code}
 
 \begin{code}
 mkTyVar :: Name -> Kind -> TyVar
-mkTyVar name kind = ASSERT( not (isCoercionKind kind ) )
-		    TyVar { varName    = name
+mkTyVar name kind = TyVar { varName    = name
 			  , realUnique = getKeyFastInt (nameUnique name)
 			  , varType  = kind
-                          , isCoercionVar    = False
 			}
 
 mkTcTyVar :: Name -> Kind -> TcTyVarDetails -> TyVar
@@ -291,36 +324,15 @@ tcTyVarDetails var = pprPanic "tcTyVarDetails" (ppr var)
 
 setTcTyVarDetails :: TyVar -> TcTyVarDetails -> TyVar
 setTcTyVarDetails tv details = tv { tc_tv_details = details }
-\end{code}
 
-%************************************************************************
-%*									*
-\subsection{Coercion variables}
-%*									*
-%************************************************************************
+mkKindVar :: Name -> SuperKind -> KindVar
+-- mkKindVar take a SuperKind as argument because we don't have access
+-- to superKind here.
+mkKindVar name kind = TyVar
+  { varName    = name
+  , realUnique = getKeyFastInt (nameUnique name)
+  , varType    = kind }
 
-\begin{code}
-coVarName :: CoVar -> Name
-coVarName = varName
-
-setCoVarUnique :: CoVar -> Unique -> CoVar
-setCoVarUnique = setVarUnique
-
-setCoVarName :: CoVar -> Name -> CoVar
-setCoVarName   = setVarName
-
-mkCoVar :: Name -> Kind -> CoVar
-mkCoVar name kind = ASSERT( isCoercionKind kind )
-		    TyVar { varName    	  = name
-			  , realUnique 	  = getKeyFastInt (nameUnique name)
-			  , varType    	  = kind
-                          , isCoercionVar = True
-			}
-
-mkWildCoVar :: Kind -> TyVar
--- ^ Create a type variable that is never referred to, so its unique doesn't 
--- matter
-mkWildCoVar = mkCoVar (mkSysTvName (mkBuiltinUnique 1) (fsLit "co_wild"))
 \end{code}
 
 %************************************************************************
@@ -339,7 +351,7 @@ idDetails (Id { id_details = details }) = details
 idDetails other 	       	        = pprPanic "idDetails" (ppr other)
 
 -- The next three have a 'Var' suffix even though they always build
--- Ids, becuase Id.lhs uses 'mkGlobalId' etc with different types
+-- Ids, because Id.lhs uses 'mkGlobalId' etc with different types
 mkGlobalVar :: IdDetails -> Name -> Type -> IdInfo -> Id
 mkGlobalVar details name ty info
   = mk_id name ty GlobalId details info
@@ -347,6 +359,10 @@ mkGlobalVar details name ty info
 mkLocalVar :: IdDetails -> Name -> Type -> IdInfo -> Id
 mkLocalVar details name ty info
   = mk_id name ty (LocalId NotExported) details  info
+
+mkCoVar :: Name -> Type -> CoVar
+-- Coercion variables have no IdInfo
+mkCoVar name ty = mk_id name ty (LocalId NotExported) coVarDetails vanillaIdInfo
 
 -- | Exported 'Var's will not be removed as dead code
 mkExportedLocalVar :: IdDetails -> Name -> Type -> IdInfo -> Id
@@ -393,19 +409,13 @@ setIdNotExported id = ASSERT( isLocalId id )
 %************************************************************************
 
 \begin{code}
-isTyCoVar :: Var -> Bool	-- True of both type and coercion variables
-isTyCoVar (TyVar {})   = True
-isTyCoVar (TcTyVar {}) = True
-isTyCoVar _            = False
+isTyVar :: Var -> Bool
+isTyVar = isTKVar     -- Historical
 
-isTyVar :: Var -> Bool		-- True of both type variables only
-isTyVar v@(TyVar {}) = not (isCoercionVar v)
-isTyVar (TcTyVar {}) = True
-isTyVar _            = False
-
-isCoVar :: Var -> Bool		-- Only works after type checking (sigh)
-isCoVar v@(TyVar {}) = isCoercionVar v
-isCoVar _            = False
+isTKVar :: Var -> Bool  -- True of both type and kind variables
+isTKVar (TyVar {})   = True
+isTKVar (TcTyVar {}) = True
+isTKVar _            = False
 
 isTcTyVar :: Var -> Bool
 isTcTyVar (TcTyVar {}) = True

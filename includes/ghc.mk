@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -33,24 +33,25 @@ includes_H_FILES := $(subst /./,/,$(includes_H_FILES))
 #
 # Options
 #
+
+includes_CC_OPTS += $(SRC_CC_OPTS)
+includes_CC_OPTS += $(SRC_CC_WARNING_OPTS)
+includes_CC_OPTS += $(CONF_CC_OPTS_STAGE1)
+
 ifeq "$(GhcUnregisterised)" "YES"
-includes_CC_OPTS += -DNO_REGS -DUSE_MINIINTERPRETER
+includes_CC_OPTS += -DUSE_MINIINTERPRETER
 endif
 
-ifeq "$(GhcEnableTablesNextToCode) $(GhcUnregisterised)" "YES NO"
-includes_CC_OPTS += -DTABLES_NEXT_TO_CODE
-endif
-
-includes_CC_OPTS += -Iincludes -Irts
+includes_CC_OPTS += $(addprefix -I,$(GHC_INCLUDE_DIRS))
+includes_CC_OPTS += -Irts
 
 ifneq "$(GhcWithSMP)" "YES"
 includes_CC_OPTS += -DNOSMP
 endif
 
-# The fptools configure script creates the configuration header file and puts it
-# in fptools/mk/config.h. We copy it down to here (without any PACKAGE_FOO
-# definitions to avoid clashes), prepending some make variables specifying cpp
-# platform variables.
+ifeq "$(DYNAMIC_BY_DEFAULT)" "YES"
+includes_CC_OPTS += -DDYNAMIC_BY_DEFAULT
+endif
 
 ifneq "$(BINDIST)" "YES"
 
@@ -62,19 +63,40 @@ $(includes_H_CONFIG) :
 
 else
 
-$(includes_H_CONFIG) : mk/config.h mk/config.mk includes/ghc.mk
+$(includes_H_CONFIG) : mk/config.h mk/config.mk includes/ghc.mk | $$(dir $$@)/.
 	@echo "Creating $@..."
 	@echo "#ifndef __GHCAUTOCONF_H__"  >$@
 	@echo "#define __GHCAUTOCONF_H__" >>$@
-#	Turn '#define PACKAGE_FOO "blah"' into '/* #undef PACKAGE_FOO */'.
+#
+#	Copy the contents of mk/config.h, turning '#define PACKAGE_FOO
+#	"blah"' into '/* #undef PACKAGE_FOO */' to avoid clashes.
+#
 	@sed 's,^\([	 ]*\)#[	 ]*define[	 ][	 ]*\(PACKAGE_[A-Z]*\)[	 ][ 	]*".*".*$$,\1/* #undef \2 */,' mk/config.h >> $@
+#
+#	Tack on some extra config information from the build system
+#
+ifeq "$(GhcEnableTablesNextToCode) $(GhcUnregisterised)" "YES NO"
+	@echo >> $@
+	@echo "#define TABLES_NEXT_TO_CODE 1" >> $@
+endif
+#
+ifeq "$(CC_LLVM_BACKEND)" "1"
+	@echo >> $@
+	@echo "#define llvm_CC_FLAVOR 1" >> $@
+endif
+#
+ifeq "$(CC_CLANG_BACKEND)" "1"
+	@echo >> $@
+	@echo "#define clang_CC_FLAVOR 1" >> $@
+endif
+#
 	@echo "#endif /* __GHCAUTOCONF_H__ */"          >> $@
 	@echo "Done."
 
 endif
 
-$(includes_H_PLATFORM) : includes/Makefile
-	"$(RM)" $(RM_OPTS) $@
+$(includes_H_PLATFORM) : includes/Makefile | $$(dir $$@)/.
+	$(call removeFiles,$@)
 	@echo "Creating $@..."
 	@echo "#ifndef __GHCPLATFORM_H__"  >$@
 	@echo "#define __GHCPLATFORM_H__" >>$@
@@ -105,7 +127,7 @@ endif
 	@echo "#define BUILD_VENDOR  \"$(HostVendor_CPP)\"" >> $@
 	@echo "#define HOST_VENDOR  \"$(TargetVendor_CPP)\"" >> $@
 	@echo >> $@
-	@echo "/* These TARGET macros are for backwards compatibily... DO NOT USE! */" >> $@
+	@echo "/* These TARGET macros are for backwards compatibility... DO NOT USE! */" >> $@
 	@echo "#define TargetPlatform_TYPE $(TargetPlatform_CPP)" >> $@
 	@echo "#define $(TargetPlatform_CPP)_TARGET  1" >> $@
 	@echo "#define $(TargetArch_CPP)_TARGET_ARCH  1" >> $@
@@ -113,6 +135,9 @@ endif
 	@echo "#define $(TargetOS_CPP)_TARGET_OS  1" >> $@  
 	@echo "#define TARGET_OS  \"$(TargetOS_CPP)\"" >> $@
 	@echo "#define $(TargetVendor_CPP)_TARGET_VENDOR  1" >> $@
+ifeq "$(GhcUnregisterised)" "YES"
+	@echo "#define UnregisterisedCompiler 1" >> $@
+endif
 	@echo >> $@
 	@echo "#endif /* __GHCPLATFORM_H__ */"          >> $@
 	@echo "Done."
@@ -122,71 +147,51 @@ endif
 # ---------------------------------------------------------------------------
 # Make DerivedConstants.h for the compiler
 
-includes_DERIVEDCONSTANTS = includes/DerivedConstants.h
+includes_DERIVEDCONSTANTS = includes/dist-derivedconstants/header/DerivedConstants.h
+includes_GHCCONSTANTS_HASKELL_TYPE = includes/dist-derivedconstants/header/GHCConstantsHaskellType.hs
+includes_GHCCONSTANTS_HASKELL_VALUE = includes/dist-derivedconstants/header/platformConstants
+includes_GHCCONSTANTS_HASKELL_WRAPPERS = includes/dist-derivedconstants/header/GHCConstantsHaskellWrappers.hs
+includes_GHCCONSTANTS_HASKELL_EXPORTS = includes/dist-derivedconstants/header/GHCConstantsHaskellExports.hs
 
-ifeq "$(PORTING_HOST)" "YES"
+INSTALL_LIBS += $(includes_GHCCONSTANTS_HASKELL_VALUE)
 
-DerivedConstants.h :
-	@echo "*** Cross-compiling: please copy DerivedConstants.h from the target system"
-	@exit 1
-
-else
-
-includes_dist-derivedconstants_C_SRCS = mkDerivedConstants.c
-includes_dist-derivedconstants_PROG   = mkDerivedConstants$(exeext)
-
-$(eval $(call build-prog,includes,dist-derivedconstants,0))
-
-$(includes_dist-derivedconstants_depfile_c_asm) : $(includes_H_CONFIG) $(includes_H_PLATFORM) $(includes_H_FILES) $$(rts_H_FILES)
-includes/dist-derivedconstants/build/mkDerivedConstants.o : $(includes_H_CONFIG) $(includes_H_PLATFORM)
+DERIVE_CONSTANTS_FLAGS += --gcc-program "$(WhatGccIsCalled)"
+DERIVE_CONSTANTS_FLAGS += $(addprefix --gcc-flag$(space),$(includes_CC_OPTS) -fcommon)
+DERIVE_CONSTANTS_FLAGS += --nm-program "$(NM)"
 
 ifneq "$(BINDIST)" "YES"
-$(includes_DERIVEDCONSTANTS) : $(INPLACE_BIN)/mkDerivedConstants$(exeext)
-	./$< >$@
-endif
+$(includes_DERIVEDCONSTANTS):           $$(includes_H_CONFIG) $$(includes_H_PLATFORM) $$(includes_H_FILES) $$(rts_H_FILES)
+$(includes_GHCCONSTANTS_HASKELL_VALUE): $$(includes_H_CONFIG) $$(includes_H_PLATFORM) $$(includes_H_FILES) $$(rts_H_FILES)
 
-endif
+$(includes_DERIVEDCONSTANTS): $(deriveConstants_INPLACE) | $$(dir $$@)/.
+	$< --gen-header -o $@ --tmpdir $(dir $@) $(DERIVE_CONSTANTS_FLAGS)
 
-# -----------------------------------------------------------------------------
-#
+$(includes_GHCCONSTANTS_HASKELL_TYPE): $(deriveConstants_INPLACE) | $$(dir $$@)/.
+	$< --gen-haskell-type -o $@ --tmpdir $(dir $@) $(DERIVE_CONSTANTS_FLAGS)
 
-includes_GHCCONSTANTS = includes/GHCConstants.h
+$(includes_GHCCONSTANTS_HASKELL_VALUE): $(deriveConstants_INPLACE) | $$(dir $$@)/.
+	$< --gen-haskell-value -o $@ --tmpdir $(dir $@) $(DERIVE_CONSTANTS_FLAGS)
 
-ifeq "$(PORTING_HOST)" "YES"
+$(includes_GHCCONSTANTS_HASKELL_WRAPPERS): $(deriveConstants_INPLACE) | $$(dir $$@)/.
+	$< --gen-haskell-wrappers -o $@ --tmpdir $(dir $@) $(DERIVE_CONSTANTS_FLAGS)
 
-$(includes_GHCCONSTANTS) :
-	@echo "*** Cross-compiling: please copy DerivedConstants.h from the target system"
-	@exit 1
-
-else
-
-includes_dist-ghcconstants_C_SRCS = mkDerivedConstants.c
-includes_dist-ghcconstants_PROG   = mkGHCConstants$(exeext)
-includes_dist-ghcconstants_CC_OPTS = -DGEN_HASKELL
-
-$(eval $(call build-prog,includes,dist-ghcconstants,0))
-
-ifneq "$(BINDIST)" "YES"
-$(includes_dist-ghcconstants_depfile_c_asm) : $(includes_H_CONFIG) $(includes_H_PLATFORM) $(includes_H_FILES) $$(rts_H_FILES)
-
-includes/dist-ghcconstants/build/mkDerivedConstants.o : $(includes_H_CONFIG) $(includes_H_PLATFORM)
-
-$(includes_GHCCONSTANTS) : $(INPLACE_BIN)/mkGHCConstants$(exeext)
-	./$< >$@
-endif
-
+$(includes_GHCCONSTANTS_HASKELL_EXPORTS): $(deriveConstants_INPLACE) | $$(dir $$@)/.
+	$< --gen-haskell-exports -o $@ --tmpdir $(dir $@) $(DERIVE_CONSTANTS_FLAGS)
 endif
 
 # ---------------------------------------------------------------------------
 # Install all header files
 
 $(eval $(call clean-target,includes,,\
-  $(includes_H_CONFIG) $(includes_H_PLATFORM) \
-  $(includes_GHCCONSTANTS) $(includes_DERIVEDCONSTANTS)))
+  $(includes_H_CONFIG) $(includes_H_PLATFORM)))
 
-$(eval $(call all-target,includes,,\
+$(eval $(call all-target,includes,\
   $(includes_H_CONFIG) $(includes_H_PLATFORM) \
-  $(includes_GHCCONSTANTS) $(includes_DERIVEDCONSTANTS)))
+  $(includes_GHCCONSTANTS_HASKELL_TYPE) \
+  $(includes_GHCCONSTANTS_HASKELL_VALUE) \
+  $(includes_GHCCONSTANTS_HASKELL_WRAPPERS) \
+  $(includes_GHCCONSTANTS_HASKELL_EXPORTS) \
+  $(includes_DERIVEDCONSTANTS)))
 
 install: install_includes
 
@@ -197,5 +202,5 @@ install_includes :
 	    $(call INSTALL_DIR,"$(DESTDIR)$(ghcheaderdir)/$d") && \
 	    $(call INSTALL_HEADER,$(INSTALL_OPTS),includes/$d/*.h,"$(DESTDIR)$(ghcheaderdir)/$d/") && \
 	) true
-	$(call INSTALL_HEADER,$(INSTALL_OPTS),$(includes_H_CONFIG) $(includes_H_PLATFORM),"$(DESTDIR)$(ghcheaderdir)/")
+	$(call INSTALL_HEADER,$(INSTALL_OPTS),$(includes_H_CONFIG) $(includes_H_PLATFORM) $(includes_DERIVEDCONSTANTS),"$(DESTDIR)$(ghcheaderdir)/")
 

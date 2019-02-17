@@ -1,113 +1,94 @@
-%
+ | %
 % (c) The University of Glasgow 2006
 % (c) The GRASP/AQUA Project, Glasgow University, 1998
 %
 \section[TypeRep]{Type - friends' interface}
 
+Note [The Type-related module hierarchy]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  Class
+  TyCon    imports Class
+  TypeRep 
+  TysPrim  imports TypeRep ( including mkTyConTy )
+  Kind     imports TysPrim ( mainly for primitive kinds )
+  Type     imports Kind
+  Coercion imports Type
+
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- We expose the relevant stuff from this module via the Type module
 {-# OPTIONS_HADDOCK hide #-}
-{-# LANGUAGE DeriveDataTypeable #-}
-
+{-# LANGUAGE DeriveDataTypeable, DeriveFunctor, DeriveFoldable, DeriveTraversable #-}
 module TypeRep (
-	TyThing(..), 
+	TyThing(..),
 	Type(..),
-	PredType(..),	 		-- to friends
-	
- 	Kind, ThetaType,		-- Synonyms
+        TyLit(..),
+        KindOrType, Kind, SuperKind,
+        PredType, ThetaType,      -- Synonyms
 
-	funTyCon, funTyConName,
-
-	-- Pretty-printing
-	pprType, pprParendType, pprTypeApp,
-	pprTyThing, pprTyThingCategory, 
-	pprPred, pprEqPred, pprTheta, pprForAll, pprThetaArrow, pprClassPred,
-
-	-- Kinds
-	liftedTypeKind, unliftedTypeKind, openTypeKind,
-        argTypeKind, ubxTupleKind,
-	isLiftedTypeKindCon, isLiftedTypeKind,
-	mkArrowKind, mkArrowKinds, isCoercionKind,
-  	coVarPred,
-
-        -- Kind constructors...
-        liftedTypeKindTyCon, openTypeKindTyCon, unliftedTypeKindTyCon,
-        argTypeKindTyCon, ubxTupleKindTyCon,
-
-        -- And their names
-        unliftedTypeKindTyConName, openTypeKindTyConName,
-        ubxTupleKindTyConName, argTypeKindTyConName,
-        liftedTypeKindTyConName,
-
-        -- Super Kinds
-	tySuperKind, coSuperKind,
-        isTySuperKind, isCoSuperKind,
-	tySuperKindTyCon, coSuperKindTyCon,
+        -- Functions over types
+        mkTyConTy, mkTyVarTy, mkTyVarTys,
+        isLiftedTypeKind, isSuperKind, isTypeVar, isKindVar,
         
-	pprKind, pprParendKind
+        -- Pretty-printing
+	pprType, pprParendType, pprTypeApp, pprTvBndr, pprTvBndrs,
+	pprTyThing, pprTyThingCategory, pprSigmaType,
+	pprEqPred, pprTheta, pprForAll, pprThetaArrowTy, pprClassPred,
+        pprKind, pprParendKind, pprTyLit, suppressKinds,
+	Prec(..), maybeParen, pprTcApp, 
+        pprPrefixApp, pprArrowChain, ppr_type,
+
+        -- Free variables
+        tyVarsOfType, tyVarsOfTypes, closeOverKinds, varSetElemsKvsFirst,
+
+        -- * Tidying type related things up for printing
+        tidyType,      tidyTypes,
+        tidyOpenType,  tidyOpenTypes,
+        tidyOpenKind,
+        tidyTyVarBndr, tidyTyVarBndrs, tidyFreeTyVars,
+        tidyOpenTyVar, tidyOpenTyVars,
+        tidyTyVarOcc,
+        tidyTopType,
+        tidyKind, 
+
+        -- Substitutions
+        TvSubst(..), TvSubstEnv
     ) where
 
 #include "HsVersions.h"
 
-import {-# SOURCE #-} DataCon( DataCon, dataConName )
+import {-# SOURCE #-} DataCon( dataConTyCon )
+import ConLike ( ConLike(..) )
+import {-# SOURCE #-} Type( noParenPred, isPredTy ) -- Transitively pulls in a LOT of stuff, better to break the loop
 
 -- friends:
 import Var
+import VarEnv
+import VarSet
 import Name
 import BasicTypes
 import TyCon
 import Class
+import CoAxiom
 
 -- others
 import PrelNames
 import Outputable
 import FastString
+import Pair
+import Util
+import DynFlags
 
 -- libraries
-import Data.Data hiding ( TyCon )
+import Data.List( mapAccumL, partition )
+import qualified Data.Data        as Data hiding ( TyCon )
 \end{code}
-
-	----------------------
-	A note about newtypes
-	----------------------
-
-Consider
-	newtype N = MkN Int
-
-Then we want N to be represented as an Int, and that's what we arrange.
-The front end of the compiler [TcType.lhs] treats N as opaque, 
-the back end treats it as transparent [Type.lhs].
-
-There's a bit of a problem with recursive newtypes
-	newtype P = MkP P
-	newtype Q = MkQ (Q->Q)
-
-Here the 'implicit expansion' we get from treating P and Q as transparent
-would give rise to infinite types, which in turn makes eqType diverge.
-Similarly splitForAllTys and splitFunTys can get into a loop.  
-
-Solution: 
-
-* Newtypes are always represented using TyConApp.
-
-* For non-recursive newtypes, P, treat P just like a type synonym after 
-  type-checking is done; i.e. it's opaque during type checking (functions
-  from TcType) but transparent afterwards (functions from Type).  
-  "Treat P as a type synonym" means "all functions expand NewTcApps 
-  on the fly".
-
-  Applications of the data constructor P simply vanish:
-	P x = x
-  
-
-* For recursive newtypes Q, treat the Q and its representation as 
-  distinct right through the compiler.  Applications of the data consructor
-  use a coerce:
-	Q = \(x::Q->Q). coerce Q x
-  They are rare, so who cares if they are a tiny bit less efficient.
-
-The typechecker (TcTyDecls) identifies enough type construtors as 'recursive'
-to cut all loops.  The other members of the loop may be marked 'non-recursive'.
 
 
 %************************************************************************
@@ -119,47 +100,60 @@ to cut all loops.  The other members of the loop may be marked 'non-recursive'.
 
 \begin{code}
 -- | The key representation of types within the compiler
-data Type
-  = TyVarTy TyVar	-- ^ Vanilla type variable
 
-  | AppTy
+-- If you edit this type, you may need to update the GHC formalism
+-- See Note [GHC Formalism] in coreSyn/CoreLint.lhs
+data Type
+  = TyVarTy Var	-- ^ Vanilla type or kind variable (*never* a coercion variable)
+
+  | AppTy         -- See Note [AppTy invariant]
 	Type
 	Type		-- ^ Type application to something other than a 'TyCon'. Parameters:
 	                --
-	                --  1) Function: must /not/ be a 'TyConApp', must be another 'AppTy', or 'TyVarTy'
+                        --  1) Function: must /not/ be a 'TyConApp',
+                        --     must be another 'AppTy', or 'TyVarTy'
 	                --
 	                --  2) Argument type
 
-  | TyConApp
+  | TyConApp      -- See Note [AppTy invariant]
 	TyCon
-	[Type]		-- ^ Application of a 'TyCon', including newtypes /and/ synonyms.
+	[KindOrType]	-- ^ Application of a 'TyCon', including newtypes /and/ synonyms.
 	                -- Invariant: saturated appliations of 'FunTyCon' must
 	                -- use 'FunTy' and saturated synonyms must use their own
-	                -- constructors. However, /unsaturated/ 'FunTyCon's do appear as 'TyConApp's.
+                        -- constructors. However, /unsaturated/ 'FunTyCon's
+                        -- do appear as 'TyConApp's.
 	                -- Parameters:
 	                --
 	                -- 1) Type constructor being applied to.
 	                --
-	                -- 2) Type arguments. Might not have enough type arguments here to saturate the constructor.
-	                -- Even type synonyms are not necessarily saturated; for example unsaturated type synonyms
-	                -- can appear as the right hand side of a type synonym.
+                        -- 2) Type arguments. Might not have enough type arguments
+                        --    here to saturate the constructor.
+                        --    Even type synonyms are not necessarily saturated;
+                        --    for example unsaturated type synonyms
+	                --    can appear as the right hand side of a type synonym.
 
   | FunTy
-	Type
+	Type		
 	Type		-- ^ Special case of 'TyConApp': @TyConApp FunTyCon [t1, t2]@
+			-- See Note [Equality-constrained types]
 
   | ForAllTy
-	TyVar
+	Var         -- Type or kind variable
 	Type	        -- ^ A polymorphic type
 
-  | PredTy
-	PredType	-- ^ The type of evidence for a type predictate.
-                        -- Note that a @PredTy (EqPred _ _)@ can appear only as the kind
-	                -- of a coercion variable; never as the argument or result
-	                -- of a 'FunTy' (unlike the 'PredType' constructors 'ClassP' or 'IParam')
-	                
-	                -- See Note [PredTy], and Note [Equality predicates]
-  deriving (Data, Typeable)
+  | LitTy TyLit     -- ^ Type literals are similar to type constructors.
+
+  deriving (Data.Data, Data.Typeable)
+
+
+-- NOTE:  Other parts of the code assume that type literals do not contain
+-- types or type variables.
+data TyLit
+  = NumTyLit Integer
+  | StrTyLit FastString
+  deriving (Eq, Ord, Data.Data, Data.Typeable)
+
+type KindOrType = Type -- See Note [Arguments to type constructors]
 
 -- | The key type representing kinds in the compiler.
 -- Invariant: a kind is always in one of these forms:
@@ -177,13 +171,69 @@ type Kind = Type
 type SuperKind = Type
 \end{code}
 
+Note [The kind invariant]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+The kinds
+   #          UnliftedTypeKind
+   OpenKind   super-kind of *, #
+
+can never appear under an arrow or type constructor in a kind; they
+can only be at the top level of a kind.  It follows that primitive TyCons,
+which have a naughty pseudo-kind
+   State# :: * -> #
+must always be saturated, so that we can never get a type whose kind
+has a UnliftedTypeKind or ArgTypeKind underneath an arrow.
+
+Nor can we abstract over a type variable with any of these kinds.
+
+    k :: = kk | # | ArgKind | (#) | OpenKind 
+    kk :: = * | kk -> kk | T kk1 ... kkn
+
+So a type variable can only be abstracted kk.
+
+Note [Arguments to type constructors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Because of kind polymorphism, in addition to type application we now
+have kind instantiation. We reuse the same notations to do so.
+
+For example:
+
+  Just (* -> *) Maybe
+  Right * Nat Zero
+
+are represented by:
+
+  TyConApp (PromotedDataCon Just) [* -> *, Maybe]
+  TyConApp (PromotedDataCon Right) [*, Nat, (PromotedDataCon Zero)]
+
+Important note: Nat is used as a *kind* and not as a type. This can be
+confusing, since type-level Nat and kind-level Nat are identical. We
+use the kind of (PromotedDataCon Right) to know if its arguments are
+kinds or types.
+
+This kind instantiation only happens in TyConApp currently.
+
+
+Note [Equality-constrained types]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+The type   forall ab. (a ~ [b]) => blah
+is encoded like this:
+
+   ForAllTy (a:*) $ ForAllTy (b:*) $
+   FunTy (TyConApp (~) [a, [b]]) $
+   blah
+
 -------------------------------------
  		Note [PredTy]
 
 \begin{code}
--- | A type of the form @PredTy p@ represents a value whose type is
+-- | A type of the form @p@ of kind @Constraint@ represents a value whose type is
 -- the Haskell predicate @p@, where a predicate is what occurs before 
 -- the @=>@ in a Haskell type.
+--
+-- We use 'PredType' as documentation to mark those types that we guarantee to have
+-- this kind.
+--
 -- It can be expanded into its representation, but: 
 --
 -- * The type checker must treat it as opaque
@@ -197,11 +247,7 @@ type SuperKind = Type
 -- > h :: (r\l) => {r} => {l::Int | r}
 --
 -- Here the @Eq a@ and @?x :: Int -> Int@ and @r\l@ are all called \"predicates\"
-data PredType 
-  = ClassP Class [Type]		-- ^ Class predicate e.g. @Eq a@
-  | IParam (IPName Name) Type	-- ^ Implicit parameter e.g. @?x :: Int@
-  | EqPred Type Type		-- ^ Equality predicate e.g @ty1 ~ ty2@
-  deriving (Data, Typeable)
+type PredType = Type
 
 -- | A collection of 'PredType's
 type ThetaType = [PredType]
@@ -213,30 +259,90 @@ to expand to allow them.)
 A Haskell qualified type, such as that for f,g,h above, is
 represented using 
 	* a FunTy for the double arrow
-	* with a PredTy as the function argument
+	* with a type of kind Constraint as the function argument
 
 The predicate really does turn into a real extra argument to the
-function.  If the argument has type (PredTy p) then the predicate p is
-represented by evidence (a dictionary, for example, of type (predRepTy p).
+function.  If the argument has type (p :: Constraint) then the predicate p is
+represented by evidence of type p.
 
-Note [Equality predicates]
-~~~~~~~~~~~~~~~~~~~~~~~~~~
-	forall a b. (a ~ S b) => a -> b
-could be represented by
-	ForAllTy a (ForAllTy b (FunTy (PredTy (EqPred a (S b))) ...))
-OR
-	ForAllTy a (ForAllTy b (ForAllTy (c::PredTy (EqPred a (S b))) ...))
+%************************************************************************
+%*									*
+            Simple constructors
+%*									*
+%************************************************************************
 
-The latter is what we do.  (Unlike for class and implicit parameter
-constraints, which do use FunTy.)
+These functions are here so that they can be used by TysPrim,
+which in turn is imported by Type
 
-Reason:
-	* FunTy is always a *value* function
-	* ForAllTy is discarded at runtime
+\begin{code}
+mkTyVarTy  :: TyVar   -> Type
+mkTyVarTy  = TyVarTy
 
-We often need to make a "wildcard" (c::PredTy..).  We always use the same
-name (wildCoVarName), since it's not mentioned.
+mkTyVarTys :: [TyVar] -> [Type]
+mkTyVarTys = map mkTyVarTy -- a common use of mkTyVarTy
 
+-- | Create the plain type constructor type which has been applied to no type arguments at all.
+mkTyConTy :: TyCon -> Type
+mkTyConTy tycon = TyConApp tycon []
+\end{code}
+
+Some basic functions, put here to break loops eg with the pretty printer
+
+\begin{code}
+isLiftedTypeKind :: Kind -> Bool
+isLiftedTypeKind (TyConApp tc []) = tc `hasKey` liftedTypeKindTyConKey
+isLiftedTypeKind _                = False
+
+-- | Is this a super-kind (i.e. a type-of-kinds)?
+isSuperKind :: Type -> Bool
+isSuperKind (TyConApp skc []) = skc `hasKey` superKindTyConKey
+isSuperKind _                 = False
+
+isTypeVar :: Var -> Bool
+isTypeVar v = isTKVar v && not (isSuperKind (varType v))
+
+isKindVar :: Var -> Bool 
+isKindVar v = isTKVar v && isSuperKind (varType v)
+\end{code}
+
+
+%************************************************************************
+%*									*
+			Free variables of types and coercions
+%*									*
+%************************************************************************
+
+\begin{code}
+tyVarsOfType :: Type -> VarSet
+-- ^ NB: for type synonyms tyVarsOfType does /not/ expand the synonym
+-- tyVarsOfType returns only the free variables of a type
+-- For example, tyVarsOfType (a::k) returns {a}, not including the
+-- kind variable {k}
+tyVarsOfType (TyVarTy v)         = unitVarSet v
+tyVarsOfType (TyConApp _ tys)    = tyVarsOfTypes tys
+tyVarsOfType (LitTy {})          = emptyVarSet
+tyVarsOfType (FunTy arg res)     = tyVarsOfType arg `unionVarSet` tyVarsOfType res
+tyVarsOfType (AppTy fun arg)     = tyVarsOfType fun `unionVarSet` tyVarsOfType arg
+tyVarsOfType (ForAllTy tyvar ty) = delVarSet (tyVarsOfType ty) tyvar
+                                   `unionVarSet` tyVarsOfType (tyVarKind tyvar)
+
+tyVarsOfTypes :: [Type] -> TyVarSet
+tyVarsOfTypes tys = foldr (unionVarSet . tyVarsOfType) emptyVarSet tys
+
+closeOverKinds :: TyVarSet -> TyVarSet
+-- Add the kind variables free in the kinds
+-- of the tyvars in the given set
+closeOverKinds tvs
+  = foldVarSet (\tv ktvs -> tyVarsOfType (tyVarKind tv) `unionVarSet` ktvs) 
+               tvs tvs
+
+varSetElemsKvsFirst :: VarSet -> [TyVar]
+-- {k1,a,k2,b} --> [k1,k2,a,b]
+varSetElemsKvsFirst set
+  = kvs ++ tvs
+  where
+    (kvs, tvs) = partition isKindVar (varSetElems set)
+\end{code}
 
 %************************************************************************
 %*									*
@@ -248,12 +354,22 @@ Despite the fact that DataCon has to be imported via a hi-boot route,
 this module seems the right place for TyThing, because it's needed for
 funTyCon and all the types in TysPrim.
 
+Note [ATyCon for classes]
+~~~~~~~~~~~~~~~~~~~~~~~~~
+Both classes and type constructors are represented in the type environment
+as ATyCon.  You can tell the difference, and get to the class, with
+   isClassTyCon :: TyCon -> Bool
+   tyConClass_maybe :: TyCon -> Maybe Class
+The Class and its associated TyCon have the same Name.
+
 \begin{code}
 -- | A typecheckable-thing, essentially anything that has a name
-data TyThing = AnId     Id
-	     | ADataCon DataCon
-	     | ATyCon   TyCon
-	     | AClass   Class
+data TyThing 
+  = AnId     Id
+  | AConLike ConLike
+  | ATyCon   TyCon       -- TyCons and classes; see Note [ATyCon for classes]
+  | ACoAxiom (CoAxiom Branched)
+  deriving (Eq, Ord)
 
 instance Outputable TyThing where 
   ppr = pprTyThing
@@ -262,146 +378,112 @@ pprTyThing :: TyThing -> SDoc
 pprTyThing thing = pprTyThingCategory thing <+> quotes (ppr (getName thing))
 
 pprTyThingCategory :: TyThing -> SDoc
-pprTyThingCategory (ATyCon _) 	= ptext (sLit "Type constructor")
-pprTyThingCategory (AClass _)   = ptext (sLit "Class")
+pprTyThingCategory (ATyCon tc)
+  | isClassTyCon tc = ptext (sLit "Class")
+  | otherwise       = ptext (sLit "Type constructor")
+pprTyThingCategory (ACoAxiom _) = ptext (sLit "Coercion axiom")
 pprTyThingCategory (AnId   _)   = ptext (sLit "Identifier")
-pprTyThingCategory (ADataCon _) = ptext (sLit "Data constructor")
+pprTyThingCategory (AConLike (RealDataCon _)) = ptext (sLit "Data constructor")
+pprTyThingCategory (AConLike (PatSynCon _))  = ptext (sLit "Pattern synonym")
+
 
 instance NamedThing TyThing where	-- Can't put this with the type
   getName (AnId id)     = getName id	-- decl, because the DataCon instance
   getName (ATyCon tc)   = getName tc	-- isn't visible there
-  getName (AClass cl)   = getName cl
-  getName (ADataCon dc) = dataConName dc
+  getName (ACoAxiom cc) = getName cc
+  getName (AConLike cl) = getName cl
+
 \end{code}
 
 
 %************************************************************************
 %*									*
-		Wired-in type constructors
+			Substitutions
+      Data type defined here to avoid unnecessary mutual recursion
 %*									*
 %************************************************************************
-
-We define a few wired-in type constructors here to avoid module knots
 
 \begin{code}
---------------------------
--- First the TyCons...
+-- | Type substitution
+--
+-- #tvsubst_invariant#
+-- The following invariants must hold of a 'TvSubst':
+-- 
+-- 1. The in-scope set is needed /only/ to
+-- guide the generation of fresh uniques
+--
+-- 2. In particular, the /kind/ of the type variables in 
+-- the in-scope set is not relevant
+--
+-- 3. The substition is only applied ONCE! This is because
+-- in general such application will not reached a fixed point.
+data TvSubst 		
+  = TvSubst InScopeSet 	-- The in-scope type and kind variables
+	    TvSubstEnv  -- Substitutes both type and kind variables
+	-- See Note [Apply Once]
+	-- and Note [Extending the TvSubstEnv]
 
--- | See "Type#kind_subtyping" for details of the distinction between the 'Kind' 'TyCon's
-funTyCon, tySuperKindTyCon, coSuperKindTyCon, liftedTypeKindTyCon,
-      openTypeKindTyCon, unliftedTypeKindTyCon,
-      ubxTupleKindTyCon, argTypeKindTyCon
-   :: TyCon
-funTyConName, tySuperKindTyConName, coSuperKindTyConName, liftedTypeKindTyConName,
-      openTypeKindTyConName, unliftedTypeKindTyConName,
-      ubxTupleKindTyConName, argTypeKindTyConName
-   :: Name
-
-funTyCon = mkFunTyCon funTyConName (mkArrowKinds [argTypeKind, openTypeKind] liftedTypeKind)
-	-- You might think that (->) should have type (?? -> ? -> *), and you'd be right
-	-- But if we do that we get kind errors when saying
-	--	instance Control.Arrow (->)
-	-- becuase the expected kind is (*->*->*).  The trouble is that the
-	-- expected/actual stuff in the unifier does not go contra-variant, whereas
-	-- the kind sub-typing does.  Sigh.  It really only matters if you use (->) in
-	-- a prefix way, thus:  (->) Int# Int#.  And this is unusual.
-
-
-tySuperKindTyCon     = mkSuperKindTyCon tySuperKindTyConName
-coSuperKindTyCon     = mkSuperKindTyCon coSuperKindTyConName
-
-liftedTypeKindTyCon   = mkKindTyCon liftedTypeKindTyConName   tySuperKind
-openTypeKindTyCon     = mkKindTyCon openTypeKindTyConName     tySuperKind
-unliftedTypeKindTyCon = mkKindTyCon unliftedTypeKindTyConName tySuperKind
-ubxTupleKindTyCon     = mkKindTyCon ubxTupleKindTyConName     tySuperKind
-argTypeKindTyCon      = mkKindTyCon argTypeKindTyConName      tySuperKind
-
---------------------------
--- ... and now their names
-
-tySuperKindTyConName      = mkPrimTyConName (fsLit "BOX") tySuperKindTyConKey tySuperKindTyCon
-coSuperKindTyConName      = mkPrimTyConName (fsLit "COERCION") coSuperKindTyConKey coSuperKindTyCon
-liftedTypeKindTyConName   = mkPrimTyConName (fsLit "*") liftedTypeKindTyConKey liftedTypeKindTyCon
-openTypeKindTyConName     = mkPrimTyConName (fsLit "?") openTypeKindTyConKey openTypeKindTyCon
-unliftedTypeKindTyConName = mkPrimTyConName (fsLit "#") unliftedTypeKindTyConKey unliftedTypeKindTyCon
-ubxTupleKindTyConName     = mkPrimTyConName (fsLit "(#)") ubxTupleKindTyConKey ubxTupleKindTyCon
-argTypeKindTyConName      = mkPrimTyConName (fsLit "??") argTypeKindTyConKey argTypeKindTyCon
-funTyConName              = mkPrimTyConName (fsLit "(->)") funTyConKey funTyCon
-
-mkPrimTyConName :: FastString -> Unique -> TyCon -> Name
-mkPrimTyConName occ key tycon = mkWiredInName gHC_PRIM (mkTcOccFS occ) 
-					      key 
-					      (ATyCon tycon)
-					      BuiltInSyntax
-	-- All of the super kinds and kinds are defined in Prim and use BuiltInSyntax,
-	-- because they are never in scope in the source
-
-------------------
--- We also need Kinds and SuperKinds, locally and in TyCon
-
-kindTyConType :: TyCon -> Type
-kindTyConType kind = TyConApp kind []
-
--- | See "Type#kind_subtyping" for details of the distinction between these 'Kind's
-liftedTypeKind, unliftedTypeKind, openTypeKind, argTypeKind, ubxTupleKind :: Kind
-
-liftedTypeKind   = kindTyConType liftedTypeKindTyCon
-unliftedTypeKind = kindTyConType unliftedTypeKindTyCon
-openTypeKind     = kindTyConType openTypeKindTyCon
-argTypeKind      = kindTyConType argTypeKindTyCon
-ubxTupleKind	 = kindTyConType ubxTupleKindTyCon
-
--- | Given two kinds @k1@ and @k2@, creates the 'Kind' @k1 -> k2@
-mkArrowKind :: Kind -> Kind -> Kind
-mkArrowKind k1 k2 = FunTy k1 k2
-
--- | Iterated application of 'mkArrowKind'
-mkArrowKinds :: [Kind] -> Kind -> Kind
-mkArrowKinds arg_kinds result_kind = foldr mkArrowKind result_kind arg_kinds
-
-tySuperKind, coSuperKind :: SuperKind
-tySuperKind = kindTyConType tySuperKindTyCon 
-coSuperKind = kindTyConType coSuperKindTyCon 
-
-isTySuperKind :: SuperKind -> Bool
-isTySuperKind (TyConApp kc []) = kc `hasKey` tySuperKindTyConKey
-isTySuperKind _                = False
-
-isCoSuperKind :: SuperKind -> Bool
-isCoSuperKind (TyConApp kc []) = kc `hasKey` coSuperKindTyConKey
-isCoSuperKind _                = False
-
--------------------
--- Lastly we need a few functions on Kinds
-
-isLiftedTypeKindCon :: TyCon -> Bool
-isLiftedTypeKindCon tc    = tc `hasKey` liftedTypeKindTyConKey
-
-isLiftedTypeKind :: Kind -> Bool
-isLiftedTypeKind (TyConApp tc []) = isLiftedTypeKindCon tc
-isLiftedTypeKind _                = False
-
-isCoercionKind :: Kind -> Bool
--- All coercions are of form (ty1 ~ ty2)
--- This function is here rather than in Coercion, 
--- because it's used in a knot-tied way to enforce invariants in Var
-isCoercionKind (PredTy (EqPred {})) = True
-isCoercionKind _                    = False
-
-coVarPred :: CoVar -> PredType
-coVarPred tv
-  = ASSERT( isCoVar tv )
-    case tyVarKind tv of
-	PredTy eq -> eq
-	other	  -> pprPanic "coVarPred" (ppr tv $$ ppr other)
+-- | A substitition of 'Type's for 'TyVar's
+--                 and 'Kind's for 'KindVar's
+type TvSubstEnv = TyVarEnv Type
+	-- A TvSubstEnv is used both inside a TvSubst (with the apply-once
+	-- invariant discussed in Note [Apply Once]), and also independently
+	-- in the middle of matching, and unification (see Types.Unify)
+	-- So you have to look at the context to know if it's idempotent or
+	-- apply-once or whatever
 \end{code}
+
+Note [Apply Once]
+~~~~~~~~~~~~~~~~~
+We use TvSubsts to instantiate things, and we might instantiate
+	forall a b. ty
+\with the types
+	[a, b], or [b, a].
+So the substition might go [a->b, b->a].  A similar situation arises in Core
+when we find a beta redex like
+	(/\ a /\ b -> e) b a
+Then we also end up with a substition that permutes type variables. Other
+variations happen to; for example [a -> (a, b)].  
+
+	***************************************************
+	*** So a TvSubst must be applied precisely once ***
+	***************************************************
+
+A TvSubst is not idempotent, but, unlike the non-idempotent substitution
+we use during unifications, it must not be repeatedly applied.
+
+Note [Extending the TvSubst]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See #tvsubst_invariant# for the invariants that must hold.
+
+This invariant allows a short-cut when the TvSubstEnv is empty:
+if the TvSubstEnv is empty --- i.e. (isEmptyTvSubt subst) holds ---
+then (substTy subst ty) does nothing.
+
+For example, consider:
+	(/\a. /\b:(a~Int). ...b..) Int
+We substitute Int for 'a'.  The Unique of 'b' does not change, but
+nevertheless we add 'b' to the TvSubstEnv, because b's kind does change
+
+This invariant has several crucial consequences:
+
+* In substTyVarBndr, we need extend the TvSubstEnv 
+	- if the unique has changed
+	- or if the kind has changed
+
+* In substTyVar, we do not need to consult the in-scope set;
+  the TvSubstEnv is enough
+
+* In substTy, substTheta, we can short-circuit when the TvSubstEnv is empty
 
 
 
 %************************************************************************
 %*									*
-\subsection{The external interface}
-%*									*
+                   Pretty-printing types
+
+       Defined very early because of debug printing in assertions
+%*                                                                      *
 %************************************************************************
 
 @pprType@ is the standard @Type@ printer; the overloaded @ppr@ function is
@@ -422,165 +504,154 @@ maybeParen ctxt_prec inner_prec pretty
 
 ------------------
 pprType, pprParendType :: Type -> SDoc
-pprType       ty = ppr_type TopPrec   ty
+pprType       ty = ppr_type TopPrec ty
 pprParendType ty = ppr_type TyConPrec ty
 
-pprTypeApp :: NamedThing a => a -> [Type] -> SDoc
--- The first arg is the tycon, or sometimes class
--- Print infix if the tycon/class looks like an operator
-pprTypeApp tc tys = ppr_type_app TopPrec (getName tc) tys
+pprTyLit :: TyLit -> SDoc
+pprTyLit = ppr_tylit TopPrec
+
+pprKind, pprParendKind :: Kind -> SDoc
+pprKind       = pprType
+pprParendKind = pprParendType
 
 ------------------
-pprPred :: PredType -> SDoc
-pprPred (ClassP cls tys) = pprClassPred cls tys
-pprPred (IParam ip ty)   = ppr ip <> dcolon <> pprType ty
-pprPred (EqPred ty1 ty2) = pprEqPred (ty1,ty2)
+pprEqPred :: Pair Type -> SDoc
+-- NB: Maybe move to Coercion? It's only called after coercionKind anyway. 
+pprEqPred (Pair ty1 ty2) 
+  = sep [ ppr_type FunPrec ty1
+        , nest 2 (ptext (sLit "~#"))
+        , ppr_type FunPrec ty2]
+    -- Precedence looks like (->) so that we get
+    --    Maybe a ~ Bool
+    --    (a->a) ~ Bool
+    -- Note parens on the latter!
 
-pprEqPred :: (Type,Type) -> SDoc
-pprEqPred (ty1,ty2) = sep [ ppr_type FunPrec ty1
-                          , nest 2 (ptext (sLit "~"))
-                          , ppr_type FunPrec ty2]
-			       -- Precedence looks like (->) so that we get
-			       --    Maybe a ~ Bool
-			       --    (a->a) ~ Bool
-			       -- Note parens on the latter!
-
+------------
 pprClassPred :: Class -> [Type] -> SDoc
-pprClassPred clas tys = ppr_type_app TopPrec (getName clas) tys
+pprClassPred clas tys = pprTypeApp (classTyCon clas) tys
 
+------------
 pprTheta :: ThetaType -> SDoc
 -- pprTheta [pred] = pprPred pred	 -- I'm in two minds about this
-pprTheta theta  = parens (sep (punctuate comma (map pprPred theta)))
+pprTheta theta  = parens (sep (punctuate comma (map (ppr_type TopPrec) theta)))
 
-pprThetaArrow :: ThetaType -> SDoc
-pprThetaArrow []     = empty
-pprThetaArrow [pred] 
-  | noParenPred pred = pprPred pred <+> darrow
-pprThetaArrow preds  = parens (sep (punctuate comma (map pprPred preds))) <+> darrow
-
-noParenPred :: PredType -> Bool
--- A predicate that can appear without parens before a "=>"
---       C a => a -> a
---       a~b => a -> b
--- But   (?x::Int) => Int -> Int
-noParenPred (ClassP {}) = True
-noParenPred (EqPred {}) = True
-noParenPred (IParam {}) = False
+pprThetaArrowTy :: ThetaType -> SDoc
+pprThetaArrowTy []      = empty
+pprThetaArrowTy [pred]
+      | noParenPred pred = ppr_type TopPrec pred <+> darrow
+pprThetaArrowTy preds   = parens (fsep (punctuate comma (map (ppr_type TopPrec) preds)))
+                            <+> darrow
+    -- Notice 'fsep' here rather that 'sep', so that
+    -- type contexts don't get displayed in a giant column
+    -- Rather than
+    --  instance (Eq a,
+    --            Eq b,
+    --            Eq c,
+    --            Eq d,
+    --            Eq e,
+    --            Eq f,
+    --            Eq g,
+    --            Eq h,
+    --            Eq i,
+    --            Eq j,
+    --            Eq k,
+    --            Eq l) =>
+    --           Eq (a, b, c, d, e, f, g, h, i, j, k, l)
+    -- we get
+    --
+    --  instance (Eq a, Eq b, Eq c, Eq d, Eq e, Eq f, Eq g, Eq h, Eq i,
+    --            Eq j, Eq k, Eq l) =>
+    --           Eq (a, b, c, d, e, f, g, h, i, j, k, l)
 
 ------------------
 instance Outputable Type where
     ppr ty = pprType ty
 
-instance Outputable PredType where
-    ppr = pprPred
-
-instance Outputable name => OutputableBndr (IPName name) where
-    pprBndr _ n = ppr n	-- Simple for now
+instance Outputable TyLit where
+   ppr = pprTyLit
 
 ------------------
 	-- OK, here's the main printer
 
-pprKind, pprParendKind :: Kind -> SDoc
-pprKind = pprType
-pprParendKind = pprParendType
-
 ppr_type :: Prec -> Type -> SDoc
 ppr_type _ (TyVarTy tv)	      = ppr_tvar tv
-ppr_type p (PredTy pred)      = maybeParen p TyConPrec $
-                                ifPprDebug (ptext (sLit "<pred>")) <> (ppr pred)
-ppr_type p (TyConApp tc tys)  = ppr_tc_app p tc tys
+
+ppr_type _ (TyConApp tc [LitTy (StrTyLit n),ty])
+  | tc `hasKey` ipClassNameKey
+  = char '?' <> ftext n <> ptext (sLit "::") <> ppr_type TopPrec ty
+
+ppr_type p (TyConApp tc tys)  = pprTyTcApp p tc tys
+
+ppr_type p (LitTy l)          = ppr_tylit p l
+ppr_type p ty@(ForAllTy {})   = ppr_forall_type p ty
 
 ppr_type p (AppTy t1 t2) = maybeParen p TyConPrec $
-			   pprType t1 <+> ppr_type TyConPrec t2
+			   ppr_type FunPrec t1 <+> ppr_type TyConPrec t2
 
-ppr_type p ty@(ForAllTy _ _)       = ppr_forall_type p ty
-ppr_type p ty@(FunTy (PredTy _) _) = ppr_forall_type p ty
-
-ppr_type p (FunTy ty1 ty2)
-  = -- We don't want to lose synonyms, so we mustn't use splitFunTys here.
-    maybeParen p FunPrec $
-    sep (ppr_type FunPrec ty1 : ppr_fun_tail ty2)
+ppr_type p fun_ty@(FunTy ty1 ty2)
+  | isPredTy ty1
+  = ppr_forall_type p fun_ty
+  | otherwise
+  = pprArrowChain p (ppr_type FunPrec ty1 : ppr_fun_tail ty2)
   where
-    ppr_fun_tail (FunTy ty1 ty2) 
-      | not (is_pred ty1) = (arrow <+> ppr_type FunPrec ty1) : ppr_fun_tail ty2
-    ppr_fun_tail other_ty = [arrow <+> pprType other_ty]
-    is_pred (PredTy {}) = True
-    is_pred _           = False
+    -- We don't want to lose synonyms, so we mustn't use splitFunTys here.
+    ppr_fun_tail (FunTy ty1 ty2)
+      | not (isPredTy ty1) = ppr_type FunPrec ty1 : ppr_fun_tail ty2
+    ppr_fun_tail other_ty = [ppr_type TopPrec other_ty]
+
 
 ppr_forall_type :: Prec -> Type -> SDoc
 ppr_forall_type p ty
-  = maybeParen p FunPrec $
-    sep [pprForAll tvs, pprThetaArrow ctxt, pprType tau]
+  = maybeParen p FunPrec $ ppr_sigma_type True ty
+
+ppr_tvar :: TyVar -> SDoc
+ppr_tvar tv  -- Note [Infix type variables]
+  = parenSymOcc (getOccName tv) (ppr tv)
+
+ppr_tylit :: Prec -> TyLit -> SDoc
+ppr_tylit _ tl =
+  case tl of
+    NumTyLit n -> integer n
+    StrTyLit s -> text (show s)
+
+-------------------
+ppr_sigma_type :: Bool -> Type -> SDoc
+-- Bool <=> Show the foralls
+ppr_sigma_type show_foralls ty
+  = sdocWithDynFlags $ \ dflags -> 
+    let filtered_tvs | gopt Opt_PrintExplicitKinds dflags 
+                     = tvs
+                     | otherwise
+                     = filterOut isKindVar tvs
+    in sep [ ppWhen show_foralls (pprForAll filtered_tvs)
+           , pprThetaArrowTy ctxt
+           , pprType tau ]
   where
     (tvs,  rho) = split1 [] ty
     (ctxt, tau) = split2 [] rho
 
-    -- We need to be extra careful here as equality constraints will occur as
-    -- type variables with an equality kind.  So, while collecting quantified
-    -- variables, we separate the coercion variables out and turn them into
-    -- equality predicates.
-    split1 tvs (ForAllTy tv ty) 
-      | not (isCoVar tv)     = split1 (tv:tvs) ty
-    split1 tvs ty	     = (reverse tvs, ty)
+    split1 tvs (ForAllTy tv ty) = split1 (tv:tvs) ty
+    split1 tvs ty          = (reverse tvs, ty)
  
-    split2 ps (PredTy p `FunTy` ty) = split2 (p:ps) ty
-    split2 ps (ForAllTy tv ty) 
-	| isCoVar tv		    = split2 (coVarPred tv : ps) ty
-    split2 ps ty		    = (reverse ps, ty)
+    split2 ps (ty1 `FunTy` ty2) | isPredTy ty1 = split2 (ty1:ps) ty2
+    split2 ps ty                               = (reverse ps, ty)
 
-ppr_tc_app :: Prec -> TyCon -> [Type] -> SDoc
-ppr_tc_app _ tc []
-  = ppr_tc tc
-ppr_tc_app _ tc [ty]
-  | tc `hasKey` listTyConKey = brackets (pprType ty)
-  | tc `hasKey` parrTyConKey = ptext (sLit "[:") <> pprType ty <> ptext (sLit ":]")
-  | tc `hasKey` liftedTypeKindTyConKey   = ptext (sLit "*")
-  | tc `hasKey` unliftedTypeKindTyConKey = ptext (sLit "#")
-  | tc `hasKey` openTypeKindTyConKey     = ptext (sLit "(?)")
-  | tc `hasKey` ubxTupleKindTyConKey     = ptext (sLit "(#)")
-  | tc `hasKey` argTypeKindTyConKey      = ptext (sLit "??")
 
-ppr_tc_app p tc tys
-  | isTupleTyCon tc && tyConArity tc == length tys
-  = tupleParens (tupleTyConBoxity tc) (sep (punctuate comma (map pprType tys)))
-  | otherwise
-  = ppr_type_app p (getName tc) tys
+pprSigmaType :: Type -> SDoc
+pprSigmaType ty = sdocWithDynFlags $ \dflags ->
+                  ppr_sigma_type (gopt Opt_PrintExplicitForalls dflags) ty
 
-ppr_type_app :: Prec -> Name -> [Type] -> SDoc
--- Used for classes as well as types; that's why it's separate from ppr_tc_app
-ppr_type_app p tc tys
-  | is_sym_occ		-- Print infix if possible
-  , [ty1,ty2] <- tys	-- We know nothing of precedence though
-  = maybeParen p FunPrec (sep [ppr_type FunPrec ty1, 
-			       pprInfixVar True (ppr tc) <+> ppr_type FunPrec ty2])
-  | otherwise
-  = maybeParen p TyConPrec (hang (pprPrefixVar is_sym_occ (ppr tc))
-    	       	 	       2 (sep (map pprParendType tys)))
-  where
-    is_sym_occ = isSymOcc (getOccName tc)
-
-ppr_tc :: TyCon -> SDoc	-- No brackets for SymOcc
-ppr_tc tc 
-  = pp_nt_debug <> ppr tc
-  where
-   pp_nt_debug | isNewTyCon tc = ifPprDebug (if isRecursiveTyCon tc 
-				             then ptext (sLit "<recnt>")
-					     else ptext (sLit "<nt>"))
-	       | otherwise     = empty
-
-ppr_tvar :: TyVar -> SDoc
-ppr_tvar tv  -- Note [Infix type variables]
-  | isSymOcc (getOccName tv)  = parens (ppr tv)
-  | otherwise		      = ppr tv
-
--------------------
 pprForAll :: [TyVar] -> SDoc
 pprForAll []  = empty
-pprForAll tvs = ptext (sLit "forall") <+> sep (map pprTvBndr tvs) <> dot
+pprForAll tvs = ptext (sLit "forall") <+> pprTvBndrs tvs <> dot
+
+pprTvBndrs :: [TyVar] -> SDoc
+pprTvBndrs tvs = sep (map pprTvBndr tvs)
 
 pprTvBndr :: TyVar -> SDoc
-pprTvBndr tv | isLiftedTypeKind kind = ppr_tvar tv
-	     | otherwise	     = parens (ppr_tvar tv <+> dcolon <+> pprKind kind)
+pprTvBndr tv 
+  | isLiftedTypeKind kind = ppr_tvar tv
+  | otherwise	          = parens (ppr_tvar tv <+> dcolon <+> pprKind kind)
 	     where
 	       kind = tyVarKind tv
 \end{code}
@@ -603,6 +674,229 @@ remember to parenthesise the operator, thus
 
 See Trac #2766.
 
+\begin{code}
+pprTypeApp :: TyCon -> [Type] -> SDoc
+pprTypeApp tc tys = pprTyTcApp TopPrec tc tys
+        -- We have to use ppr on the TyCon (not its name)
+        -- so that we get promotion quotes in the right place
+
+pprTyTcApp :: Prec -> TyCon -> [Type] -> SDoc
+-- Used for types only; so that we can make a
+-- special case for type-level lists
+pprTyTcApp p tc tys
+  | tc `hasKey` consDataConKey
+  , [_kind,ty1,ty2] <- tys
+  = sdocWithDynFlags $ \dflags ->
+    if gopt Opt_PrintExplicitKinds dflags then pprTcApp  p ppr_type tc tys
+                                   else pprTyList p ty1 ty2
+
+  | otherwise
+  = pprTcApp p ppr_type tc tys
+
+pprTcApp :: Prec -> (Prec -> a -> SDoc) -> TyCon -> [a] -> SDoc
+-- Used for both types and coercions, hence polymorphism
+pprTcApp _ pp tc [ty]
+  | tc `hasKey` listTyConKey = pprPromotionQuote tc <> brackets   (pp TopPrec ty)
+  | tc `hasKey` parrTyConKey = pprPromotionQuote tc <> paBrackets (pp TopPrec ty)
+
+pprTcApp p pp tc tys
+  | isTupleTyCon tc && tyConArity tc == length tys
+  = pprPromotionQuote tc <>
+    tupleParens (tupleTyConSort tc) (sep (punctuate comma (map (pp TopPrec) tys)))
+
+  | Just dc <- isPromotedDataCon_maybe tc
+  , let dc_tc = dataConTyCon dc
+  , isTupleTyCon dc_tc 
+  , let arity = tyConArity dc_tc    -- E.g. 3 for (,,) k1 k2 k3 t1 t2 t3
+        ty_args = drop arity tys    -- Drop the kind args
+  , ty_args `lengthIs` arity        -- Result is saturated
+  = pprPromotionQuote tc <>
+    (tupleParens (tupleTyConSort dc_tc) $
+     sep (punctuate comma (map (pp TopPrec) ty_args)))
+
+  | otherwise
+  = sdocWithDynFlags (pprTcApp_help p pp tc tys)
+
+pprTcApp_help :: Prec -> (Prec -> a -> SDoc) -> TyCon -> [a] -> DynFlags -> SDoc
+-- This one has accss to the DynFlags
+pprTcApp_help p pp tc tys dflags
+  | not (isSymOcc (nameOccName (tyConName tc)))
+  = pprPrefixApp p (ppr tc) (map (pp TyConPrec) tys_wo_kinds)
+
+  | [ty1,ty2] <- tys_wo_kinds  -- Infix, two arguments;
+                               -- we know nothing of precedence though
+  = pprInfixApp p pp (ppr tc) ty1 ty2
+
+  |  tc `hasKey` liftedTypeKindTyConKey 
+  || tc `hasKey` unliftedTypeKindTyConKey 
+  = ASSERT( null tys ) ppr tc   -- Do not wrap *, # in parens
+
+  | otherwise
+  = pprPrefixApp p (parens (ppr tc)) (map (pp TyConPrec) tys_wo_kinds)
+  where
+    tys_wo_kinds = suppressKinds dflags (tyConKind tc) tys
+
+------------------
+suppressKinds :: DynFlags -> Kind -> [a] -> [a]
+-- Given the kind of a TyCon, and the args to which it is applied,
+-- suppress the args that are kind args
+suppressKinds dflags kind xs
+  | gopt Opt_PrintExplicitKinds dflags = xs
+  | otherwise                          = suppress kind xs
+  where
+    suppress (ForAllTy _ kind) (_ : xs) = suppress kind xs
+    suppress (FunTy _ res)     (x:xs)   = x : suppress res xs
+    suppress _                 xs       = xs
+
+----------------
+pprTyList :: Prec -> Type -> Type -> SDoc
+-- Given a type-level list (t1 ': t2), see if we can print 
+-- it in list notation [t1, ...].  
+pprTyList p ty1 ty2
+  = case gather ty2 of
+      (arg_tys, Nothing) -> char '\'' <> brackets (fsep (punctuate comma 
+                                            (map (ppr_type TopPrec) (ty1:arg_tys))))
+      (arg_tys, Just tl) -> maybeParen p FunPrec $
+                            hang (ppr_type FunPrec ty1)
+                               2 (fsep [ colon <+> ppr_type FunPrec ty | ty <- arg_tys ++ [tl]])
+  where
+    gather :: Type -> ([Type], Maybe Type)
+     -- (gather ty) = (tys, Nothing) means ty is a list [t1, .., tn]
+     --             = (tys, Just tl) means ty is of form t1:t2:...tn:tl
+    gather (TyConApp tc tys)
+      | tc `hasKey` consDataConKey
+      , [_kind, ty1,ty2] <- tys
+      , (args, tl) <- gather ty2
+      = (ty1:args, tl)
+      | tc `hasKey` nilDataConKey
+      = ([], Nothing)
+    gather ty = ([], Just ty)
+
+----------------
+pprInfixApp :: Prec -> (Prec -> a -> SDoc) -> SDoc -> a -> a -> SDoc
+pprInfixApp p pp pp_tc ty1 ty2
+  = maybeParen p FunPrec $
+    sep [pp FunPrec ty1, pprInfixVar True pp_tc <+> pp FunPrec ty2]
+
+pprPrefixApp :: Prec -> SDoc -> [SDoc] -> SDoc
+pprPrefixApp p pp_fun pp_tys 
+  | null pp_tys = pp_fun
+  | otherwise   = maybeParen p TyConPrec $
+                  hang pp_fun 2 (sep pp_tys)
+
+----------------
+pprArrowChain :: Prec -> [SDoc] -> SDoc
+-- pprArrowChain p [a,b,c]  generates   a -> b -> c
+pprArrowChain _ []         = empty
+pprArrowChain p (arg:args) = maybeParen p FunPrec $
+                             sep [arg, sep (map (arrow <+>) args)]
+\end{code}
+
+%************************************************************************
+%*									*
+\subsection{TidyType}
+%*									*
+%************************************************************************
+
+Tidying is here because it has a special case for FlatSkol
+
+\begin{code}
+-- | This tidies up a type for printing in an error message, or in
+-- an interface file.
+-- 
+-- It doesn't change the uniques at all, just the print names.
+tidyTyVarBndrs :: TidyEnv -> [TyVar] -> (TidyEnv, [TyVar])
+tidyTyVarBndrs env tvs = mapAccumL tidyTyVarBndr env tvs
+
+tidyTyVarBndr :: TidyEnv -> TyVar -> (TidyEnv, TyVar)
+tidyTyVarBndr tidy_env@(occ_env, subst) tyvar
+  = case tidyOccName occ_env occ1 of
+      (tidy', occ') -> ((tidy', subst'), tyvar')
+	where
+          subst' = extendVarEnv subst tyvar tyvar'
+          tyvar' = setTyVarKind (setTyVarName tyvar name') kind'
+          name'  = tidyNameOcc name occ'
+          kind'  = tidyKind tidy_env (tyVarKind tyvar)
+  where
+    name = tyVarName tyvar
+    occ  = getOccName name
+    -- System Names are for unification variables;
+    -- when we tidy them we give them a trailing "0" (or 1 etc)
+    -- so that they don't take precedence for the un-modified name
+    occ1 | isSystemName name = mkTyVarOcc (occNameString occ ++ "0")
+         | otherwise         = occ
 
 
+---------------
+tidyFreeTyVars :: TidyEnv -> TyVarSet -> TidyEnv
+-- ^ Add the free 'TyVar's to the env in tidy form,
+-- so that we can tidy the type they are free in
+tidyFreeTyVars (full_occ_env, var_env) tyvars 
+  = fst (tidyOpenTyVars (full_occ_env, var_env) (varSetElems tyvars))
 
+        ---------------
+tidyOpenTyVars :: TidyEnv -> [TyVar] -> (TidyEnv, [TyVar])
+tidyOpenTyVars env tyvars = mapAccumL tidyOpenTyVar env tyvars
+
+---------------
+tidyOpenTyVar :: TidyEnv -> TyVar -> (TidyEnv, TyVar)
+-- ^ Treat a new 'TyVar' as a binder, and give it a fresh tidy name
+-- using the environment if one has not already been allocated. See
+-- also 'tidyTyVarBndr'
+tidyOpenTyVar env@(_, subst) tyvar
+  = case lookupVarEnv subst tyvar of
+	Just tyvar' -> (env, tyvar')		-- Already substituted
+	Nothing	    -> tidyTyVarBndr env tyvar	-- Treat it as a binder
+
+---------------
+tidyTyVarOcc :: TidyEnv -> TyVar -> TyVar
+tidyTyVarOcc (_, subst) tv
+  = case lookupVarEnv subst tv of
+	Nothing  -> tv
+	Just tv' -> tv'
+
+---------------
+tidyTypes :: TidyEnv -> [Type] -> [Type]
+tidyTypes env tys = map (tidyType env) tys
+
+---------------
+tidyType :: TidyEnv -> Type -> Type
+tidyType _   (LitTy n)            = LitTy n
+tidyType env (TyVarTy tv)	  = TyVarTy (tidyTyVarOcc env tv)
+tidyType env (TyConApp tycon tys) = let args = tidyTypes env tys
+ 		                    in args `seqList` TyConApp tycon args
+tidyType env (AppTy fun arg)	  = (AppTy $! (tidyType env fun)) $! (tidyType env arg)
+tidyType env (FunTy fun arg)	  = (FunTy $! (tidyType env fun)) $! (tidyType env arg)
+tidyType env (ForAllTy tv ty)	  = ForAllTy tvp $! (tidyType envp ty)
+			          where
+			            (envp, tvp) = tidyTyVarBndr env tv
+
+---------------
+-- | Grabs the free type variables, tidies them
+-- and then uses 'tidyType' to work over the type itself
+tidyOpenType :: TidyEnv -> Type -> (TidyEnv, Type)
+tidyOpenType env ty
+  = (env', tidyType (trimmed_occ_env, var_env) ty)
+  where
+    (env'@(_, var_env), tvs') = tidyOpenTyVars env (varSetElems (tyVarsOfType ty))
+    trimmed_occ_env = initTidyOccEnv (map getOccName tvs')
+      -- The idea here was that we restrict the new TidyEnv to the 
+      -- _free_ vars of the type, so that we don't gratuitously rename
+      -- the _bound_ variables of the type.
+
+---------------
+tidyOpenTypes :: TidyEnv -> [Type] -> (TidyEnv, [Type])
+tidyOpenTypes env tys = mapAccumL tidyOpenType env tys
+
+---------------
+-- | Calls 'tidyType' on a top-level type (i.e. with an empty tidying environment)
+tidyTopType :: Type -> Type
+tidyTopType ty = tidyType emptyTidyEnv ty
+
+---------------
+tidyOpenKind :: TidyEnv -> Kind -> (TidyEnv, Kind)
+tidyOpenKind = tidyOpenType
+
+tidyKind :: TidyEnv -> Kind -> Kind
+tidyKind = tidyType
+\end{code}

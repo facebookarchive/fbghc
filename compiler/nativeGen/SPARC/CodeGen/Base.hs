@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module SPARC.CodeGen.Base (
 	InstrBlock,
 	CondCode(..),
@@ -18,12 +25,14 @@ import SPARC.Instr
 import SPARC.Cond
 import SPARC.AddrMode
 import SPARC.Regs
-import SPARC.RegPlate
 import Size
 import Reg
 
-import OldCmm
-import OldPprCmm ()
+import CodeGen.Platform
+import DynFlags
+import Cmm
+import PprCmmExpr ()
+import Platform
 
 import Outputable
 import OrdList
@@ -91,13 +100,13 @@ setSizeOfRegister reg size
 
 --------------------------------------------------------------------------------
 -- | Grab the Reg for a CmmReg
-getRegisterReg :: CmmReg -> Reg
+getRegisterReg :: Platform -> CmmReg -> Reg
 
-getRegisterReg (CmmLocal (LocalReg u pk))
+getRegisterReg _ (CmmLocal (LocalReg u pk))
   	= RegVirtual $ mkVirtualReg u (cmmTypeSize pk)
 
-getRegisterReg (CmmGlobal mid)
-  = case globalRegMaybe mid of
+getRegisterReg platform (CmmGlobal mid)
+  = case globalRegMaybe platform mid of
         Just reg -> RegReal reg
         Nothing  -> pprPanic
                         "SPARC.CodeGen.Base.getRegisterReg: global is in memory"
@@ -106,13 +115,13 @@ getRegisterReg (CmmGlobal mid)
 
 -- Expand CmmRegOff.  ToDo: should we do it this way around, or convert
 -- CmmExprs into CmmRegOff?
-mangleIndexTree :: CmmExpr -> CmmExpr
+mangleIndexTree :: DynFlags -> CmmExpr -> CmmExpr
 
-mangleIndexTree (CmmRegOff reg off)
+mangleIndexTree dflags (CmmRegOff reg off)
 	= CmmMachOp (MO_Add width) [CmmReg reg, CmmLit (CmmInt (fromIntegral off) width)]
-	where width = typeWidth (cmmRegType reg)
+	where width = typeWidth (cmmRegType dflags reg)
 
-mangleIndexTree _
+mangleIndexTree _ _
 	= panic "SPARC.CodeGen.Base.mangleIndexTree: no match"
 
 

@@ -5,13 +5,14 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
-utils/ghctags_dist_MODULES = Main
-utils/ghctags_dist_HC_OPTS = -package ghc
-utils/ghctags_dist_INSTALL = NO
-utils/ghctags_dist_PROG    = ghctags$(exeext)
-$(eval $(call build-prog,utils/ghctags,dist,2))
+utils/ghctags_USES_CABAL                   = YES
+utils/ghctags_PACKAGE                      = ghctags
+utils/ghctags_dist-install_PROGNAME        = ghctags
+utils/ghctags_dist-install_INSTALL         = NO
+utils/ghctags_dist-install_INSTALL_INPLACE = YES
+$(eval $(call build-prog,utils/ghctags,dist-install,2))

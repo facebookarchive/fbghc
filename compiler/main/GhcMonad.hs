@@ -15,11 +15,11 @@ module GhcMonad (
         reflectGhc, reifyGhc,
         getSessionDynFlags, 
         liftIO,
-	Session(..), withSession, modifySession, withTempSession,
+        Session(..), withSession, modifySession, withTempSession,
 
         -- ** Warnings
-        logWarnings, printException, printExceptionAndWarnings,
-	WarnErrLogger, defaultWarnErrLogger
+        logWarnings, printException,
+        WarnErrLogger, defaultWarnErrLogger
   ) where
 
 import MonadUtils
@@ -46,10 +46,9 @@ import Data.IORef
 -- If you do not use 'Ghc' or 'GhcT', make sure to call 'GHC.initGhcMonad'
 -- before any call to the GHC API functions can occur.
 --
-class (Functor m, MonadIO m, ExceptionMonad m) => GhcMonad m where
+class (Functor m, MonadIO m, ExceptionMonad m, HasDynFlags m) => GhcMonad m where
   getSession :: m HscEnv
   setSession :: HscEnv -> m ()
-
 
 -- | Call the argument with the current session.
 withSession :: GhcMonad m => (HscEnv -> m a) -> m a
@@ -98,6 +97,10 @@ data Session = Session !(IORef HscEnv)
 instance Functor Ghc where
   fmap f m = Ghc $ \s -> f `fmap` unGhc m s
 
+instance Applicative Ghc where
+  pure    = return
+  g <*> m = do f <- g; a <- m; return (f a)
+
 instance Monad Ghc where
   return a = Ghc $ \_ -> return a
   m >>= g  = Ghc $ \s -> do a <- unGhc m s; unGhc (g a) s
@@ -105,17 +108,21 @@ instance Monad Ghc where
 instance MonadIO Ghc where
   liftIO ioA = Ghc $ \_ -> ioA
 
+instance MonadFix Ghc where
+  mfix f = Ghc $ \s -> mfix (\x -> unGhc (f x) s)
+
 instance ExceptionMonad Ghc where
   gcatch act handle =
       Ghc $ \s -> unGhc act s `gcatch` \e -> unGhc (handle e) s
-  gblock (Ghc m)   = Ghc $ \s -> gblock (m s)
-  gunblock (Ghc m) = Ghc $ \s -> gunblock (m s)
   gmask f =
       Ghc $ \s -> gmask $ \io_restore ->
                              let
                                 g_restore (Ghc m) = Ghc $ \s -> io_restore (m s)
                              in
                                 unGhc (f g_restore) s
+
+instance HasDynFlags Ghc where
+  getDynFlags = getSessionDynFlags
 
 instance GhcMonad Ghc where
   getSession = Ghc $ \(Session r) -> readIORef r
@@ -154,6 +161,10 @@ liftGhcT m = GhcT $ \_ -> m
 instance Functor m => Functor (GhcT m) where
   fmap f m = GhcT $ \s -> f `fmap` unGhcT m s
 
+instance Applicative m => Applicative (GhcT m) where
+  pure x  = GhcT $ \_ -> pure x
+  g <*> m = GhcT $ \s -> unGhcT g s <*> unGhcT m s
+
 instance Monad m => Monad (GhcT m) where
   return x = GhcT $ \_ -> return x
   m >>= k  = GhcT $ \s -> do a <- unGhcT m s; unGhcT (k a) s
@@ -164,14 +175,15 @@ instance MonadIO m => MonadIO (GhcT m) where
 instance ExceptionMonad m => ExceptionMonad (GhcT m) where
   gcatch act handle =
       GhcT $ \s -> unGhcT act s `gcatch` \e -> unGhcT (handle e) s
-  gblock (GhcT m) = GhcT $ \s -> gblock (m s)
-  gunblock (GhcT m) = GhcT $ \s -> gunblock (m s)
   gmask f =
       GhcT $ \s -> gmask $ \io_restore ->
                            let
                               g_restore (GhcT m) = GhcT $ \s -> io_restore (m s)
                            in
                               unGhcT (f g_restore) s
+
+instance (Functor m, ExceptionMonad m, MonadIO m) => HasDynFlags (GhcT m) where
+  getDynFlags = getSessionDynFlags
 
 instance (Functor m, ExceptionMonad m, MonadIO m) => GhcMonad (GhcT m) where
   getSession = GhcT $ \(Session r) -> liftIO $ readIORef r
@@ -184,10 +196,6 @@ printException :: GhcMonad m => SourceError -> m ()
 printException err = do
   dflags <- getSessionDynFlags
   liftIO $ printBagOfErrors dflags (srcErrorMessages err)
-
-{-# DEPRECATED printExceptionAndWarnings "use printException instead" #-}
-printExceptionAndWarnings :: GhcMonad m => SourceError -> m ()
-printExceptionAndWarnings = printException
 
 -- | A function called to log warnings and errors.
 type WarnErrLogger = GhcMonad m => Maybe SourceError -> m ()

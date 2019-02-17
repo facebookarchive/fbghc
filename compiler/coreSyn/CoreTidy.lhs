@@ -7,6 +7,13 @@ This module contains "tidying" code for *nested* expressions, bindings, rules.
 The code for *top-level* bindings is in TidyPgm.
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module CoreTidy (
 	tidyExpr, tidyVarOcc, tidyRule, tidyRules, tidyUnfolding
     ) where
@@ -17,7 +24,8 @@ import CoreSyn
 import CoreArity
 import Id
 import IdInfo
-import TcType( tidyType, tidyTyVarBndr )
+import Type( tidyType, tidyTyVarBndr )
+import Coercion( tidyCo )
 import Var
 import VarEnv
 import UniqFM
@@ -55,11 +63,12 @@ tidyBind env (Rec prs)
 ------------  Expressions  --------------
 tidyExpr :: TidyEnv -> CoreExpr -> CoreExpr
 tidyExpr env (Var v)   	 =  Var (tidyVarOcc env v)
-tidyExpr env (Type ty) 	 =  Type (tidyType env ty)
+tidyExpr env (Type ty)  =  Type (tidyType env ty)
+tidyExpr env (Coercion co) = Coercion (tidyCo env co)
 tidyExpr _   (Lit lit)   =  Lit lit
 tidyExpr env (App f a) 	 =  App (tidyExpr env f) (tidyExpr env a)
-tidyExpr env (Note n e)  =  Note (tidyNote env n) (tidyExpr env e)
-tidyExpr env (Cast e co) =  Cast (tidyExpr env e) (tidyType env co)
+tidyExpr env (Tick t e) =  Tick (tidyTickish env t) (tidyExpr env e)
+tidyExpr env (Cast e co) =  Cast (tidyExpr env e) (tidyCo env co)
 
 tidyExpr env (Let b e) 
   = tidyBind env b 	=: \ (env', b') ->
@@ -80,9 +89,10 @@ tidyAlt _case_bndr env (con, vs, rhs)
   = tidyBndrs env vs 	=: \ (env', vs) ->
     (con, vs, tidyExpr env' rhs)
 
-------------  Notes  --------------
-tidyNote :: TidyEnv -> Note -> Note
-tidyNote _ note            = note
+------------  Tickish  --------------
+tidyTickish :: TidyEnv -> Tickish Id -> Tickish Id
+tidyTickish env (Breakpoint ix ids) = Breakpoint ix (map (tidyVarOcc env) ids)
+tidyTickish _   other_tickish       = other_tickish
 
 ------------  Rules  --------------
 tidyRules :: TidyEnv -> [CoreRule] -> [CoreRule]
@@ -125,7 +135,7 @@ tidyVarOcc (_, var_env) v = lookupVarEnv var_env v `orElse` v
 -- tidyBndr is used for lambda and case binders
 tidyBndr :: TidyEnv -> Var -> (TidyEnv, Var)
 tidyBndr env var
-  | isTyCoVar var = tidyTyVarBndr env var
+  | isTyVar var = tidyTyVarBndr env var
   | otherwise   = tidyIdBndr env var
 
 tidyBndrs :: TidyEnv -> [Var] -> (TidyEnv, [Var])
@@ -162,8 +172,8 @@ tidyLetBndr rec_tidy_env env (id,rhs)
     idinfo   = idInfo id
     new_info = idInfo new_id
 		`setArityInfo`		exprArity rhs
-		`setStrictnessInfo`	strictnessInfo idinfo
-		`setDemandInfo`		demandInfo idinfo
+                `setStrictnessInfo`	strictnessInfo idinfo
+                `setDemandInfo`	        demandInfo idinfo
 		`setInlinePragInfo`	inlinePragInfo idinfo
 		`setUnfoldingInfo`	new_unf
 
@@ -196,21 +206,19 @@ tidyIdBndr env@(tidy_env, var_env) id
 
 ------------ Unfolding  --------------
 tidyUnfolding :: TidyEnv -> Unfolding -> Unfolding -> Unfolding
-tidyUnfolding tidy_env (DFunUnfolding ar con ids) _
-  = DFunUnfolding ar con (map (fmap (tidyExpr tidy_env)) ids)
+tidyUnfolding tidy_env df@(DFunUnfolding { df_bndrs = bndrs, df_args = args }) _
+  = df { df_bndrs = bndrs', df_args = map (tidyExpr tidy_env') args }
+  where
+    (tidy_env', bndrs') = tidyBndrs tidy_env bndrs
+
 tidyUnfolding tidy_env 
               unf@(CoreUnfolding { uf_tmpl = unf_rhs, uf_src = src })
               unf_from_rhs
   | isStableSource src
-  = unf { uf_tmpl = tidyExpr tidy_env unf_rhs, 	   -- Preserves OccInfo
-	  uf_src  = tidySrc tidy_env src }
+  = unf { uf_tmpl = tidyExpr tidy_env unf_rhs }	   -- Preserves OccInfo
   | otherwise
   = unf_from_rhs
 tidyUnfolding _ unf _ = unf	-- NoUnfolding or OtherCon
-
-tidySrc :: TidyEnv -> UnfoldingSource -> UnfoldingSource
-tidySrc tidy_env (InlineWrapper w) = InlineWrapper (tidyVarOcc tidy_env w)
-tidySrc _        inl_info          = inl_info
 \end{code}
 
 Note [Tidy IdInfo]

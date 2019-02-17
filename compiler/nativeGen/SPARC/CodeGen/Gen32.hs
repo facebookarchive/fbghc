@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- | Evaluation of 32 bit values.
 module SPARC.CodeGen.Gen32 (
 	getSomeReg,
@@ -22,9 +29,10 @@ import NCGMonad
 import Size
 import Reg
 
-import OldCmm
+import Cmm
 
 import Control.Monad (liftM)
+import DynFlags
 import OrdList
 import Outputable
 
@@ -47,11 +55,14 @@ getSomeReg expr = do
 getRegister :: CmmExpr -> NatM Register
 
 getRegister (CmmReg reg) 
-  = return (Fixed (cmmTypeSize (cmmRegType reg)) 
-		  (getRegisterReg reg) nilOL)
+  = do dflags <- getDynFlags
+       let platform = targetPlatform dflags
+       return (Fixed (cmmTypeSize (cmmRegType dflags reg))
+                     (getRegisterReg platform reg) nilOL)
 
 getRegister tree@(CmmRegOff _ _) 
-  = getRegister (mangleIndexTree tree)
+  = do dflags <- getDynFlags
+       getRegister (mangleIndexTree dflags tree)
 
 getRegister (CmmMachOp (MO_UU_Conv W64 W32)
              [CmmMachOp (MO_U_Shr W64) [x,CmmLit (CmmInt 32 _)]]) = do
@@ -83,9 +94,8 @@ getRegister (CmmLit (CmmFloat f W32)) = do
 
     let code dst = toOL [
             -- the data area         
-	    LDATA ReadOnlyData
-	                [CmmDataLabel lbl,
-			 CmmStaticLit (CmmFloat f W32)],
+	    LDATA ReadOnlyData $ Statics lbl
+			 [CmmStaticLit (CmmFloat f W32)],
 
             -- load the literal
 	    SETHI (HI (ImmCLbl lbl)) tmp,
@@ -97,9 +107,8 @@ getRegister (CmmLit (CmmFloat d W64)) = do
     lbl <- getNewLabelNat
     tmp <- getNewRegNat II32
     let code dst = toOL [
-	    LDATA ReadOnlyData
-	                [CmmDataLabel lbl,
-			 CmmStaticLit (CmmFloat d W64)],
+	    LDATA ReadOnlyData $ Statics lbl
+			 [CmmStaticLit (CmmFloat d W64)],
 	    SETHI (HI (ImmCLbl lbl)) tmp,
 	    LD II64 (AddrRegImm tmp (LO (ImmCLbl lbl))) dst] 
     return (Any FF64 code)
@@ -482,14 +491,15 @@ trivialFCode
 	-> NatM Register
 
 trivialFCode pk instr x y = do
+    dflags <- getDynFlags
     (src1, code1) <- getSomeReg x
     (src2, code2) <- getSomeReg y
     tmp <- getNewRegNat FF64
     let
     	promote x = FxTOy FF32 FF64 x tmp
 
-    	pk1   = cmmExprType x
-    	pk2   = cmmExprType y
+    	pk1   = cmmExprType dflags x
+    	pk2   = cmmExprType dflags y
 
     	code__2 dst =
     	    	if pk1 `cmmEqType` pk2 then
@@ -596,7 +606,7 @@ coerceFlt2Dbl x = do
 
 -- Condition Codes -------------------------------------------------------------
 --
--- Evaluate a comparision, and get the result into a register.
+-- Evaluate a comparison, and get the result into a register.
 -- 
 -- Do not fill the delay slots here. you will confuse the register allocator.
 --

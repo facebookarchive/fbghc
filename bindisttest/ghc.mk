@@ -5,15 +5,15 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
 ifeq "$(TEST_PREP)" "YES"
-BIN_DIST_TEST_TAR_BZ2 = $(BIN_DIST_PREP_TAR_BZ2)
+BIN_DIST_TEST_TAR_COMP = $(BIN_DIST_PREP_TAR_COMP)
 else
-BIN_DIST_TEST_TAR_BZ2 = $(BIN_DIST_TAR_BZ2)
+BIN_DIST_TEST_TAR_COMP = $(BIN_DIST_TAR_COMP)
 endif
 
 .PHONY: test_bindist
@@ -33,9 +33,9 @@ test_bindist:
 	mkdir bindisttest/a
 	mkdir bindisttest/a/b
 	mkdir bindisttest/a/b/c
-	cd bindisttest/a/b/c/ && $(BZIP2_CMD) -cd ../../../../$(BIN_DIST_TEST_TAR_BZ2) | $(TAR_CMD) -xf -
+	cd bindisttest/a/b/c/ && $(TAR_COMP_CMD) -cd ../../../../$(BIN_DIST_TEST_TAR_COMP) | $(TAR_CMD) -xf -
 	$(SHELL) bindisttest/checkBinaries.sh $(ProjectVersion)
-ifeq "$(Windows)" "YES"
+ifeq "$(Windows_Host)" "YES"
 	mv bindisttest/a/b/c/$(BIN_DIST_NAME) $(BIN_DIST_INST_DIR)
 else
 	cd bindisttest/a/b/c/$(BIN_DIST_NAME) && ./configure --prefix=$(TOP)/$(BIN_DIST_INST_DIR) --with-gcc="$(WhatGccIsCalled)"
@@ -48,8 +48,8 @@ endif
 	$(BIN_DIST_INST_DIR)/bin/ghc --make bindisttest/HelloWorld
 	bindisttest/HelloWorld > bindisttest/output
 	$(CONTEXT_DIFF) bindisttest/output bindisttest/expected_output
-# Without --no-user-package-conf we might pick up random packages from ~/.ghc
-	$(BIN_DIST_INST_DIR)/bin/ghc-pkg check --no-user-package-conf
+# Without --no-user-package-db we might pick up random packages from ~/.ghc
+	$(BIN_DIST_INST_DIR)/bin/ghc-pkg check --no-user-package-db
 
 $(eval $(call clean-target,bindisttest,all,$(BIN_DIST_INST_DIR) $(wildcard bindisttest/a/b/c/*) bindisttest/HelloWorld bindisttest/HelloWorld.o bindisttest/HelloWorld.hi bindisttest/output))
 

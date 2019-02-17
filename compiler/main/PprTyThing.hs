@@ -6,26 +6,40 @@
 --
 -----------------------------------------------------------------------------
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module PprTyThing (
-	PrintExplicitForalls,
 	pprTyThing,
-	pprTyThingInContext, pprTyThingParent_maybe,
+	pprTyThingInContext,
 	pprTyThingLoc,
 	pprTyThingInContextLoc,
 	pprTyThingHdr,
   	pprTypeForUser
   ) where
 
-import qualified GHC
-
-import GHC ( TyThing(..) )
+import TypeRep ( TyThing(..) )
 import DataCon
 import Id
-import IdInfo
 import TyCon
+import Class
+import Coercion( pprCoAxBranch )
+import CoAxiom( CoAxiom(..), brListMap )
+import HscTypes( tyThingParent_maybe )
+import Type( tidyTopType, tidyOpenType, splitForAllTys, funResultTy )
+import Kind( synTyConResKind )
+import TypeRep( pprTvBndrs, pprForAll, suppressKinds )
+import TysPrim( alphaTyVars )
+import MkIface ( tyThingToIfaceDecl )
 import TcType
-import Var
 import Name
+import VarEnv( emptyTidyEnv )
+import StaticFlags( opt_PprStyle_Debug )
+import DynFlags
 import Outputable
 import FastString
 
@@ -35,209 +49,259 @@ import FastString
 -- This should be a good source of sample code for using the GHC API to
 -- inspect source code entities.
 
-type PrintExplicitForalls = Bool
+type ShowSub = [Name]
+--   []     <=> print all sub-components of the current thing
+--   (n:ns) <=> print sub-component 'n' with ShowSub=ns
+--              elide other sub-components to "..."
+showAll :: ShowSub
+showAll = []
 
-type ShowMe = Name -> Bool
--- The ShowMe function says which sub-components to print
---   True  <=> print
---   False <=> elide to "..."
+showSub :: NamedThing n => ShowSub -> n -> Bool
+showSub []    _     = True
+showSub (n:_) thing = n == getName thing
+
+showSub_maybe :: NamedThing n => ShowSub -> n -> Maybe ShowSub
+showSub_maybe []     _     = Just []
+showSub_maybe (n:ns) thing = if n == getName thing then Just ns
+                                                   else Nothing
 
 ----------------------------
 -- | Pretty-prints a 'TyThing' with its defining location.
-pprTyThingLoc :: PrintExplicitForalls -> TyThing -> SDoc
-pprTyThingLoc pefas tyThing 
-  = showWithLoc loc (pprTyThing pefas tyThing)
-  where loc = pprNameLoc (GHC.getName tyThing)
+pprTyThingLoc :: TyThing -> SDoc
+pprTyThingLoc tyThing
+  = showWithLoc (pprDefinedAt (getName tyThing)) (pprTyThing tyThing)
 
 -- | Pretty-prints a 'TyThing'.
-pprTyThing :: PrintExplicitForalls -> TyThing -> SDoc
-pprTyThing pefas thing = ppr_ty_thing pefas (const True) thing
-
-ppr_ty_thing :: PrintExplicitForalls -> ShowMe -> TyThing -> SDoc
-ppr_ty_thing pefas _ 	 (AnId id)          = pprId         pefas id
-ppr_ty_thing pefas _ 	 (ADataCon dataCon) = pprDataConSig pefas dataCon
-ppr_ty_thing pefas show_me (ATyCon tyCon)   = pprTyCon      pefas show_me tyCon
-ppr_ty_thing pefas show_me (AClass cls)     = pprClass      pefas show_me cls
+pprTyThing :: TyThing -> SDoc
+pprTyThing thing = ppr_ty_thing (Just showAll) thing
 
 -- | Pretty-prints a 'TyThing' in context: that is, if the entity
--- is a data constructor, record selector, or class method, then 
+-- is a data constructor, record selector, or class method, then
 -- the entity's parent declaration is pretty-printed with irrelevant
 -- parts omitted.
-pprTyThingInContext :: PrintExplicitForalls -> TyThing -> SDoc
-pprTyThingInContext pefas thing
-  | Just parent <- pprTyThingParent_maybe thing
-  = ppr_ty_thing pefas (== GHC.getName thing) parent
-  | otherwise
-  = pprTyThing pefas thing
+pprTyThingInContext :: TyThing -> SDoc
+pprTyThingInContext thing
+  = go [] thing
+  where
+    go ss thing = case tyThingParent_maybe thing of
+                    Just parent -> go (getName thing : ss) parent
+                    Nothing     -> ppr_ty_thing (Just ss) thing
 
 -- | Like 'pprTyThingInContext', but adds the defining location.
-pprTyThingInContextLoc :: PrintExplicitForalls -> TyThing -> SDoc
-pprTyThingInContextLoc pefas tyThing
-  = showWithLoc (pprNameLoc (GHC.getName tyThing))
-                (pprTyThingInContext pefas tyThing)
-
-pprTyThingParent_maybe :: TyThing -> Maybe TyThing
--- (pprTyThingParent_maybe x) returns (Just p) 
--- when pprTyThingInContext sould print a declaration for p
--- (albeit with some "..." in it) when asked to show x
-pprTyThingParent_maybe (ADataCon dc) = Just (ATyCon (dataConTyCon dc))
-pprTyThingParent_maybe (AnId id)     = case idDetails id of
-      				      	 RecSelId { sel_tycon = tc } -> Just (ATyCon tc)
-      				      	 ClassOpId cls               -> Just (AClass cls)
-                                      	 _other                      -> Nothing
-pprTyThingParent_maybe _other = Nothing
+pprTyThingInContextLoc :: TyThing -> SDoc
+pprTyThingInContextLoc tyThing
+  = showWithLoc (pprDefinedAt (getName tyThing))
+                (pprTyThingInContext tyThing)
 
 -- | Pretty-prints the 'TyThing' header. For functions and data constructors
 -- the function is equivalent to 'pprTyThing' but for type constructors
 -- and classes it prints only the header part of the declaration.
-pprTyThingHdr :: PrintExplicitForalls -> TyThing -> SDoc
-pprTyThingHdr pefas (AnId id)          = pprId         pefas id
-pprTyThingHdr pefas (ADataCon dataCon) = pprDataConSig pefas dataCon
-pprTyThingHdr pefas (ATyCon tyCon)     = pprTyConHdr   pefas tyCon
-pprTyThingHdr pefas (AClass cls)       = pprClassHdr   pefas cls
+pprTyThingHdr :: TyThing -> SDoc
+pprTyThingHdr = ppr_ty_thing Nothing
 
-pprTyConHdr :: PrintExplicitForalls -> TyCon -> SDoc
-pprTyConHdr _ tyCon
-  | Just (_fam_tc, tys) <- tyConFamInst_maybe tyCon
-  = ptext keyword <+> ptext (sLit "instance") <+> pprTypeApp tyCon tys
+------------------------
+-- NOTE: We pretty-print 'TyThing' via 'IfaceDecl' so that we can reuse the
+-- 'TyCon' tidying happening in 'tyThingToIfaceDecl'. See #8776 for details.
+ppr_ty_thing :: Maybe ShowSub -> TyThing -> SDoc
+ppr_ty_thing mss tyThing = case tyThing of
+    AnId id -> pprId id
+    ATyCon tyCon -> case mss of
+        Nothing -> pprTyConHdr tyCon
+        Just ss -> pprTyCon ss tyCon
+    _ -> ppr $ tyThingToIfaceDecl tyThing
+
+pprTyConHdr :: TyCon -> SDoc
+pprTyConHdr tyCon
+  | Just (fam_tc, tys) <- tyConFamInst_maybe tyCon
+  = ptext keyword <+> ptext (sLit "instance") <+> pprTypeApp fam_tc tys
+  | Just cls <- tyConClass_maybe tyCon
+  = pprClassHdr cls
   | otherwise
-  = ptext keyword <+> opt_family <+> opt_stupid <+> ppr_bndr tyCon <+> hsep (map ppr vars)
+  = sdocWithDynFlags $ \dflags ->
+    ptext keyword <+> opt_family <+> opt_stupid <+> ppr_bndr tyCon
+    <+> pprTvBndrs (suppressKinds dflags (tyConKind tyCon) vars)
   where
-    vars | GHC.isPrimTyCon tyCon || 
-	   GHC.isFunTyCon tyCon = take (GHC.tyConArity tyCon) GHC.alphaTyVars
-	 | otherwise = GHC.tyConTyVars tyCon
+    vars | isPrimTyCon tyCon ||
+	   isFunTyCon tyCon = take (tyConArity tyCon) alphaTyVars
+	 | otherwise = tyConTyVars tyCon
 
-    keyword | GHC.isSynTyCon tyCon = sLit "type"
-            | GHC.isNewTyCon tyCon = sLit "newtype"
+    keyword | isSynTyCon tyCon = sLit "type"
+            | isNewTyCon tyCon = sLit "newtype"
             | otherwise            = sLit "data"
 
     opt_family
-      | GHC.isFamilyTyCon tyCon = ptext (sLit "family")
+      | isFamilyTyCon tyCon = ptext (sLit "family")
       | otherwise             = empty
 
     opt_stupid 	-- The "stupid theta" part of the declaration
-	| isAlgTyCon tyCon = GHC.pprThetaArrow (tyConStupidTheta tyCon)
+	| isAlgTyCon tyCon = pprThetaArrowTy (tyConStupidTheta tyCon)
 	| otherwise	   = empty	-- Returns 'empty' if null theta
 
-pprDataConSig :: PrintExplicitForalls -> GHC.DataCon -> SDoc
-pprDataConSig pefas dataCon
-  = ppr_bndr dataCon <+> dcolon <+> pprTypeForUser pefas (GHC.dataConType dataCon)
-
-pprClassHdr :: PrintExplicitForalls -> GHC.Class -> SDoc
-pprClassHdr _ cls
-  = ptext (sLit "class") <+> 
-    GHC.pprThetaArrow (GHC.classSCTheta cls) <+>
-    ppr_bndr cls <+>
-    hsep (map ppr tyVars) <+>
-    GHC.pprFundeps funDeps
+pprClassHdr :: Class -> SDoc
+pprClassHdr cls
+  = sdocWithDynFlags $ \dflags ->
+    ptext (sLit "class") <+>
+    sep [ pprThetaArrowTy (classSCTheta cls)
+        , ppr_bndr cls
+          <+> pprTvBndrs (suppressKinds dflags (tyConKind (classTyCon cls)) tvs)
+        , pprFundeps funDeps ]
   where
-     (tyVars, funDeps) = GHC.classTvsFds cls
-     
-pprId :: PrintExplicitForalls -> Var -> SDoc
-pprId pefas ident
-  = hang (ppr_bndr ident <+> dcolon)
-	 2 (pprTypeForUser pefas (GHC.idType ident))
+     (tvs, funDeps) = classTvsFds cls
 
-pprTypeForUser :: PrintExplicitForalls -> GHC.Type -> SDoc
+pprId :: Var -> SDoc
+pprId ident
+  = hang (ppr_bndr ident <+> dcolon)
+	 2 (pprTypeForUser (idType ident))
+
+pprTypeForUser :: Type -> SDoc
 -- We do two things here.
 -- a) We tidy the type, regardless
--- b) If PrintExplicitForAlls is True, we discard the foralls
+-- b) If Opt_PrintExplicitForAlls is True, we discard the foralls
 -- 	but we do so `deeply'
 -- Prime example: a class op might have type
 --	forall a. C a => forall b. Ord b => stuff
 -- Then we want to display
 --	(C a, Ord b) => stuff
-pprTypeForUser print_foralls ty 
-  | print_foralls = ppr tidy_ty
-  | otherwise     = ppr (mkPhiTy ctxt ty')
+pprTypeForUser ty
+  = sdocWithDynFlags $ \ dflags ->
+    if gopt Opt_PrintExplicitForalls dflags
+    then ppr tidy_ty
+    else ppr (mkPhiTy ctxt ty')
   where
-    tidy_ty     = tidyTopType ty
     (_, ctxt, ty') = tcSplitSigmaTy tidy_ty
+    (_, tidy_ty)   = tidyOpenType emptyTidyEnv ty
+     -- Often the types/kinds we print in ghci are fully generalised
+     -- and have no free variables, but it turns out that we sometimes
+     -- print un-generalised kinds (eg when doing :k T), so it's
+     -- better to use tidyOpenType here
 
-pprTyCon :: PrintExplicitForalls -> ShowMe -> TyCon -> SDoc
-pprTyCon pefas show_me tyCon
-  | GHC.isSynTyCon tyCon
-  = if GHC.isFamilyTyCon tyCon
-    then pprTyConHdr pefas tyCon <+> dcolon <+> 
-	 pprTypeForUser pefas (GHC.synTyConResKind tyCon)
-    else 
-      let rhs_type = GHC.synTyConType tyCon
-      in hang (pprTyConHdr pefas tyCon <+> equals) 2 (pprTypeForUser pefas rhs_type)
+pprTyCon :: ShowSub -> TyCon -> SDoc
+pprTyCon ss tyCon
+  | Just syn_rhs <- synTyConRhs_maybe tyCon
+  = case syn_rhs of
+      OpenSynFamilyTyCon    -> pp_tc_with_kind
+      BuiltInSynFamTyCon {} -> pp_tc_with_kind
+
+      ClosedSynFamilyTyCon (CoAxiom { co_ax_branches = branches })
+         -> hang closed_family_header
+              2  (vcat (brListMap (pprCoAxBranch tyCon) branches))
+
+      AbstractClosedSynFamilyTyCon
+         -> closed_family_header <+> ptext (sLit "..")
+
+      SynonymTyCon rhs_ty
+         -> hang (pprTyConHdr tyCon <+> equals)
+               2 (ppr rhs_ty)   -- Don't suppress foralls on RHS type!
+
+                                                 -- e.g. type T = forall a. a->a
+  | Just cls <- tyConClass_maybe tyCon
+  = (pp_roles (== Nominal)) $$ pprClass ss cls
+
   | otherwise
-  = pprAlgTyCon pefas show_me tyCon
+  = (pp_roles (== Representational)) $$ pprAlgTyCon ss tyCon
 
-pprAlgTyCon :: PrintExplicitForalls -> ShowMe -> TyCon -> SDoc
-pprAlgTyCon pefas show_me tyCon
-  | gadt      = pprTyConHdr pefas tyCon <+> ptext (sLit "where") $$ 
-		   nest 2 (vcat (ppr_trim show_con datacons))
-  | otherwise = hang (pprTyConHdr pefas tyCon)
-    		   2 (add_bars (ppr_trim show_con datacons))
   where
-    datacons = GHC.tyConDataCons tyCon
-    gadt = any (not . GHC.isVanillaDataCon) datacons
+      -- if, for each role, suppress_if role is True, then suppress the role
+      -- output
+    pp_roles :: (Role -> Bool) -> SDoc
+    pp_roles suppress_if
+      = sdocWithDynFlags $ \dflags ->
+        let roles = suppressKinds dflags (tyConKind tyCon) (tyConRoles tyCon)
+        in ppUnless (isFamInstTyCon tyCon || all suppress_if roles) $
+             -- Don't display roles for data family instances (yet)
+             -- See discussion on Trac #8672.
+           ptext (sLit "type role") <+> ppr tyCon <+> hsep (map ppr roles)
 
-    ok_con dc = show_me (dataConName dc) || any show_me (dataConFieldLabels dc)
+    pp_tc_with_kind = vcat [ pp_roles (const True)
+                           , pprTyConHdr tyCon <+> dcolon
+                             <+> pprTypeForUser (synTyConResKind tyCon) ]
+    closed_family_header
+       = pp_tc_with_kind <+> ptext (sLit "where")
+
+pprAlgTyCon :: ShowSub -> TyCon -> SDoc
+pprAlgTyCon ss tyCon
+  | gadt      = pprTyConHdr tyCon <+> ptext (sLit "where") $$
+		   nest 2 (vcat (ppr_trim (map show_con datacons)))
+  | otherwise = hang (pprTyConHdr tyCon)
+    		   2 (add_bars (ppr_trim (map show_con datacons)))
+  where
+    datacons = tyConDataCons tyCon
+    gadt = any (not . isVanillaDataCon) datacons
+
+    ok_con dc = showSub ss dc || any (showSub ss) (dataConFieldLabels dc)
     show_con dc
-      | ok_con dc = Just (pprDataConDecl pefas show_me gadt dc)
+      | ok_con dc = Just (pprDataConDecl ss gadt dc)
       | otherwise = Nothing
 
-pprDataConDecl :: PrintExplicitForalls -> ShowMe -> Bool -> GHC.DataCon -> SDoc
-pprDataConDecl pefas show_me gadt_style dataCon
+pprDataConDecl :: ShowSub -> Bool -> DataCon -> SDoc
+pprDataConDecl ss gadt_style dataCon
   | not gadt_style = ppr_fields tys_w_strs
-  | otherwise      = ppr_bndr dataCon <+> dcolon <+> 
-			sep [ pp_foralls, GHC.pprThetaArrow theta, pp_tau ]
+  | otherwise      = ppr_bndr dataCon <+> dcolon <+>
+			sep [ pp_foralls, pprThetaArrowTy theta, pp_tau ]
 	-- Printing out the dataCon as a type signature, in GADT style
   where
-    (forall_tvs, theta, tau) = tcSplitSigmaTy (GHC.dataConUserType dataCon)
+    (forall_tvs, theta, tau) = tcSplitSigmaTy (dataConUserType dataCon)
     (arg_tys, res_ty)        = tcSplitFunTys tau
-    labels     = GHC.dataConFieldLabels dataCon
-    stricts    = GHC.dataConStrictMarks dataCon
-    tys_w_strs = zip stricts arg_tys
-    pp_foralls | pefas     = GHC.pprForAll forall_tvs
-               | otherwise = empty
+    labels     = dataConFieldLabels dataCon
+    stricts    = dataConStrictMarks dataCon
+    tys_w_strs = zip (map user_ify stricts) arg_tys
+    pp_foralls = sdocWithDynFlags $ \dflags ->
+                 ppWhen (gopt Opt_PrintExplicitForalls dflags)
+                        (pprForAll forall_tvs)
 
     pp_tau = foldr add (ppr res_ty) tys_w_strs
     add str_ty pp_ty = pprParendBangTy str_ty <+> arrow <+> pp_ty
 
-    pprParendBangTy (bang,ty) = ppr bang <> GHC.pprParendType ty
+    pprParendBangTy (bang,ty) = ppr bang <> pprParendType ty
+    pprBangTy       (bang,ty) = ppr bang <> ppr ty
 
-    pprBangTy bang ty = ppr bang <> ppr ty
+    -- See Note [Printing bangs on data constructors]
+    user_ify :: HsBang -> HsBang
+    user_ify bang | opt_PprStyle_Debug = bang
+    user_ify HsStrict                  = HsUserBang Nothing     True
+    user_ify (HsUnpack {})             = HsUserBang (Just True) True
+    user_ify bang                      = bang
 
-    maybe_show_label (lbl,(strict,tp))
-	| show_me lbl = Just (ppr lbl <+> dcolon <+> pprBangTy strict tp)
-	| otherwise   = Nothing
+    maybe_show_label (lbl,bty)
+	| showSub ss lbl = Just (ppr_bndr lbl <+> dcolon <+> pprBangTy bty)
+	| otherwise      = Nothing
 
     ppr_fields [ty1, ty2]
-	| GHC.dataConIsInfix dataCon && null labels
+	| dataConIsInfix dataCon && null labels
 	= sep [pprParendBangTy ty1, pprInfixName dataCon, pprParendBangTy ty2]
     ppr_fields fields
 	| null labels
 	= ppr_bndr dataCon <+> sep (map pprParendBangTy fields)
 	| otherwise
-	= ppr_bndr dataCon <+> 
-		braces (sep (punctuate comma (ppr_trim maybe_show_label 
-					(zip labels fields))))
+	= ppr_bndr dataCon
+	  <+> (braces $ sep $ punctuate comma $ ppr_trim $
+               map maybe_show_label (zip labels fields))
 
-pprClass :: PrintExplicitForalls -> ShowMe -> GHC.Class -> SDoc
-pprClass pefas show_me cls
-  | null methods
-  = pprClassHdr pefas cls
-  | otherwise 
-  = hang (pprClassHdr pefas cls <+> ptext (sLit "where"))
-       2 (vcat (ppr_trim show_meth methods))
+pprClass :: ShowSub -> Class -> SDoc
+pprClass ss cls
+  | null methods && null assoc_ts
+  = pprClassHdr cls
+  | otherwise
+  = vcat [ pprClassHdr cls <+> ptext (sLit "where")
+         , nest 2 (vcat $ ppr_trim $ 
+                   map show_at assoc_ts ++ map show_meth methods)]
   where
-    methods = GHC.classMethods cls
-    show_meth id | show_me (idName id) = Just (pprClassMethod pefas id)
-	         | otherwise           = Nothing
+    methods  = classMethods cls
+    assoc_ts = classATs cls
+    show_meth id | showSub ss id  = Just (pprClassMethod id)
+	         | otherwise      = Nothing
+    show_at tc = case showSub_maybe ss tc of
+                      Just ss' -> Just (pprTyCon ss' tc)
+                      Nothing  -> Nothing
 
-pprClassMethod :: PrintExplicitForalls -> Id -> SDoc
-pprClassMethod pefas id
-  = hang (ppr_bndr id <+> dcolon) 2 (pprTypeForUser pefas op_ty)
+pprClassMethod :: Id -> SDoc
+pprClassMethod id
+  = hang (ppr_bndr id <+> dcolon) 2 (pprTypeForUser op_ty)
   where
   -- Here's the magic incantation to strip off the dictionary
   -- from the class op type.  Stolen from IfaceSyn.tyThingToIfaceDecl.
   --
-  -- It's important to tidy it *before* splitting it up, so that if 
+  -- It's important to tidy it *before* splitting it up, so that if
   -- we have	class C a b where
   --	          op :: forall a. a -> b
   -- then the inner forall on op gets renamed to a1, and we print
@@ -245,18 +309,18 @@ pprClassMethod pefas id
   --		class C a b where
   --		  op :: a1 -> b
 
-  tidy_sel_ty = tidyTopType (GHC.idType id)
-  (_sel_tyvars, rho_ty) = GHC.splitForAllTys tidy_sel_ty
-  op_ty = GHC.funResultTy rho_ty
+  tidy_sel_ty = tidyTopType (idType id)
+  (_sel_tyvars, rho_ty) = splitForAllTys tidy_sel_ty
+  op_ty = funResultTy rho_ty
 
-ppr_trim :: (a -> Maybe SDoc) -> [a] -> [SDoc]
-ppr_trim show xs
+ppr_trim :: [Maybe SDoc] -> [SDoc]
+-- Collapse a group of Nothings to a single "..."
+ppr_trim xs
   = snd (foldr go (False, []) xs)
   where
-    go x (eliding, so_far)
-	| Just doc <- show x = (False, doc : so_far)
-	| otherwise = if eliding then (True, so_far)
-		                 else (True, ptext (sLit "...") : so_far)
+    go (Just doc) (_,     so_far) = (False, doc : so_far)
+    go Nothing    (True,  so_far) = (True, so_far)
+    go Nothing    (False, so_far) = (True, ptext (sLit "...") : so_far)
 
 add_bars :: [SDoc] -> SDoc
 add_bars []      = empty
@@ -264,13 +328,21 @@ add_bars [c]     = equals <+> c
 add_bars (c:cs)  = sep ((equals <+> c) : map (char '|' <+>) cs)
 
 -- Wrap operators in ()
-ppr_bndr :: GHC.NamedThing a => a -> SDoc
-ppr_bndr a = GHC.pprParenSymName a
+ppr_bndr :: NamedThing a => a -> SDoc
+ppr_bndr a = parenSymOcc (getOccName a) (ppr (getName a))
 
 showWithLoc :: SDoc -> SDoc -> SDoc
-showWithLoc loc doc 
+showWithLoc loc doc
     = hang doc 2 (char '\t' <> comment <+> loc)
 		-- The tab tries to make them line up a bit
   where
     comment = ptext (sLit "--")
 
+{-
+Note [Printing bangs on data constructors]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+For imported data constructors the dataConStrictMarks are the
+representation choices (see Note [Bangs on data constructor arguments]
+in DataCon.lhs). So we have to fiddle a little bit here to turn them
+back into user-printable form.
+-}

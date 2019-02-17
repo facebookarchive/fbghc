@@ -71,7 +71,7 @@ Version 2.0     24 April 1997
         nest k empty = empty
     which wasn't true before.
 
-  * Fixed an obscure bug in sep that occassionally gave very wierd behaviour
+  * Fixed an obscure bug in sep that occasionally gave very weird behaviour
 
   * Added $+$
 
@@ -106,7 +106,7 @@ Relative to John's original paper, there are the following new features:
         These new ones do the obvious things:
                 char, semi, comma, colon, space,
                 parens, brackets, braces,
-                quotes, doubleQuotes
+                quotes, quote, doubleQuotes
 
 4.      The "above" combinator, $$, now overlaps its two arguments if the
         last line of the top argument stops before the first line of the second begins.
@@ -153,9 +153,6 @@ Relative to John's original paper, there are the following new features:
 
 \begin{code}
 {-# LANGUAGE BangPatterns #-}
-{-# OPTIONS -fno-warn-unused-imports #-}
--- XXX GHC 6.9 seems to be confused by unpackCString# being used only in
---     a RULE
 
 module Pretty (
         Doc,            -- Abstract
@@ -163,9 +160,9 @@ module Pretty (
 
         empty, isEmpty, nest,
 
-        char, text, ftext, ptext,
+        char, text, ftext, ptext, ztext, zeroWidthText,
         int, integer, float, double, rational,
-        parens, brackets, braces, quotes, doubleQuotes,
+        parens, brackets, braces, quotes, quote, doubleQuotes,
         semi, comma, colon, space, equals,
         lparen, rparen, lbrack, rbrack, lbrace, rbrace, cparen,
 
@@ -176,8 +173,7 @@ module Pretty (
 
         hang, punctuate,
 
---      renderStyle,            -- Haskell 1.3 only
-        render, fullRender, printDoc, showDocWith,
+        fullRender, printDoc, printDoc_, showDoc,
         bufLeftRender -- performance hack
   ) where
 
@@ -185,10 +181,8 @@ import BufWrite
 import FastString
 import FastTypes
 import Panic
-import StaticFlags
 import Numeric (fromRat)
 import System.IO
---import Foreign.Ptr (castPtr)
 
 #if defined(__GLASGOW_HASKELL__)
 --for a RULES
@@ -224,14 +218,18 @@ The primitive @Doc@ values
 \begin{code}
 empty                     :: Doc
 isEmpty                   :: Doc    -> Bool
+-- | Some text, but without any width. Use for non-printing text
+-- such as a HTML or Latex tags
+zeroWidthText :: String   -> Doc
+
 text                      :: String -> Doc
 char                      :: Char -> Doc
 
 semi, comma, colon, space, equals              :: Doc
 lparen, rparen, lbrack, rbrack, lbrace, rbrace :: Doc
 
-parens, brackets, braces  :: Doc -> Doc
-quotes, doubleQuotes      :: Doc -> Doc
+parens, brackets, braces    :: Doc -> Doc
+quotes, quote, doubleQuotes :: Doc -> Doc
 
 int      :: Int -> Doc
 integer  :: Integer -> Doc
@@ -271,9 +269,8 @@ Displaying @Doc@ values.
 
 \begin{code}
 instance Show Doc where
-  showsPrec _ doc cont = showDoc doc cont
+  showsPrec _ doc cont = showDocPlus PageMode 100 doc cont
 
-render     :: Doc -> String             -- Uses default style
 fullRender :: Mode
            -> Int                       -- Line length
            -> Float                     -- Ribbons per line
@@ -282,21 +279,10 @@ fullRender :: Mode
            -> Doc
            -> a                         -- Result
 
-{-      When we start using 1.3
-renderStyle  :: Style -> Doc -> String
-data Style = Style { lineLength     :: Int,     -- In chars
-                     ribbonsPerLine :: Float,   -- Ratio of ribbon length to line length
-                     mode :: Mode
-             }
-style :: Style          -- The default style
-style = Style { lineLength = 100, ribbonsPerLine = 2.5, mode = PageMode }
--}
-
 data Mode = PageMode            -- Normal
           | ZigZagMode          -- With zig-zag cuts
           | LeftMode            -- No indentation, infinitely long lines
           | OneLineMode         -- All on one line
-
 \end{code}
 
 
@@ -406,6 +392,7 @@ rational n = text (show (fromRat n :: Double))
 --rational n = text (show (fromRationalX n)) -- _showRational 30 n)
 
 quotes p        = char '`' <> p <> char '\''
+quote p         = char '\'' <> p
 doubleQuotes p  = char '"' <> p <> char '"'
 parens p        = char '(' <> p <> char ')'
 brackets p      = char '[' <> p <> char ']'
@@ -460,6 +447,7 @@ reduceDoc p              = p
 data TextDetails = Chr  {-#UNPACK#-}!Char
                  | Str  String
                  | PStr FastString                      -- a hashed string
+                 | ZStr FastZString                     -- a z-encoded string
                  | LStr {-#UNPACK#-}!LitString FastInt  -- a '\0'-terminated
                                                         -- array of bytes
 
@@ -554,12 +542,19 @@ isEmpty Empty = True
 isEmpty _     = False
 
 char  c = textBeside_ (Chr c) (_ILIT(1)) Empty
+
 text  s = case iUnbox (length   s) of {sl -> textBeside_ (Str s)  sl Empty}
+{-# NOINLINE [0] text #-}   -- Give the RULE a chance to fire
+                            -- It must wait till after phase 1 when
+                            -- the unpackCString first is manifested
+
 ftext :: FastString -> Doc
 ftext s = case iUnbox (lengthFS s) of {sl -> textBeside_ (PStr s) sl Empty}
 ptext :: LitString -> Doc
-ptext s_= case iUnbox (lengthLS s) of {sl -> textBeside_ (LStr s sl) sl Empty}
-  where s = {-castPtr-} s_
+ptext s = case iUnbox (lengthLS s) of {sl -> textBeside_ (LStr s sl) sl Empty}
+ztext :: FastZString -> Doc
+ztext s = case iUnbox (lengthFZS s) of {sl -> textBeside_ (ZStr s) sl Empty}
+zeroWidthText s = textBeside_ (Str s) (_ILIT(0)) Empty
 
 #if defined(__GLASGOW_HASKELL__)
 -- RULE that turns (text "abc") into (ptext (A# "abc"#)) to avoid the
@@ -882,26 +877,17 @@ oneLiner _                   = panic "oneLiner: Unhandled case"
 
 
 \begin{code}
-{-
-renderStyle Style{mode, lineLength, ribbonsPerLine} doc
-  = fullRender mode lineLength ribbonsPerLine doc ""
--}
+showDocPlus :: Mode -> Int -> Doc -> String -> String
+showDocPlus mode cols doc rest = fullRender mode cols 1.5 string_txt rest doc
 
-render doc       = showDocWith PageMode doc
-
-showDoc :: Doc -> String -> String
-showDoc doc rest = showDocWithAppend PageMode doc rest
-
-showDocWithAppend :: Mode -> Doc -> String -> String
-showDocWithAppend mode doc rest = fullRender mode 100 1.5 string_txt rest doc
-
-showDocWith :: Mode -> Doc -> String
-showDocWith mode doc = showDocWithAppend mode doc ""
+showDoc :: Mode -> Int -> Doc -> String
+showDoc mode cols doc = showDocPlus mode cols doc ""
 
 string_txt :: TextDetails -> String -> String
 string_txt (Chr c)   s  = c:s
 string_txt (Str s1)  s2 = s1 ++ s2
 string_txt (PStr s1) s2 = unpackFS s1 ++ s2
+string_txt (ZStr s1) s2 = zString s1 ++ s2
 string_txt (LStr s1 _) s2 = unpackLitString s1 ++ s2
 \end{code}
 
@@ -998,13 +984,17 @@ spaces n | n <=# _ILIT(0) = ""
 \end{code}
 
 \begin{code}
-pprCols :: Int
-pprCols = opt_PprCols
+printDoc :: Mode -> Int -> Handle -> Doc -> IO ()
+-- printDoc adds a newline to the end
+printDoc mode cols hdl doc = printDoc_ mode cols hdl (doc $$ text "")
 
-printDoc :: Mode -> Handle -> Doc -> IO ()
-printDoc LeftMode hdl doc
+printDoc_ :: Mode -> Int -> Handle -> Doc -> IO ()
+-- printDoc_ does not add a newline at the end, so that
+-- successive calls can output stuff on the same line
+-- Rather like putStr vs putStrLn
+printDoc_ LeftMode _ hdl doc
   = do { printLeftRender hdl doc; hFlush hdl }
-printDoc mode hdl doc
+printDoc_ mode pprCols hdl doc
   = do { fullRender mode pprCols 1.5 put done doc ;
          hFlush hdl }
   where
@@ -1013,9 +1003,10 @@ printDoc mode hdl doc
     put (PStr s) next = hPutStr  hdl (unpackFS s) >> next
                         -- NB. not hPutFS, we want this to go through
                         -- the I/O library's encoding layer. (#3398)
+    put (ZStr s) next = hPutFZS  hdl s >> next
     put (LStr s l) next = hPutLitString hdl s l >> next
 
-    done = hPutChar hdl '\n'
+    done = return () -- hPutChar hdl '\n'
 
   -- some versions of hPutBuf will barf if the length is zero
 hPutLitString :: Handle -> Ptr a -> Int# -> IO ()
@@ -1064,6 +1055,7 @@ layLeft b (TextBeside s _ p) = put b s >> layLeft b p
     put b (Chr c)    = bPutChar b c
     put b (Str s)    = bPutStr  b s
     put b (PStr s)   = bPutFS   b s
+    put b (ZStr s)   = bPutFZS  b s
     put b (LStr s l) = bPutLitString b s l
 layLeft _ _                  = panic "layLeft: Unhandled case"
 \end{code}

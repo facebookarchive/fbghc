@@ -2,7 +2,7 @@
 module Main where
 
 import Prelude hiding ( mod, id, mapM )
-import GHC hiding (flags)
+import GHC
 --import Packages
 import HscTypes         ( isBootSummary )
 import Digraph          ( flattenSCCs )
@@ -11,17 +11,20 @@ import HscTypes         ( msHsFilePath )
 import Name             ( getOccString )
 --import ErrUtils         ( printBagOfErrors )
 import Panic            ( panic )
-import DynFlags         ( defaultDynFlags )
+import DynFlags         ( defaultFatalMessager, defaultFlushOut )
 import Bag
 import Exception
 import FastString
 import MonadUtils       ( liftIO )
+import SrcLoc
 
--- Every GHC comes with Cabal anyways, so this is not a bad new dependency
-import Distribution.Simple.GHC ( ghcOptions )
+import Distribution.Simple.GHC ( componentGhcOptions )
 import Distribution.Simple.Configure ( getPersistBuildConfig )
+import Distribution.Simple.Compiler ( compilerVersion )
+import Distribution.Simple.Program.GHC ( renderGhcOptions )
 import Distribution.PackageDescription ( library, libBuildInfo )
-import Distribution.Simple.LocalBuildInfo ( localPkgDescr, buildDir, libraryConfig )
+import Distribution.Simple.LocalBuildInfo
+import qualified Distribution.Verbosity as V
 
 import Control.Monad hiding (mapM)
 import System.Environment
@@ -49,7 +52,7 @@ type FileName = String
 type ThingName = String -- name of a defined entity in a Haskell program
 
 -- A definition we have found (we know its containing module, name, and location)
-data FoundThing = FoundThing ModuleName ThingName SrcLoc
+data FoundThing = FoundThing ModuleName ThingName RealSrcLoc
 
 -- Data we have obtained from a file (list of things we found)
 data FileData = FileData FileName [FoundThing] (Map Int String)
@@ -101,7 +104,7 @@ main = do
                      then Just `liftM` openFile "TAGS" openFileMode
                      else return Nothing
 
-  GHC.defaultErrorHandler (defaultDynFlags (panic "No settings")) $
+  GHC.defaultErrorHandler defaultFatalMessager defaultFlushOut $
     runGhc (Just ghc_topdir) $ do
       --liftIO $ print "starting up session"
       dflags <- getSessionDynFlags
@@ -179,12 +182,17 @@ flagsFromCabal :: FilePath -> IO [String]
 flagsFromCabal distPref = do
   lbi <- getPersistBuildConfig distPref
   let pd = localPkgDescr lbi
-  case (library pd, libraryConfig lbi) of
+      findLibraryConfig []                         = Nothing
+      findLibraryConfig ((CLibName, clbi, _) :  _) = Just clbi
+      findLibraryConfig (_                   : xs) = findLibraryConfig xs
+      mLibraryConfig = findLibraryConfig (componentsConfigs lbi)
+  case (library pd, mLibraryConfig) of
     (Just lib, Just clbi) ->
       let bi = libBuildInfo lib
           odir = buildDir lbi
-          opts = ghcOptions lbi bi clbi odir
-      in return opts
+          opts = componentGhcOptions V.normal lbi bi clbi odir
+          version = compilerVersion (compiler lbi)
+      in return $ renderGhcOptions version opts
     _ -> error "no library"
 
 ----------------------------------------------------------------
@@ -249,20 +257,22 @@ boundValues mod group =
   let vals = case hs_valds group of
                ValBindsOut nest _sigs ->
                    [ x | (_rec, binds) <- nest
-                       , bind <- bagToList binds
+                       , (_, bind) <- bagToList binds
                        , x <- boundThings mod bind ]
                _other -> error "boundValues"
-      tys = [ n | ns <- map hsTyClDeclBinders (concat (hs_tyclds group))
+      tys = [ n | ns <- map hsLTyClDeclBinders (tyClGroupConcat (hs_tyclds group))
                 , n <- map found ns ]
       fors = concat $ map forBound (hs_fords group)
              where forBound lford = case unLoc lford of
-                                      ForeignImport n _ _ -> [found n]
+                                      ForeignImport n _ _ _ -> [found n]
                                       ForeignExport { } -> []
   in vals ++ tys ++ fors
   where found = foundOfLName mod
 
-startOfLocated :: Located a -> SrcLoc
-startOfLocated lHs = srcSpanStart $ getLoc lHs
+startOfLocated :: Located a -> RealSrcLoc
+startOfLocated lHs = case getLoc lHs of
+                     RealSrcSpan l -> realSrcSpanStart l
+                     UnhelpfulSpan _ -> panic "startOfLocated UnhelpfulSpan"
 
 foundOfLName :: ModuleName -> Located Name -> FoundThing
 foundOfLName mod id = FoundThing mod (getOccString $ unLoc id) (startOfLocated id)
@@ -274,6 +284,7 @@ boundThings modname lbinding =
     PatBind { pat_lhs = lhs } -> patThings lhs []
     VarBind { var_id = id } -> [FoundThing modname (getOccString id) (startOfLocated lbinding)]
     AbsBinds { } -> [] -- nothing interesting in a type abstraction
+    PatSynBind { patsyn_id = id } -> [thing id]
   where thing = foundOfLName modname
         patThings lpat tl =
           let loc = startOfLocated lpat
@@ -285,15 +296,14 @@ boundThings modname lbinding =
                AsPat id p -> patThings p (thing id : tl)
                ParPat p -> patThings p tl
                BangPat p -> patThings p tl
-               ListPat ps _ -> foldr patThings tl ps
+               ListPat ps _ _ -> foldr patThings tl ps
                TuplePat ps _ _ -> foldr patThings tl ps
                PArrPat ps _ -> foldr patThings tl ps
                ConPatIn _ conargs -> conArgs conargs tl
-               ConPatOut _ _ _ _ conargs _ -> conArgs conargs tl
+               ConPatOut{ pat_args = conargs } -> conArgs conargs tl
                LitPat _ -> tl
                NPat _ _ _ -> tl -- form of literal pattern?
                NPlusKPat id _ _ _ -> thing id : tl
-               TypePat _ -> tl -- XXX need help here
                SigPatIn p _ -> patThings p tl
                SigPatOut p _ -> patThings p tl
                _ -> error "boundThings"

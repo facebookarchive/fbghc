@@ -4,25 +4,37 @@
 \section[CoreMonad]{The core pipeline monad}
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 {-# LANGUAGE UndecidableInstances #-}
 
 module CoreMonad (
     -- * Configuration of the core-to-core passes
-    CoreToDo(..),
+    CoreToDo(..), runWhen, runMaybe,
     SimplifierMode(..),
     FloatOutSwitches(..),
-    getCoreToDo, dumpSimplPhase,
+    dumpSimplPhase, pprPassDetails, 
+
+    -- * Plugins
+    PluginPass, Plugin(..), CommandLineOption, 
+    defaultPlugin, bindsOnlyPass,
 
     -- * Counting
     SimplCount, doSimplTick, doFreeSimplTick, simplCountN,
-    pprSimplCount, plusSimplCount, zeroSimplCount, isZeroSimplCount, Tick(..),
+    pprSimplCount, plusSimplCount, zeroSimplCount, 
+    isZeroSimplCount, hasDetailedCounts, Tick(..),
 
     -- * The monad
     CoreM, runCoreM,
     
     -- ** Reading from the monad
     getHscEnv, getRuleBase, getModule,
-    getDynFlags, getOrigNameCache,
+    getDynFlags, getOrigNameCache, getPackageFamInstEnv,
     
     -- ** Writing to the monad
     addSimplCount,
@@ -31,11 +43,15 @@ module CoreMonad (
     liftIO, liftIOWithCount,
     liftIO1, liftIO2, liftIO3, liftIO4,
     
+    -- ** Global initialization
+    reinitializeGlobals,
+    
     -- ** Dealing with annotations
     getAnnotations, getFirstAnnotations,
     
     -- ** Debug output
-    showPass, endPass, endIteration, dumpIfSet,
+    showPass, endPass, dumpPassResult, lintPassResult, 
+    lintInteractiveExpr, dumpIfSet,
 
     -- ** Screen output
     putMsg, putMsgS, errorMsg, errorMsgS, 
@@ -55,45 +71,60 @@ import Name( Name )
 import CoreSyn
 import PprCore
 import CoreUtils
-import CoreLint		( lintCoreBindings )
-import PrelNames        ( iNTERACTIVE )
+import CoreLint		( lintCoreBindings, lintExpr )
 import HscTypes
-import Module           ( Module )
+import Module
 import DynFlags
 import StaticFlags	
 import Rules            ( RuleBase )
 import BasicTypes       ( CompilerPhase(..) )
 import Annotations
-import Id		( Id )
 
 import IOEnv hiding     ( liftIO, failM, failWithM )
 import qualified IOEnv  ( liftIO )
 import TcEnv            ( tcLookupGlobal )
-import TcRnMonad        ( TcM, initTc )
+import TcRnMonad        ( initTcForLookup )
+import InstEnv          ( instanceDFunId )
+import Type             ( tyVarsOfType )
+import Id               ( idType )
+import Var
+import VarSet
 
 import Outputable
 import FastString
 import qualified ErrUtils as Err
 import Bag
 import Maybes
+import SrcLoc
 import UniqSupply
 import UniqFM       ( UniqFM, mapUFM, filterUFM )
 import MonadUtils
 
-import Util		( split )
-import Data.List	( intersperse )
+import Util ( split )
+import ListSetOps	( runs )
+import Data.List
+import Data.Ord
 import Data.Dynamic
 import Data.IORef
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Word
+import qualified Control.Applicative as A
 import Control.Monad
 
 import Prelude hiding   ( read )
 
 #ifdef GHCI
+import Control.Concurrent.MVar (MVar)
+import Linker ( PersistentLinkerState, saveLinkerGlobals, restoreLinkerGlobals )
 import {-# SOURCE #-} TcSplice ( lookupThName_maybe )
 import qualified Language.Haskell.TH as TH
+#else
+saveLinkerGlobals :: IO ()
+saveLinkerGlobals = return ()
+
+restoreLinkerGlobals :: () -> IO ()
+restoreLinkerGlobals () = return ()
 #endif
 \end{code}
 
@@ -109,61 +140,72 @@ stuff before and after core passes, and do Core Lint when necessary.
 
 \begin{code}
 showPass :: DynFlags -> CoreToDo -> IO ()
-showPass dflags pass = Err.showPass dflags (showSDoc (ppr pass))
+showPass dflags pass = Err.showPass dflags (showPpr dflags pass)
 
-endPass :: DynFlags -> CoreToDo -> [CoreBind] -> [CoreRule] -> IO ()
-endPass dflags pass = dumpAndLint dflags True pass empty (coreDumpFlag pass)
-
--- Same as endPass but doesn't dump Core even with -dverbose-core2core
-endIteration :: DynFlags -> CoreToDo -> Int -> [CoreBind] -> [CoreRule] -> IO ()
-endIteration dflags pass n
-  = dumpAndLint dflags False pass (ptext (sLit "iteration=") <> int n)
-                (Just Opt_D_dump_simpl_iterations)
-
-dumpIfSet :: Bool -> CoreToDo -> SDoc -> SDoc -> IO ()
-dumpIfSet dump_me pass extra_info doc
-  = Err.dumpIfSet dump_me (showSDoc (ppr pass <+> extra_info)) doc
-
-dumpAndLint :: DynFlags -> Bool -> CoreToDo -> SDoc -> Maybe DynFlag
-            -> [CoreBind] -> [CoreRule] -> IO ()
--- The "show_all" parameter says to print dump if -dverbose-core2core is on
-dumpAndLint dflags show_all pass extra_info mb_dump_flag binds rules
-  = do {  -- Report result size if required
-	  -- This has the side effect of forcing the intermediate to be evaluated
-       ; Err.debugTraceMsg dflags 2 $
-		(text "    Result size =" <+> int (coreBindsSize binds))
-
-	-- Report verbosely, if required
-       ; let pass_name = showSDoc (ppr pass <+> extra_info)
-             dump_doc  = pprCoreBindings binds 
-                         $$ ppUnless (null rules) pp_rules
-
-       ; case mb_dump_flag of
-            Nothing        -> return ()
-            Just dump_flag -> Err.dumpIfSet_dyn_or dflags dump_flags pass_name dump_doc
-               where
-                 dump_flags | show_all  = [dump_flag, Opt_D_verbose_core2core]
-		 	    | otherwise = [dump_flag] 
-
-	-- Type check
-       ; when (dopt Opt_DoCoreLinting dflags) $
-         do { let (warns, errs) = lintCoreBindings binds
-            ; Err.showPass dflags ("Core Linted result of " ++ pass_name)
-            ; displayLintResults dflags pass warns errs binds  } }
+endPass :: HscEnv -> CoreToDo -> CoreProgram -> [CoreRule] -> IO ()
+endPass hsc_env pass binds rules
+  = do { dumpPassResult dflags mb_flag (ppr pass) (pprPassDetails pass) binds rules
+       ; lintPassResult hsc_env pass binds }      
   where
+    dflags = hsc_dflags hsc_env 
+    mb_flag = case coreDumpFlag pass of
+                Just flag | dopt flag dflags                    -> Just flag
+                          | dopt Opt_D_verbose_core2core dflags -> Just flag
+                _ -> Nothing
+
+dumpIfSet :: DynFlags -> Bool -> CoreToDo -> SDoc -> SDoc -> IO ()
+dumpIfSet dflags dump_me pass extra_info doc
+  = Err.dumpIfSet dflags dump_me (showSDoc dflags (ppr pass <+> extra_info)) doc
+
+dumpPassResult :: DynFlags 
+               -> Maybe DumpFlag		-- Just df => show details in a file whose
+	       	  			--            name is specified by df
+               -> SDoc 			-- Header
+               -> SDoc 			-- Extra info to appear after header
+               -> CoreProgram -> [CoreRule] 
+               -> IO ()
+dumpPassResult dflags mb_flag hdr extra_info binds rules
+  | Just flag <- mb_flag
+  = Err.dumpSDoc dflags flag (showSDoc dflags hdr) dump_doc
+
+  | otherwise
+  = Err.debugTraceMsg dflags 2 size_doc
+          -- Report result size 
+	  -- This has the side effect of forcing the intermediate to be evaluated
+
+  where
+    size_doc = sep [text "Result size of" <+> hdr, nest 2 (equals <+> ppr (coreBindsStats binds))]
+
+    dump_doc  = vcat [ nest 2 extra_info
+		     , size_doc
+                     , blankLine
+                     , pprCoreBindings binds 
+                     , ppUnless (null rules) pp_rules ]
     pp_rules = vcat [ blankLine
                     , ptext (sLit "------ Local rules for imported ids --------")
                     , pprRules rules ]
 
+lintPassResult :: HscEnv -> CoreToDo -> CoreProgram -> IO ()
+lintPassResult hsc_env pass binds
+  | not (gopt Opt_DoCoreLinting dflags)
+  = return ()
+  | otherwise
+  = do { let (warns, errs) = lintCoreBindings (interactiveInScope hsc_env) binds
+       ; Err.showPass dflags ("Core Linted result of " ++ showPpr dflags pass)
+       ; displayLintResults dflags pass warns errs binds  }
+  where 
+    dflags = hsc_dflags hsc_env
+
 displayLintResults :: DynFlags -> CoreToDo
-                   -> Bag Err.Message -> Bag Err.Message -> [CoreBind]
+                   -> Bag Err.MsgDoc -> Bag Err.MsgDoc -> CoreProgram
                    -> IO ()
 displayLintResults dflags pass warns errs binds
   | not (isEmptyBag errs)
-  = do { printDump (vcat [ banner "errors", Err.pprMessageBag errs
-			 , ptext (sLit "*** Offending Program ***")
-			 , pprCoreBindings binds
-			 , ptext (sLit "*** End of Offense ***") ])
+  = do { log_action dflags dflags Err.SevDump noSrcSpan defaultDumpStyle
+           (vcat [ lint_banner "errors" (ppr pass), Err.pprMessageBag errs
+                 , ptext (sLit "*** Offending Program ***")
+                 , pprCoreBindings binds
+                 , ptext (sLit "*** End of Offense ***") ])
        ; Err.ghcExit dflags 1 }
 
   | not (isEmptyBag warns)
@@ -174,19 +216,70 @@ displayLintResults dflags pass warns errs binds
 	-- group.  Only afer a round of simplification are they unravelled.
   , not opt_NoDebugOutput
   , showLintWarnings pass
-  = printDump (banner "warnings" $$ Err.pprMessageBag warns)
+  = log_action dflags dflags Err.SevDump noSrcSpan defaultDumpStyle
+        (lint_banner "warnings" (ppr pass) $$ Err.pprMessageBag warns)
 
   | otherwise = return ()
   where
-    banner string = ptext (sLit "*** Core Lint")      <+> text string 
-                    <+> ptext (sLit ": in result of") <+> ppr pass
-                    <+> ptext (sLit "***")
+
+lint_banner :: String -> SDoc -> SDoc
+lint_banner string pass = ptext (sLit "*** Core Lint")      <+> text string 
+                          <+> ptext (sLit ": in result of") <+> pass
+                          <+> ptext (sLit "***")
 
 showLintWarnings :: CoreToDo -> Bool
 -- Disable Lint warnings on the first simplifier pass, because
 -- there may be some INLINE knots still tied, which is tiresomely noisy
 showLintWarnings (CoreDoSimplify _ (SimplMode { sm_phase = InitialPhase })) = False
 showLintWarnings _ = True
+
+lintInteractiveExpr :: String -> HscEnv -> CoreExpr -> IO ()
+lintInteractiveExpr what hsc_env expr
+  | not (gopt Opt_DoCoreLinting dflags)
+  = return ()
+  | Just err <- lintExpr (interactiveInScope hsc_env) expr 
+  = do { display_lint_err err
+       ; Err.ghcExit dflags 1 }
+  | otherwise
+  = return ()
+  where
+    dflags = hsc_dflags hsc_env
+
+    display_lint_err err
+      = do { log_action dflags dflags Err.SevDump noSrcSpan defaultDumpStyle
+               (vcat [ lint_banner "errors" (text what) 
+                     , err
+                     , ptext (sLit "*** Offending Program ***")
+                     , pprCoreExpr expr
+                     , ptext (sLit "*** End of Offense ***") ])
+           ; Err.ghcExit dflags 1 }
+
+interactiveInScope :: HscEnv -> [Var]
+-- In GHCi we may lint expressions, or bindings arising from 'deriving'
+-- clauses, that mention variables bound in the interactive context.
+-- These are Local things (see Note [Interactively-bound Ids in GHCi] in HscTypes).
+-- So we have to tell Lint about them, lest it reports them as out of scope.
+-- 
+-- We do this by find local-named things that may appear free in interactive
+-- context.  This function is pretty revolting and quite possibly not quite right.
+-- When we are not in GHCi, the interactive context (hsc_IC hsc_env) is empty
+-- so this is a (cheap) no-op.
+-- 
+-- See Trac #8215 for an example
+interactiveInScope hsc_env 
+  = varSetElems tyvars ++ ids
+  where
+    -- C.f. TcRnDriver.setInteractiveContext, Desugar.deSugarExpr
+    ictxt                   = hsc_IC hsc_env
+    (cls_insts, _fam_insts) = ic_instances ictxt
+    te1    = mkTypeEnvWithImplicits (ic_tythings ictxt)
+    te     = extendTypeEnvWithIds te1 (map instanceDFunId cls_insts)
+    ids    = typeEnvIds te
+    tyvars = foldr (unionVarSet . tyVarsOfType . idType) emptyVarSet ids
+              -- Why the type variables?  How can the top level envt have free tyvars?
+              -- I think it's because of the GHCi debugger, which can bind variables
+              --   f :: [t] -> [t]
+              -- where t is a RuntimeUnk (see TcType)
 \end{code}
 
 
@@ -198,6 +291,7 @@ showLintWarnings _ = True
 %************************************************************************
 
 \begin{code}
+
 data CoreToDo           -- These are diff core-to-core passes,
                         -- which may be invoked in any order,
                         -- as many times as you like.
@@ -205,17 +299,17 @@ data CoreToDo           -- These are diff core-to-core passes,
   = CoreDoSimplify      -- The core-to-core simplifier.
         Int                    -- Max iterations
         SimplifierMode
-
+  | CoreDoPluginPass String PluginPass
   | CoreDoFloatInwards
   | CoreDoFloatOutwards FloatOutSwitches
   | CoreLiberateCase
   | CoreDoPrintCore
   | CoreDoStaticArgs
+  | CoreDoCallArity
   | CoreDoStrictness
   | CoreDoWorkerWrapper
   | CoreDoSpecialising
   | CoreDoSpecConstr
-  | CoreDoGlomBinds
   | CoreCSE
   | CoreDoRuleCheck CompilerPhase String   -- Check for non-application of rules
                                            -- matching this string
@@ -223,18 +317,24 @@ data CoreToDo           -- These are diff core-to-core passes,
   | CoreDoNothing                -- Useful when building up
   | CoreDoPasses [CoreToDo]      -- lists of these things
 
-  | CoreDesugar	 -- Not strictly a core-to-core pass, but produces
-                 -- Core output, and hence useful to pass to endPass
+  | CoreDesugar    -- Right after desugaring, no simple optimisation yet!
+  | CoreDesugarOpt -- CoreDesugarXXX: Not strictly a core-to-core pass, but produces
+                       --                 Core output, and hence useful to pass to endPass
 
   | CoreTidy
   | CorePrep
 
-coreDumpFlag :: CoreToDo -> Maybe DynFlag
+\end{code}
+
+\begin{code}
+coreDumpFlag :: CoreToDo -> Maybe DumpFlag
 coreDumpFlag (CoreDoSimplify {})      = Just Opt_D_dump_simpl_phases
+coreDumpFlag (CoreDoPluginPass {})    = Just Opt_D_dump_core_pipeline
 coreDumpFlag CoreDoFloatInwards       = Just Opt_D_verbose_core2core
 coreDumpFlag (CoreDoFloatOutwards {}) = Just Opt_D_verbose_core2core
 coreDumpFlag CoreLiberateCase         = Just Opt_D_verbose_core2core
 coreDumpFlag CoreDoStaticArgs 	      = Just Opt_D_verbose_core2core
+coreDumpFlag CoreDoCallArity 	      = Just Opt_D_dump_call_arity
 coreDumpFlag CoreDoStrictness 	      = Just Opt_D_dump_stranal
 coreDumpFlag CoreDoWorkerWrapper      = Just Opt_D_dump_worker_wrapper
 coreDumpFlag CoreDoSpecialising       = Just Opt_D_dump_spec
@@ -242,37 +342,42 @@ coreDumpFlag CoreDoSpecConstr         = Just Opt_D_dump_spec
 coreDumpFlag CoreCSE                  = Just Opt_D_dump_cse 
 coreDumpFlag CoreDoVectorisation      = Just Opt_D_dump_vect
 coreDumpFlag CoreDesugar              = Just Opt_D_dump_ds 
+coreDumpFlag CoreDesugarOpt           = Just Opt_D_dump_ds 
 coreDumpFlag CoreTidy                 = Just Opt_D_dump_simpl
 coreDumpFlag CorePrep                 = Just Opt_D_dump_prep
 
 coreDumpFlag CoreDoPrintCore         = Nothing
 coreDumpFlag (CoreDoRuleCheck {})    = Nothing
 coreDumpFlag CoreDoNothing           = Nothing
-coreDumpFlag CoreDoGlomBinds         = Nothing
 coreDumpFlag (CoreDoPasses {})       = Nothing
 
 instance Outputable CoreToDo where
-  ppr (CoreDoSimplify n md)  = ptext (sLit "Simplifier")
-                               <+> ppr md
-                                 <+> ptext (sLit "max-iterations=") <> int n
+  ppr (CoreDoSimplify _ _)     = ptext (sLit "Simplifier")
+  ppr (CoreDoPluginPass s _)   = ptext (sLit "Core plugin: ") <+> text s
   ppr CoreDoFloatInwards       = ptext (sLit "Float inwards")
   ppr (CoreDoFloatOutwards f)  = ptext (sLit "Float out") <> parens (ppr f)
   ppr CoreLiberateCase         = ptext (sLit "Liberate case")
   ppr CoreDoStaticArgs 	       = ptext (sLit "Static argument")
+  ppr CoreDoCallArity	       = ptext (sLit "Called arity analysis")
   ppr CoreDoStrictness 	       = ptext (sLit "Demand analysis")
   ppr CoreDoWorkerWrapper      = ptext (sLit "Worker Wrapper binds")
   ppr CoreDoSpecialising       = ptext (sLit "Specialise")
   ppr CoreDoSpecConstr         = ptext (sLit "SpecConstr")
   ppr CoreCSE                  = ptext (sLit "Common sub-expression")
   ppr CoreDoVectorisation      = ptext (sLit "Vectorisation")
-  ppr CoreDesugar              = ptext (sLit "Desugar")
+  ppr CoreDesugar              = ptext (sLit "Desugar (before optimization)")
+  ppr CoreDesugarOpt           = ptext (sLit "Desugar (after optimization)")
   ppr CoreTidy                 = ptext (sLit "Tidy Core")
   ppr CorePrep 		       = ptext (sLit "CorePrep")
   ppr CoreDoPrintCore          = ptext (sLit "Print core")
   ppr (CoreDoRuleCheck {})     = ptext (sLit "Rule check")
-  ppr CoreDoGlomBinds          = ptext (sLit "Glom binds")
   ppr CoreDoNothing            = ptext (sLit "CoreDoNothing")
   ppr (CoreDoPasses {})        = ptext (sLit "CoreDoPasses")
+
+pprPassDetails :: CoreToDo -> SDoc
+pprPassDetails (CoreDoSimplify n md) = vcat [ ptext (sLit "Max iterations =") <+> int n 
+                                            , ppr md ]
+pprPassDetails _ = empty
 \end{code}
 
 \begin{code}
@@ -327,200 +432,6 @@ pprFloatOutSwitches sw
      [ ptext (sLit "Lam =")    <+> ppr (floatOutLambdas sw)
      , ptext (sLit "Consts =") <+> ppr (floatOutConstants sw)
      , ptext (sLit "PAPs =")   <+> ppr (floatOutPartialApplications sw) ])
-\end{code}
-
-
-%************************************************************************
-%*									*
-           Generating the main optimisation pipeline
-%*									*
-%************************************************************************
-
-\begin{code}
-getCoreToDo :: DynFlags -> [CoreToDo]
-getCoreToDo dflags
-  = core_todo
-  where
-    opt_level     = optLevel           dflags
-    phases        = simplPhases        dflags
-    max_iter      = maxSimplIterations dflags
-    rule_check    = ruleCheck          dflags
-    strictness    = dopt Opt_Strictness   		  dflags
-    full_laziness = dopt Opt_FullLaziness 		  dflags
-    do_specialise = dopt Opt_Specialise   		  dflags
-    do_float_in   = dopt Opt_FloatIn      		  dflags          
-    cse           = dopt Opt_CSE                          dflags
-    spec_constr   = dopt Opt_SpecConstr                   dflags
-    liberate_case = dopt Opt_LiberateCase                 dflags
-    static_args   = dopt Opt_StaticArgumentTransformation dflags
-    rules_on      = dopt Opt_EnableRewriteRules           dflags
-    eta_expand_on = dopt Opt_DoLambdaEtaExpansion         dflags
-
-    maybe_rule_check phase = runMaybe rule_check (CoreDoRuleCheck phase)
-
-    maybe_strictness_before phase
-      = runWhen (phase `elem` strictnessBefore dflags) CoreDoStrictness
-
-    base_mode = SimplMode { sm_phase      = panic "base_mode"
-                          , sm_names      = []
-                          , sm_rules      = rules_on
-                          , sm_eta_expand = eta_expand_on
-                          , sm_inline     = True
-                          , sm_case_case  = True }
-
-    simpl_phase phase names iter
-      = CoreDoPasses
-      $   [ maybe_strictness_before phase
-          , CoreDoSimplify iter
-                (base_mode { sm_phase = Phase phase
-                           , sm_names = names })
-
-          , maybe_rule_check (Phase phase) ]
-
-          -- Vectorisation can introduce a fair few common sub expressions involving 
-          --  DPH primitives. For example, see the Reverse test from dph-examples.
-          --  We need to eliminate these common sub expressions before their definitions
-          --  are inlined in phase 2. The CSE introduces lots of  v1 = v2 bindings, 
-          --  so we also run simpl_gently to inline them.
-      ++  (if dopt Opt_Vectorise dflags && phase == 3
-	    then [CoreCSE, simpl_gently]
-	    else [])
-
-    vectorisation
-      = runWhen (dopt Opt_Vectorise dflags) $
-          CoreDoPasses [ simpl_gently, CoreDoVectorisation ]
-
-                -- By default, we have 2 phases before phase 0.
-
-                -- Want to run with inline phase 2 after the specialiser to give
-                -- maximum chance for fusion to work before we inline build/augment
-                -- in phase 1.  This made a difference in 'ansi' where an
-                -- overloaded function wasn't inlined till too late.
-
-                -- Need phase 1 so that build/augment get
-                -- inlined.  I found that spectral/hartel/genfft lost some useful
-                -- strictness in the function sumcode' if augment is not inlined
-                -- before strictness analysis runs
-    simpl_phases = CoreDoPasses [ simpl_phase phase ["main"] max_iter
-                                | phase <- [phases, phases-1 .. 1] ]
-
-
-        -- initial simplify: mk specialiser happy: minimum effort please
-    simpl_gently = CoreDoSimplify max_iter
-                       (base_mode { sm_phase = InitialPhase
-                                  , sm_names = ["Gentle"]
-                                  , sm_rules = rules_on   -- Note [RULEs enabled in SimplGently]
-                                  , sm_inline = False
-                                  , sm_case_case = False })
-                          -- Don't do case-of-case transformations.
-                          -- This makes full laziness work better
-
-    core_todo =
-     if opt_level == 0 then
-       [vectorisation,
-        simpl_phase 0 ["final"] max_iter]
-     else {- opt_level >= 1 -} [
-
-    -- We want to do the static argument transform before full laziness as it
-    -- may expose extra opportunities to float things outwards. However, to fix
-    -- up the output of the transformation we need at do at least one simplify
-    -- after this before anything else
-        runWhen static_args (CoreDoPasses [ simpl_gently, CoreDoStaticArgs ]),
-
-        -- We run vectorisation here for now, but we might also try to run
-        -- it later
-        vectorisation,
-
-        -- initial simplify: mk specialiser happy: minimum effort please
-        simpl_gently,
-
-        -- Specialisation is best done before full laziness
-        -- so that overloaded functions have all their dictionary lambdas manifest
-        runWhen do_specialise CoreDoSpecialising,
-
-        runWhen full_laziness $
-           CoreDoFloatOutwards FloatOutSwitches {
-                                 floatOutLambdas   = Just 0,
-                                 floatOutConstants = True,
-                                 floatOutPartialApplications = False },
-      		-- Was: gentleFloatOutSwitches	
-                --
-		-- I have no idea why, but not floating constants to
-		-- top level is very bad in some cases.
-                --
-		-- Notably: p_ident in spectral/rewrite
-		-- 	    Changing from "gentle" to "constantsOnly"
-		-- 	    improved rewrite's allocation by 19%, and
-		-- 	    made 0.0% difference to any other nofib
-		-- 	    benchmark
-                --
-                -- Not doing floatOutPartialApplications yet, we'll do
-                -- that later on when we've had a chance to get more
-                -- accurate arity information.  In fact it makes no
-                -- difference at all to performance if we do it here,
-                -- but maybe we save some unnecessary to-and-fro in
-                -- the simplifier.
-
-        runWhen do_float_in CoreDoFloatInwards,
-
-        simpl_phases,
-
-                -- Phase 0: allow all Ids to be inlined now
-                -- This gets foldr inlined before strictness analysis
-
-                -- At least 3 iterations because otherwise we land up with
-                -- huge dead expressions because of an infelicity in the
-                -- simpifier.
-                --      let k = BIG in foldr k z xs
-                -- ==>  let k = BIG in letrec go = \xs -> ...(k x).... in go xs
-                -- ==>  let k = BIG in letrec go = \xs -> ...(BIG x).... in go xs
-                -- Don't stop now!
-        simpl_phase 0 ["main"] (max max_iter 3),
-
-        runWhen strictness (CoreDoPasses [
-                CoreDoStrictness,
-                CoreDoWorkerWrapper,
-                CoreDoGlomBinds,
-                simpl_phase 0 ["post-worker-wrapper"] max_iter
-                ]),
-
-        runWhen full_laziness $
-           CoreDoFloatOutwards FloatOutSwitches {
-                                 floatOutLambdas   = floatLamArgs dflags,
-                                 floatOutConstants = True,
-                                 floatOutPartialApplications = True },
-                -- nofib/spectral/hartel/wang doubles in speed if you
-                -- do full laziness late in the day.  It only happens
-                -- after fusion and other stuff, so the early pass doesn't
-                -- catch it.  For the record, the redex is
-                --        f_el22 (f_el21 r_midblock)
-
-
-        runWhen cse CoreCSE,
-                -- We want CSE to follow the final full-laziness pass, because it may
-                -- succeed in commoning up things floated out by full laziness.
-                -- CSE used to rely on the no-shadowing invariant, but it doesn't any more
-
-        runWhen do_float_in CoreDoFloatInwards,
-
-        maybe_rule_check (Phase 0),
-
-                -- Case-liberation for -O2.  This should be after
-                -- strictness analysis and the simplification which follows it.
-        runWhen liberate_case (CoreDoPasses [
-            CoreLiberateCase,
-            simpl_phase 0 ["post-liberate-case"] max_iter
-            ]),         -- Run the simplifier after LiberateCase to vastly
-                        -- reduce the possiblility of shadowing
-                        -- Reason: see Note [Shadowing] in SpecConstr.lhs
-
-        runWhen spec_constr CoreDoSpecConstr,
-
-        maybe_rule_check (Phase 0),
-
-        -- Final clean-up simplification:
-        simpl_phase 0 ["final"] max_iter
-     ]
 
 -- The core-to-core pass ordering is derived from the DynFlags:
 runWhen :: Bool -> CoreToDo -> CoreToDo
@@ -530,6 +441,7 @@ runWhen False _       = CoreDoNothing
 runMaybe :: Maybe a -> (a -> CoreToDo) -> CoreToDo
 runMaybe (Just x) f = f x
 runMaybe Nothing  _ = CoreDoNothing
+
 
 dumpSimplPhase :: DynFlags -> SimplifierMode -> Bool
 dumpSimplPhase dflags mode
@@ -579,6 +491,47 @@ to switch off those rules until after floating.
 
 %************************************************************************
 %*									*
+             Types for Plugins
+%*									*
+%************************************************************************
+
+\begin{code}
+-- | Command line options gathered from the -PModule.Name:stuff syntax are given to you as this type
+type CommandLineOption = String
+
+-- | 'Plugin' is the core compiler plugin data type. Try to avoid
+-- constructing one of these directly, and just modify some fields of
+-- 'defaultPlugin' instead: this is to try and preserve source-code
+-- compatability when we add fields to this.
+--
+-- Nonetheless, this API is preliminary and highly likely to change in the future.
+data Plugin = Plugin { 
+        installCoreToDos :: [CommandLineOption] -> [CoreToDo] -> CoreM [CoreToDo]
+                -- ^ Modify the Core pipeline that will be used for compilation. 
+                -- This is called as the Core pipeline is built for every module
+                --  being compiled, and plugins get the opportunity to modify 
+                -- the pipeline in a nondeterministic order.
+     }
+
+-- | Default plugin: does nothing at all! For compatability reasons you should base all your
+-- plugin definitions on this default value.
+defaultPlugin :: Plugin
+defaultPlugin = Plugin {
+        installCoreToDos = const return
+    }
+
+-- | A description of the plugin pass itself
+type PluginPass = ModGuts -> CoreM ModGuts
+
+bindsOnlyPass :: (CoreProgram -> CoreM CoreProgram) -> ModGuts -> CoreM ModGuts
+bindsOnlyPass pass guts
+  = do { binds' <- pass (mg_binds guts)
+       ; return (guts { mg_binds = binds' }) }
+\end{code}
+
+
+%************************************************************************
+%*									*
              Counting and logging
 %*									*
 %************************************************************************
@@ -589,8 +542,10 @@ verboseSimplStats = opt_PprStyle_Debug		-- For now, anyway
 
 zeroSimplCount	   :: DynFlags -> SimplCount
 isZeroSimplCount   :: SimplCount -> Bool
+hasDetailedCounts  :: SimplCount -> Bool
 pprSimplCount	   :: SimplCount -> SDoc
-doSimplTick, doFreeSimplTick :: Tick -> SimplCount -> SimplCount
+doSimplTick        :: DynFlags -> Tick -> SimplCount -> SimplCount
+doFreeSimplTick    ::             Tick -> SimplCount -> SimplCount
 plusSimplCount     :: SimplCount -> SimplCount -> SimplCount
 \end{code}
 
@@ -628,17 +583,21 @@ zeroSimplCount dflags
 isZeroSimplCount (VerySimplCount n)    	    = n==0
 isZeroSimplCount (SimplCount { ticks = n }) = n==0
 
+hasDetailedCounts (VerySimplCount {}) = False
+hasDetailedCounts (SimplCount {})     = True
+
 doFreeSimplTick tick sc@SimplCount { details = dts } 
   = sc { details = dts `addTick` tick }
 doFreeSimplTick _ sc = sc 
 
-doSimplTick tick sc@SimplCount { ticks = tks, details = dts, n_log = nl, log1 = l1 }
-  | nl >= opt_HistorySize = sc1 { n_log = 1, log1 = [tick], log2 = l1 }
-  | otherwise		  = sc1 { n_log = nl+1, log1 = tick : l1 }
+doSimplTick dflags tick
+    sc@(SimplCount { ticks = tks, details = dts, n_log = nl, log1 = l1 })
+  | nl >= historySize dflags = sc1 { n_log = 1, log1 = [tick], log2 = l1 }
+  | otherwise                = sc1 { n_log = nl+1, log1 = tick : l1 }
   where
     sc1 = sc { ticks = tks+1, details = dts `addTick` tick }
 
-doSimplTick _ (VerySimplCount n) = VerySimplCount (n+1)
+doSimplTick _ _ (VerySimplCount n) = VerySimplCount (n+1)
 
 
 -- Don't use Map.unionWith because that's lazy, and we want to 
@@ -668,7 +627,7 @@ pprSimplCount (VerySimplCount n) = ptext (sLit "Total ticks:") <+> int n
 pprSimplCount (SimplCount { ticks = tks, details = dts, log1 = l1, log2 = l2 })
   = vcat [ptext (sLit "Total ticks:    ") <+> int tks,
 	  blankLine,
-	  pprTickCounts (Map.toList dts),
+	  pprTickCounts dts,
 	  if verboseSimplStats then
 		vcat [blankLine,
 		      ptext (sLit "Log (most recent first)"),
@@ -676,23 +635,22 @@ pprSimplCount (SimplCount { ticks = tks, details = dts, log1 = l1, log2 = l2 })
 	  else empty
     ]
 
-pprTickCounts :: [(Tick,Int)] -> SDoc
-pprTickCounts [] = empty
-pprTickCounts ((tick1,n1):ticks)
-  = vcat [int tot_n <+> text (tickString tick1),
-	  pprTCDetails real_these,
-	  pprTickCounts others
-    ]
+pprTickCounts :: Map Tick Int -> SDoc
+pprTickCounts counts
+  = vcat (map pprTickGroup groups)
   where
-    tick1_tag		= tickToTag tick1
-    (these, others)	= span same_tick ticks
-    real_these		= (tick1,n1):these
-    same_tick (tick2,_) = tickToTag tick2 == tick1_tag
-    tot_n		= sum [n | (_,n) <- real_these]
+    groups :: [[(Tick,Int)]]	-- Each group shares a comon tag
+    	      			-- toList returns common tags adjacent
+    groups = runs same_tag (Map.toList counts)
+    same_tag (tick1,_) (tick2,_) = tickToTag tick1 == tickToTag tick2
 
-pprTCDetails :: [(Tick, Int)] -> SDoc
-pprTCDetails ticks
-  = nest 4 (vcat [int n <+> pprTickCts tick | (tick,n) <- ticks])
+pprTickGroup :: [(Tick, Int)] -> SDoc
+pprTickGroup group@((tick1,_):_)
+  = hang (int (sum [n | (_,n) <- group]) <+> text (tickString tick1))
+       2 (vcat [ int n <+> pprTickCts tick  
+                                    -- flip as we want largest first
+               | (tick,n) <- sortBy (flip (comparing snd)) group])
+pprTickGroup [] = panic "pprTickGroup"
 \end{code}
 
 
@@ -827,11 +785,18 @@ newtype CoreState = CoreState {
 data CoreReader = CoreReader {
         cr_hsc_env :: HscEnv,
         cr_rule_base :: RuleBase,
-        cr_module :: Module
+        cr_module :: Module,
+#ifdef GHCI
+        cr_globals :: (MVar PersistentLinkerState, Bool)
+#else
+        cr_globals :: ()
+#endif
 }
 
 data CoreWriter = CoreWriter {
-        cw_simpl_count :: SimplCount
+        cw_simpl_count :: !SimplCount  
+        -- Making this strict fixes a nasty space leak
+        -- See Trac #7702
 }
 
 emptyWriter :: DynFlags -> CoreWriter
@@ -860,11 +825,16 @@ instance Monad CoreM where
     mx >>= f = CoreM $ \s -> do
             (x, s', w1) <- unCoreM mx s
             (y, s'', w2) <- unCoreM (f x) s'
-            return (y, s'', w1 `plusWriter` w2)
+            let w = w1 `plusWriter` w2 -- forcing w before returning avoids a space leak (Trac #7702)
+            return $ seq w (y, s'', w)
 
-instance Applicative CoreM where
+instance A.Applicative CoreM where
     pure = return
     (<*>) = ap
+
+instance MonadPlus IO => A.Alternative CoreM where
+    empty = mzero
+    (<|>) = mplus
 
 -- For use if the user has imported Control.Monad.Error from MTL
 -- Requires UndecidableInstances
@@ -879,19 +849,27 @@ instance MonadUnique CoreM where
         modifyS (\s -> s { cs_uniq_supply = us2 })
         return us1
 
+    getUniqueM = do
+        us <- getS cs_uniq_supply
+        let (u,us') = takeUniqFromSupply us
+        modifyS (\s -> s { cs_uniq_supply = us' })
+        return u
+
 runCoreM :: HscEnv
          -> RuleBase
          -> UniqSupply
          -> Module
          -> CoreM a
          -> IO (a, SimplCount)
-runCoreM hsc_env rule_base us mod m =
-        liftM extract $ runIOEnv reader $ unCoreM m state
+runCoreM hsc_env rule_base us mod m = do
+        glbls <- saveLinkerGlobals
+        liftM extract $ runIOEnv (reader glbls) $ unCoreM m state
   where
-    reader = CoreReader {
+    reader glbls = CoreReader {
             cr_hsc_env = hsc_env,
             cr_rule_base = rule_base,
-            cr_module = mod
+            cr_module = mod,
+            cr_globals = glbls
         }
     state = CoreState { 
             cs_uniq_supply = us
@@ -955,23 +933,22 @@ liftIOWithCount what = liftIO what >>= (\(count, x) -> addSimplCount count >> re
 %************************************************************************
 
 \begin{code}
-
 getHscEnv :: CoreM HscEnv
 getHscEnv = read cr_hsc_env
 
 getRuleBase :: CoreM RuleBase
 getRuleBase = read cr_rule_base
 
-getModule :: CoreM Module
-getModule = read cr_module
-
 addSimplCount :: SimplCount -> CoreM ()
 addSimplCount count = write (CoreWriter { cw_simpl_count = count })
 
 -- Convenience accessors for useful fields of HscEnv
 
-getDynFlags :: CoreM DynFlags
-getDynFlags = fmap hsc_dflags getHscEnv
+instance HasDynFlags CoreM where
+    getDynFlags = fmap hsc_dflags getHscEnv
+
+instance HasModule CoreM where
+    getModule = read cr_module
 
 -- | The original name cache is the current mapping from 'Module' and
 -- 'OccName' to a compiler-wide unique 'Name'
@@ -980,8 +957,66 @@ getOrigNameCache = do
     nameCacheRef <- fmap hsc_NC getHscEnv
     liftIO $ fmap nsNames $ readIORef nameCacheRef
 
+getPackageFamInstEnv :: CoreM PackageFamInstEnv
+getPackageFamInstEnv = do
+    hsc_env <- getHscEnv
+    eps <- liftIO $ hscEPS hsc_env
+    return $ eps_fam_inst_env eps
 \end{code}
 
+%************************************************************************
+%*									*
+             Initializing globals
+%*									*
+%************************************************************************
+
+This is a rather annoying function. When a plugin is loaded, it currently
+gets linked against a *newly loaded* copy of the GHC package. This would
+not be a problem, except that the new copy has its own mutable state
+that is not shared with that state that has already been initialized by
+the original GHC package.
+
+(NB This mechanism is sufficient for granting plugins read-only access to
+globals that are guaranteed to be initialized before the plugin is loaded.  If
+any further synchronization is necessary, I would suggest using the more
+sophisticated mechanism involving GHC.Conc.Sync.sharedCAF and rts/Globals.c to
+share a single instance of the global variable among the compiler and the
+plugins.  Perhaps we should migrate all global variables to use that mechanism,
+for robustness... -- NSF July 2013)
+
+This leads to loaded plugins calling GHC code which pokes the static flags,
+and then dying with a panic because the static flags *it* sees are uninitialized.
+
+There are two possible solutions:
+  1. Export the symbols from the GHC executable from the GHC library and link
+     against this existing copy rather than a new copy of the GHC library
+  2. Carefully ensure that the global state in the two copies of the GHC
+     library matches
+
+I tried 1. and it *almost* works (and speeds up plugin load times!) except
+on Windows. On Windows the GHC library tends to export more than 65536 symbols
+(see #5292) which overflows the limit of what we can export from the EXE and
+causes breakage.
+
+(Note that if the GHC exeecutable was dynamically linked this wouldn't be a problem,
+because we could share the GHC library it links to.)
+
+We are going to try 2. instead. Unfortunately, this means that every plugin
+will have to say `reinitializeGlobals` before it does anything, but never mind.
+
+I've threaded the cr_globals through CoreM rather than giving them as an
+argument to the plugin function so that we can turn this function into
+(return ()) without breaking any plugins when we eventually get 1. working.
+
+\begin{code}
+reinitializeGlobals :: CoreM ()
+reinitializeGlobals = do
+    linker_globals <- read cr_globals
+    hsc_env <- getHscEnv
+    let dflags = hsc_dflags hsc_env
+    liftIO $ restoreLinkerGlobals linker_globals
+    liftIO $ setUnsafeGlobalDynFlags dflags
+\end{code}
 
 %************************************************************************
 %*									*
@@ -1076,15 +1111,8 @@ debugTraceMsg :: SDoc -> CoreM ()
 debugTraceMsg = msg (flip Err.debugTraceMsg 3)
 
 -- | Show some labelled 'SDoc' if a particular flag is set or at a verbosity level of @-v -ddump-most@ or higher
-dumpIfSet_dyn :: DynFlag -> String -> SDoc -> CoreM ()
+dumpIfSet_dyn :: DumpFlag -> String -> SDoc -> CoreM ()
 dumpIfSet_dyn flag str = msg (\dflags -> Err.dumpIfSet_dyn dflags flag str)
-\end{code}
-
-\begin{code}
-
-initTcForLookup :: HscEnv -> TcM a -> IO a
-initTcForLookup hsc_env = liftM (expectJust "initTcInteractive" . snd) . initTc hsc_env HsSrcFile False iNTERACTIVE
-
 \end{code}
 
 

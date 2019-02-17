@@ -16,11 +16,6 @@ you will screw up the layout where they are used in case expressions!
 /* Pull in all the platform defines for this build (foo_TARGET_ARCH etc.) */
 #include "ghc_boot_platform.h"
 
-/* This macro indicates that the target OS supports ELF-like shared libraries */
-#if linux_TARGET_OS || freebsd_TARGET_OS || openbsd_TARGET_OS || solaris2_TARGET_OS
-#define elf_OBJ_FORMAT 1
-#endif
-
 /* Pull in the autoconf defines (HAVE_FOO), but don't include
  * ghcconfig.h, because that will include ghcplatform.h which has the
  * wrong platform settings for the compiler (it has the platform
@@ -29,42 +24,21 @@ you will screw up the layout where they are used in case expressions!
 
 /* Global variables may not work in other Haskell implementations,
  * but we need them currently! so the conditional on GLASGOW won't do. */
-#ifndef __HADDOCK__
 #if defined(__GLASGOW_HASKELL__) || !defined(__GLASGOW_HASKELL__)
 #define GLOBAL_VAR(name,value,ty)  \
 {-# NOINLINE name #-};             \
 name :: IORef (ty);                \
 name = Util.global (value);
 
-#define GLOBAL_MVAR(name,value,ty) \
-{-# NOINLINE name #-};             \
-name :: MVar (ty);                 \
-name = Util.globalMVar (value);
-#endif
-#else /* __HADDOCK__ */
-#define GLOBAL_VAR(name,value,ty)  \
-name :: IORef (ty);                \
-name = Util.global (value);
-
-#define GLOBAL_MVAR(name,value,ty) \
-name :: MVar (ty);                 \
-name = Util.globalMVar (value);
+#define GLOBAL_VAR_M(name,value,ty) \
+{-# NOINLINE name #-};              \
+name :: IORef (ty);                 \
+name = Util.globalM (value);
 #endif
 
-#define COMMA ,
-
-#ifdef DEBUG
-#define ASSERT(e)      if (not (e)) then (assertPanic __FILE__ __LINE__) else
-#define ASSERT2(e,msg) if (not (e)) then (assertPprPanic __FILE__ __LINE__ (msg)) else
+#define ASSERT(e)      if debugIsOn && not (e) then (assertPanic __FILE__ __LINE__) else
+#define ASSERT2(e,msg) if debugIsOn && not (e) then (assertPprPanic __FILE__ __LINE__ (msg)) else
 #define WARN( e, msg ) (warnPprTrace (e) __FILE__ __LINE__ (msg)) $
-#else
--- We have to actually use all the variables we are given or we may get
--- unused variable warnings when DEBUG is off.
-#define ASSERT(e)      if False && (not (e)) then panic "ASSERT" else
-#define ASSERT2(e,msg) if False && (const False (e,msg)) then pprPanic "ASSERT2" (msg) else
-#define WARN(e,msg)    if False && (e) then pprPanic "WARN" (msg) else
--- Here we deliberately don't use when as Control.Monad might not be imported
-#endif
 
 -- Examples:   Assuming   flagSet :: String -> m Bool
 -- 

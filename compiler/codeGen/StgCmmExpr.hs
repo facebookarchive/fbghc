@@ -17,7 +17,7 @@ import StgCmmMonad
 import StgCmmHeap
 import StgCmmEnv
 import StgCmmCon
-import StgCmmProf
+import StgCmmProf (saveCurrentCostCentre, restoreCurrentCostCentre, emitSetCCC)
 import StgCmmLayout
 import StgCmmPrim
 import StgCmmHpc
@@ -29,61 +29,69 @@ import StgSyn
 
 import MkGraph
 import BlockId
-import CmmExpr
+import Cmm
+import CmmInfo
 import CoreSyn
 import DataCon
 import ForeignCall
 import Id
 import PrimOp
-import SMRep
 import TyCon
 import Type
-import CostCentre	( CostCentreStack, currentCCS )
-import Control.Monad (when)
+import CostCentre       ( CostCentreStack, currentCCS )
 import Maybes
 import Util
 import FastString
 import Outputable
-import UniqSupply
+
+import Control.Monad (when,void)
 
 ------------------------------------------------------------------------
---		cgExpr: the main function
+--              cgExpr: the main function
 ------------------------------------------------------------------------
 
-cgExpr	:: StgExpr -> FCode ()
+cgExpr  :: StgExpr -> FCode ReturnKind
 
 cgExpr (StgApp fun args)     = cgIdApp fun args
+
+{- seq# a s ==> a -}
+cgExpr (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _res_ty) =
+  cgIdApp a []
+
 cgExpr (StgOpApp op args ty) = cgOpApp op args ty
 cgExpr (StgConApp con args)  = cgConApp con args
-cgExpr (StgSCC cc expr)   = do { emitSetCCC cc; cgExpr expr }
-cgExpr (StgTick m n expr) = do { emit (mkTickBox m n); cgExpr expr }
+cgExpr (StgSCC cc tick push expr) = do { emitSetCCC cc tick push; cgExpr expr }
+cgExpr (StgTick m n expr) = do dflags <- getDynFlags
+                               emit (mkTickBox dflags m n)
+                               cgExpr expr
 cgExpr (StgLit lit)       = do cmm_lit <- cgLit lit
                                emitReturn [CmmLit cmm_lit]
 
 cgExpr (StgLet binds expr)             = do { cgBind binds;     cgExpr expr }
 cgExpr (StgLetNoEscape _ _ binds expr) =
-  do { us <- newUniqSupply
-     ; let join_id = mkBlockId (uniqFromSupply us)
+  do { u <- newUnique
+     ; let join_id = mkBlockId u
      ; cgLneBinds join_id binds
-     ; cgExpr expr 
-     ; emit $ mkLabel join_id}
+     ; r <- cgExpr expr
+     ; emitLabel join_id
+     ; return r }
 
-cgExpr (StgCase expr _live_vars _save_vars bndr srt alt_type alts) =
-  cgCase expr bndr srt alt_type alts
+cgExpr (StgCase expr _live_vars _save_vars bndr _srt alt_type alts) =
+  cgCase expr bndr alt_type alts
 
 cgExpr (StgLam {}) = panic "cgExpr: StgLam"
 
 ------------------------------------------------------------------------
---		Let no escape
+--              Let no escape
 ------------------------------------------------------------------------
 
 {- Generating code for a let-no-escape binding, aka join point is very
 very similar to what we do for a case expression.  The duality is
 between
-	let-no-escape x = b
-	in e
+        let-no-escape x = b
+        in e
 and
-	case e of ... -> b
+        case e of ... -> b
 
 That is, the RHS of 'x' (ie 'b') will execute *later*, just like
 the alternative of the case; it needs to be compiled in an environment
@@ -96,69 +104,71 @@ cgLneBinds :: BlockId -> StgBinding -> FCode ()
 cgLneBinds join_id (StgNonRec bndr rhs)
   = do  { local_cc <- saveCurrentCostCentre
                 -- See Note [Saving the current cost centre]
-        ; info <- cgLetNoEscapeRhs join_id local_cc bndr rhs 
-        ; addBindC (cg_id info) info }
+        ; (info, fcode) <- cgLetNoEscapeRhs join_id local_cc bndr rhs
+        ; fcode
+        ; addBindC info }
 
 cgLneBinds join_id (StgRec pairs)
   = do  { local_cc <- saveCurrentCostCentre
-        ; new_bindings <- fixC (\ new_bindings -> do
-                { addBindsC new_bindings
-                ; listFCs [ cgLetNoEscapeRhs join_id local_cc b e 
-                          | (b,e) <- pairs ] })
-        ; addBindsC new_bindings }
-
+        ; r <- sequence $ unzipWith (cgLetNoEscapeRhs join_id local_cc) pairs
+        ; let (infos, fcodes) = unzip r
+        ; addBindsC infos
+        ; sequence_ fcodes
+        }
 
 -------------------------
 cgLetNoEscapeRhs
     :: BlockId          -- join point for successor of let-no-escape
-    -> Maybe LocalReg	-- Saved cost centre
+    -> Maybe LocalReg   -- Saved cost centre
     -> Id
     -> StgRhs
-    -> FCode CgIdInfo
+    -> FCode (CgIdInfo, FCode ())
 
 cgLetNoEscapeRhs join_id local_cc bndr rhs =
-  do { (info, rhs_body) <- getCodeR $ cgLetNoEscapeRhsBody local_cc bndr rhs 
+  do { (info, rhs_code) <- cgLetNoEscapeRhsBody local_cc bndr rhs
      ; let (bid, _) = expectJust "cgLetNoEscapeRhs" $ maybeLetNoEscape info
-     ; emit (outOfLine $ mkLabel bid <*> rhs_body <*> mkBranch join_id)
-     ; return info
+     ; let code = do { body <- getCode rhs_code
+                     ; emitOutOfLine bid (body <*> mkBranch join_id) }
+     ; return (info, code)
      }
 
 cgLetNoEscapeRhsBody
-    :: Maybe LocalReg	-- Saved cost centre
+    :: Maybe LocalReg   -- Saved cost centre
     -> Id
     -> StgRhs
-    -> FCode CgIdInfo
+    -> FCode (CgIdInfo, FCode ())
 cgLetNoEscapeRhsBody local_cc bndr (StgRhsClosure cc _bi _ _upd _ args body)
   = cgLetNoEscapeClosure bndr local_cc cc (nonVoidIds args) body
 cgLetNoEscapeRhsBody local_cc bndr (StgRhsCon cc con args)
   = cgLetNoEscapeClosure bndr local_cc cc [] (StgConApp con args)
-	-- For a constructor RHS we want to generate a single chunk of 
-	-- code which can be jumped to from many places, which will 
-	-- return the constructor. It's easy; just behave as if it 
-	-- was an StgRhsClosure with a ConApp inside!
+        -- For a constructor RHS we want to generate a single chunk of
+        -- code which can be jumped to from many places, which will
+        -- return the constructor. It's easy; just behave as if it
+        -- was an StgRhsClosure with a ConApp inside!
 
 -------------------------
 cgLetNoEscapeClosure
-	:: Id			-- binder
-	-> Maybe LocalReg	-- Slot for saved current cost centre
-	-> CostCentreStack   	-- XXX: *** NOT USED *** why not?
-	-> [NonVoid Id]		-- Args (as in \ args -> body)
-    	-> StgExpr		-- Body (as in above)
-	-> FCode CgIdInfo
+        :: Id                   -- binder
+        -> Maybe LocalReg       -- Slot for saved current cost centre
+        -> CostCentreStack      -- XXX: *** NOT USED *** why not?
+        -> [NonVoid Id]         -- Args (as in \ args -> body)
+        -> StgExpr              -- Body (as in above)
+        -> FCode (CgIdInfo, FCode ())
 
 cgLetNoEscapeClosure bndr cc_slot _unused_cc args body
-  = do  { arg_regs <- forkProc $ do	
-		{ restoreCurrentCostCentre cc_slot
-		; arg_regs <- bindArgsToRegs args
-		; altHeapCheck arg_regs (cgExpr body)
-			-- Using altHeapCheck just reduces
-			-- instructions to save on stack
-		; return arg_regs }
-	; return $ lneIdInfo bndr arg_regs}
+  = do dflags <- getDynFlags
+       return ( lneIdInfo dflags bndr args
+              , code )
+  where
+   code = forkLneBody $ do {
+            ; withNewTickyCounterLNE (idName bndr) args $ do
+            ; restoreCurrentCostCentre cc_slot
+            ; arg_regs <- bindArgsToRegs args
+            ; void $ noEscapeHeapCheck arg_regs (tickyEnterLNE >> cgExpr body) }
 
 
 ------------------------------------------------------------------------
---		Case expressions
+--              Case expressions
 ------------------------------------------------------------------------
 
 {- Note [Compiling case expressions]
@@ -170,11 +180,11 @@ trigger GC.
 
 A more interesting situation is this (a Plan-B situation)
 
-	!P!;
-	...P...
-	case x# of
-	  0#      -> !Q!; ...Q...
-	  default -> !R!; ...R...
+        !P!;
+        ...P...
+        case x# of
+          0#      -> !Q!; ...Q...
+          default -> !R!; ...R...
 
 where !x! indicates a possible heap-check point. The heap checks
 in the alternatives *can* be omitted, in which case the topmost
@@ -183,9 +193,9 @@ heapcheck will take their worst case into account.
 In favour of omitting !Q!, !R!:
 
  - *May* save a heap overflow test,
-   if ...P... allocates anything.  
+   if ...P... allocates anything.
 
- - We can use relative addressing from a single Hp to 
+ - We can use relative addressing from a single Hp to
    get at all the closures so allocated.
 
  - No need to save volatile vars etc across heap checks
@@ -193,16 +203,16 @@ In favour of omitting !Q!, !R!:
 
 Against omitting !Q!, !R!
 
-  - May put a heap-check into the inner loop.  Suppose 
-	the main loop is P -> R -> P -> R...
-	Q is the loop exit, and only it does allocation.
+  - May put a heap-check into the inner loop.  Suppose
+        the main loop is P -> R -> P -> R...
+        Q is the loop exit, and only it does allocation.
     This only hurts us if P does no allocation.  If P allocates,
     then there is a heap check in the inner loop anyway.
 
   - May do more allocation than reqd.  This sometimes bites us
     badly.  For example, nfib (ha!) allocates about 30\% more space if the
     worst-casing is done, because many many calls to nfib are leaf calls
-    which don't need to allocate anything. 
+    which don't need to allocate anything.
 
     We can un-allocate, but that costs an instruction
 
@@ -212,14 +222,14 @@ Suppose the inner loop is P->R->P->R etc.  Then here is
 how many heap checks we get in the *inner loop* under various
 conditions
 
-  Alooc	  Heap check in branches (!Q!, !R!)?
-  P Q R	     yes     no (absorb to !P!)
+  Alooc   Heap check in branches (!Q!, !R!)?
+  P Q R      yes     no (absorb to !P!)
 --------------------------------------
-  n n n	     0		0
-  n y n	     0		1
-  n . y	     1		1
-  y . y	     2		1
-  y . n	     1		1
+  n n n      0          0
+  n y n      0          1
+  n . y      1          1
+  y . y      2          1
+  y . n      1          1
 
 Best choices: absorb heap checks from Q and R into !P! iff
   a) P itself does some allocation
@@ -232,18 +242,18 @@ single-branch cases, we may have lots of things live
 
 Hence: two basic plans for
 
-	case e of r { alts }
+        case e of r { alts }
 
 ------ Plan A: the general case ---------
 
-	...save current cost centre...
+        ...save current cost centre...
 
-	...code for e, 
-	   with sequel (SetLocals r)
+        ...code for e,
+           with sequel (SetLocals r)
 
         ...restore current cost centre...
-	...code for alts...
-	...alts do their own heap checks
+        ...code for alts...
+        ...alts do their own heap checks
 
 ------ Plan B: special case when ---------
   (i)  e does not allocate or call GC
@@ -254,33 +264,95 @@ Hence: two basic plans for
   is absorbed by the upstream check.
   Very common example: primops on unboxed values
 
-	...code for e,
-	   with sequel (SetLocals r)...
+        ...code for e,
+           with sequel (SetLocals r)...
 
-	...code for alts...
-	...no heap check...
+        ...code for alts...
+        ...no heap check...
 -}
 
 
 
 -------------------------------------
 data GcPlan
-  = GcInAlts 		-- Put a GC check at the start the case alternatives,
-	[LocalReg] 	-- which binds these registers
-	SRT		-- using this SRT
-  | NoGcInAlts		-- The scrutinee is a primitive value, or a call to a
-			-- primitive op which does no GC.  Absorb the allocation
-			-- of the case alternative(s) into the upstream check
+  = GcInAlts            -- Put a GC check at the start the case alternatives,
+        [LocalReg]      -- which binds these registers
+  | NoGcInAlts          -- The scrutinee is a primitive value, or a call to a
+                        -- primitive op which does no GC.  Absorb the allocation
+                        -- of the case alternative(s) into the upstream check
 
 -------------------------------------
--- See Note [case on Bool]
-cgCase :: StgExpr -> Id -> SRT -> AltType -> [StgAlt] -> FCode ()
+cgCase :: StgExpr -> Id -> AltType -> [StgAlt] -> FCode ReturnKind
+
+cgCase (StgOpApp (StgPrimOp op) args _) bndr (AlgAlt tycon) alts
+  | isEnumerationTyCon tycon -- Note [case on bool]
+  = do { tag_expr <- do_enum_primop op args
+
+       -- If the binder is not dead, convert the tag to a constructor
+       -- and assign it.
+       ; when (not (isDeadBinder bndr)) $ do
+            { dflags <- getDynFlags
+            ; tmp_reg <- bindArgToReg (NonVoid bndr)
+            ; emitAssign (CmmLocal tmp_reg)
+                         (tagToClosure dflags tycon tag_expr) }
+
+       ; (mb_deflt, branches) <- cgAlgAltRhss (NoGcInAlts,AssignedDirectly)
+                                              (NonVoid bndr) alts
+       ; emitSwitch tag_expr branches mb_deflt 0 (tyConFamilySize tycon - 1)
+       ; return AssignedDirectly
+       }
+  where
+    do_enum_primop :: PrimOp -> [StgArg] -> FCode CmmExpr
+    do_enum_primop TagToEnumOp [arg]  -- No code!
+      = getArgAmode (NonVoid arg)
+    do_enum_primop primop args
+      = do dflags <- getDynFlags
+           tmp <- newTemp (bWord dflags)
+           cgPrimOp [tmp] primop args
+           return (CmmReg (CmmLocal tmp))
+
 {-
-cgCase (OpApp ) bndr srt AlgAlt [(DataAlt flase, a2]
-  | isBoolTy (idType bndr)
-  , isDeadBndr bndr
-  = 
+Note [case on bool]
+~~~~~~~~~~~~~~~~~~~
+This special case handles code like
+
+  case a <# b of
+    True ->
+    False ->
+
+-->  case tagToEnum# (a <$# b) of
+        True -> .. ; False -> ...
+
+--> case (a <$# b) of r ->
+    case tagToEnum# r of
+        True -> .. ; False -> ...
+
+If we let the ordinary case code handle it, we'll get something like
+
+ tmp1 = a < b
+ tmp2 = Bool_closure_tbl[tmp1]
+ if (tmp2 & 7 != 0) then ... // normal tagged case
+
+but this junk won't optimise away.  What we really want is just an
+inline comparison:
+
+ if (a < b) then ...
+
+So we add a special case to generate
+
+ tmp1 = a < b
+ if (tmp1 == 0) then ...
+
+and later optimisations will further improve this.
+
+Now that #6135 has been resolved it should be possible to remove that
+special case. The idea behind this special case and pre-6135 implementation
+of Bool-returning primops was that tagToEnum# was added implicitly in the
+codegen and then optimized away. Now the call to tagToEnum# is explicit
+in the source code, which allows to optimize it away at the earlier stages
+of compilation (i.e. at the Core level).
 -}
+
 
   -- Note [ticket #3132]: we might be looking at a case of a lifted Id
   -- that was cast to an unlifted type.  The Id will always be bottom,
@@ -301,52 +373,90 @@ cgCase (OpApp ) bndr srt AlgAlt [(DataAlt flase, a2]
   -- code that enters the HValue, then we'll get a runtime panic, because
   -- the HValue really is a MutVar#.  The types are compatible though,
   -- so we can just generate an assignment.
-cgCase (StgApp v []) bndr _ alt_type@(PrimAlt _) alts
+cgCase (StgApp v []) bndr alt_type@(PrimAlt _) alts
   | isUnLiftedType (idType v)
   || reps_compatible
   = -- assignment suffices for unlifted types
-    do { when (not reps_compatible) $
+    do { dflags <- getDynFlags
+       ; when (not reps_compatible) $
            panic "cgCase: reps do not match, perhaps a dodgy unsafeCoerce?"
        ; v_info <- getCgIdInfo v
-       ; emit (mkAssign (CmmLocal (idToReg (NonVoid bndr))) (idInfoToAmode v_info))
+       ; emitAssign (CmmLocal (idToReg dflags (NonVoid bndr))) (idInfoToAmode v_info)
        ; _ <- bindArgsToRegs [NonVoid bndr]
-       ; cgAlts NoGcInAlts (NonVoid bndr) alt_type alts }
+       ; cgAlts (NoGcInAlts,AssignedDirectly) (NonVoid bndr) alt_type alts }
   where
-    reps_compatible = idCgRep v == idCgRep bndr
+    reps_compatible = idPrimRep v == idPrimRep bndr
 
-cgCase scrut@(StgApp v []) _ _ (PrimAlt _) _ 
+cgCase scrut@(StgApp v []) _ (PrimAlt _) _
   = -- fail at run-time, not compile-time
-    do { mb_cc <- maybeSaveCostCentre True
-       ; withSequel (AssignTo [idToReg (NonVoid v)] False) (cgExpr scrut)
+    do { dflags <- getDynFlags
+       ; mb_cc <- maybeSaveCostCentre True
+       ; _ <- withSequel (AssignTo [idToReg dflags (NonVoid v)] False) (cgExpr scrut)
        ; restoreCurrentCostCentre mb_cc
-       ; emit $ mkComment $ mkFastString "should be unreachable code"
-       ; emit $ withFreshLabel "l" (\l -> mkLabel l <*> mkBranch l)}
+       ; emitComment $ mkFastString "should be unreachable code"
+       ; l <- newLabelC
+       ; emitLabel l
+       ; emit (mkBranch l)
+       ; return AssignedDirectly
+       }
+{-
+case seq# a s of v
+  (# s', a' #) -> e
 
-cgCase scrut bndr srt alt_type alts 
+==>
+
+case a of v
+  (# s', a' #) -> e
+
+(taking advantage of the fact that the return convention for (# State#, a #)
+is the same as the return convention for just 'a')
+-}
+
+cgCase (StgOpApp (StgPrimOp SeqOp) [StgVarArg a, _] _) bndr alt_type alts
+  = -- handle seq#, same return convention as vanilla 'a'.
+    cgCase (StgApp a []) bndr alt_type alts
+
+cgCase scrut bndr alt_type alts
   = -- the general case
-    do { up_hp_usg <- getVirtHp        -- Upstream heap usage
+    do { dflags <- getDynFlags
+       ; up_hp_usg <- getVirtHp        -- Upstream heap usage
        ; let ret_bndrs = chooseReturnBndrs bndr alt_type alts
-             alt_regs  = map idToReg ret_bndrs
+             alt_regs  = map (idToReg dflags) ret_bndrs
              simple_scrut = isSimpleScrut scrut alt_type
-             gcInAlts | not simple_scrut = True
-                      | isSingleton alts = False
-                      | up_hp_usg > 0    = False
-                      | otherwise        = True
-             gc_plan = if gcInAlts then GcInAlts alt_regs srt else NoGcInAlts
+             do_gc  | not simple_scrut = True
+                    | isSingleton alts = False
+                    | up_hp_usg > 0    = False
+                    | otherwise        = True
+               -- cf Note [Compiling case expressions]
+             gc_plan = if do_gc then GcInAlts alt_regs else NoGcInAlts
 
        ; mb_cc <- maybeSaveCostCentre simple_scrut
-       ; withSequel (AssignTo alt_regs gcInAlts) (cgExpr scrut)
-       ; restoreCurrentCostCentre mb_cc
 
-  -- JD: We need Note: [Better Alt Heap Checks]
+       ; let sequel = AssignTo alt_regs do_gc{- Note [scrut sequel] -}
+       ; ret_kind <- withSequel sequel (cgExpr scrut)
+       ; restoreCurrentCostCentre mb_cc
        ; _ <- bindArgsToRegs ret_bndrs
-       ; cgAlts gc_plan (NonVoid bndr) alt_type alts }
+       ; cgAlts (gc_plan,ret_kind) (NonVoid bndr) alt_type alts
+       }
+
+
+{-
+Note [scrut sequel]
+
+The job of the scrutinee is to assign its value(s) to alt_regs.
+Additionally, if we plan to do a heap-check in the alternatives (see
+Note [Compiling case expressions]), then we *must* retreat Hp to
+recover any unused heap before passing control to the sequel.  If we
+don't do this, then any unused heap will become slop because the heap
+check will reset the heap usage. Slop in the heap breaks LDV profiling
+(+RTS -hb) which needs to do a linear sweep through the nursery.
+-}
 
 -----------------
 maybeSaveCostCentre :: Bool -> FCode (Maybe LocalReg)
 maybeSaveCostCentre simple_scrut
-  | simple_scrut = saveCurrentCostCentre
-  | otherwise    = return Nothing
+  | simple_scrut = return Nothing
+  | otherwise    = saveCurrentCostCentre
 
 
 -----------------
@@ -356,14 +466,14 @@ isSimpleScrut :: StgExpr -> AltType -> Bool
 -- NB: if you get this wrong, and claim that the expression doesn't allocate
 --     when it does, you'll deeply mess up allocation
 isSimpleScrut (StgOpApp op _ _) _          = isSimpleOp op
-isSimpleScrut (StgLit _)       _           = True	-- case 1# of { 0# -> ..; ... }
-isSimpleScrut (StgApp _ [])    (PrimAlt _) = True	-- case x# of { 0# -> ..; ... }
-isSimpleScrut _		       _           = False
+isSimpleScrut (StgLit _)       _           = True       -- case 1# of { 0# -> ..; ... }
+isSimpleScrut (StgApp _ [])    (PrimAlt _) = True       -- case x# of { 0# -> ..; ... }
+isSimpleScrut _                _           = False
 
 isSimpleOp :: StgOp -> Bool
 -- True iff the op cannot block or allocate
 isSimpleOp (StgFCallOp (CCall (CCallSpec _ _ safe)) _) = not (playSafe safe)
-isSimpleOp (StgPrimOp op)      			       = not (primOpOutOfLine op)
+isSimpleOp (StgPrimOp op)                              = not (primOpOutOfLine op)
 isSimpleOp (StgPrimCallOp _)                           = False
 
 -----------------
@@ -375,237 +485,353 @@ chooseReturnBndrs bndr (PrimAlt _) _alts
   = nonVoidIds [bndr]
 
 chooseReturnBndrs _bndr (UbxTupAlt _) [(_, ids, _, _)]
-  = nonVoidIds ids	-- 'bndr' is not assigned!
+  = nonVoidIds ids      -- 'bndr' is not assigned!
 
 chooseReturnBndrs bndr (AlgAlt _) _alts
-  = nonVoidIds [bndr]	-- Only 'bndr' is assigned
+  = nonVoidIds [bndr]   -- Only 'bndr' is assigned
 
 chooseReturnBndrs bndr PolyAlt _alts
-  = nonVoidIds [bndr]	-- Only 'bndr' is assigned
+  = nonVoidIds [bndr]   -- Only 'bndr' is assigned
 
 chooseReturnBndrs _ _ _ = panic "chooseReturnBndrs"
-	-- UbxTupALt has only one alternative
+        -- UbxTupALt has only one alternative
 
 -------------------------------------
-cgAlts :: GcPlan -> NonVoid Id -> AltType -> [StgAlt] -> FCode ()
+cgAlts :: (GcPlan,ReturnKind) -> NonVoid Id -> AltType -> [StgAlt]
+       -> FCode ReturnKind
 -- At this point the result of the case are in the binders
 cgAlts gc_plan _bndr PolyAlt [(_, _, _, rhs)]
   = maybeAltHeapCheck gc_plan (cgExpr rhs)
-  
+
 cgAlts gc_plan _bndr (UbxTupAlt _) [(_, _, _, rhs)]
   = maybeAltHeapCheck gc_plan (cgExpr rhs)
-	-- Here bndrs are *already* in scope, so don't rebind them
+        -- Here bndrs are *already* in scope, so don't rebind them
 
 cgAlts gc_plan bndr (PrimAlt _) alts
-  = do	{ tagged_cmms <- cgAltRhss gc_plan bndr alts
+  = do  { dflags <- getDynFlags
 
-	; let bndr_reg = CmmLocal (idToReg bndr)
-	      (DEFAULT,deflt) = head tagged_cmms
-		-- PrimAlts always have a DEFAULT case
-		-- and it always comes first
+        ; tagged_cmms <- cgAltRhss gc_plan bndr alts
 
-	      tagged_cmms' = [(lit,code) 
-			     | (LitAlt lit, code) <- tagged_cmms]
-	; emit (mkCmmLitSwitch (CmmReg bndr_reg) tagged_cmms' deflt) }
+        ; let bndr_reg = CmmLocal (idToReg dflags bndr)
+              (DEFAULT,deflt) = head tagged_cmms
+                -- PrimAlts always have a DEFAULT case
+                -- and it always comes first
+
+              tagged_cmms' = [(lit,code)
+                             | (LitAlt lit, code) <- tagged_cmms]
+        ; emitCmmLitSwitch (CmmReg bndr_reg) tagged_cmms' deflt
+        ; return AssignedDirectly }
 
 cgAlts gc_plan bndr (AlgAlt tycon) alts
-  = do	{ tagged_cmms <- cgAltRhss gc_plan bndr alts
-	
-	; let fam_sz   = tyConFamilySize tycon
-	      bndr_reg = CmmLocal (idToReg bndr)
-	      mb_deflt = case tagged_cmms of
-			   ((DEFAULT,rhs) : _) -> Just rhs
-			   _other	       -> Nothing
-		-- DEFAULT is always first, if present
+  = do  { dflags <- getDynFlags
 
-	      branches = [ (dataConTagZ con, cmm) 
-	   	         | (DataAlt con, cmm) <- tagged_cmms ]
+        ; (mb_deflt, branches) <- cgAlgAltRhss gc_plan bndr alts
+
+        ; let fam_sz   = tyConFamilySize tycon
+              bndr_reg = CmmLocal (idToReg dflags bndr)
 
                     -- Is the constructor tag in the node reg?
-        ; if isSmallFamily fam_sz
-	  then let	-- Yes, bndr_reg has constr. tag in ls bits
-                   tag_expr = cmmConstrTag1 (CmmReg bndr_reg)
+        ; if isSmallFamily dflags fam_sz
+          then do
+                let   -- Yes, bndr_reg has constr. tag in ls bits
+                   tag_expr = cmmConstrTag1 dflags (CmmReg bndr_reg)
                    branches' = [(tag+1,branch) | (tag,branch) <- branches]
-                in
-	        emitSwitch tag_expr branches' mb_deflt 1 fam_sz
+                emitSwitch tag_expr branches' mb_deflt 1 fam_sz
+                return AssignedDirectly
 
-	   else 	-- No, get tag from info table
-                let -- Note that ptr _always_ has tag 1
-                    -- when the family size is big enough
-                    untagged_ptr = cmmRegOffB bndr_reg (-1)
-                    tag_expr = getConstrTag (untagged_ptr)
-		 in
-		 emitSwitch tag_expr branches mb_deflt 0 (fam_sz - 1) }
+           else         -- No, get tag from info table
+                do dflags <- getDynFlags
+                   let -- Note that ptr _always_ has tag 1
+                       -- when the family size is big enough
+                       untagged_ptr = cmmRegOffB bndr_reg (-1)
+                       tag_expr = getConstrTag dflags (untagged_ptr)
+                   emitSwitch tag_expr branches mb_deflt 0 (fam_sz - 1)
+                   return AssignedDirectly }
 
 cgAlts _ _ _ _ = panic "cgAlts"
-	-- UbxTupAlt and PolyAlt have only one alternative
+        -- UbxTupAlt and PolyAlt have only one alternative
+
+
+-- Note [alg-alt heap check]
+--
+-- In an algebraic case with more than one alternative, we will have
+-- code like
+--
+-- L0:
+--   x = R1
+--   goto L1
+-- L1:
+--   if (x & 7 >= 2) then goto L2 else goto L3
+-- L2:
+--   Hp = Hp + 16
+--   if (Hp > HpLim) then goto L4
+--   ...
+-- L4:
+--   call gc() returns to L5
+-- L5:
+--   x = R1
+--   goto L1
 
 -------------------
-cgAltRhss :: GcPlan -> NonVoid Id -> [StgAlt] -> FCode [(AltCon, CmmAGraph)]
-cgAltRhss gc_plan bndr alts
-  = forkAlts (map cg_alt alts)
-  where
-    base_reg = idToReg bndr
+cgAlgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [StgAlt]
+             -> FCode ( Maybe CmmAGraph
+                      , [(ConTagZ, CmmAGraph)] )
+cgAlgAltRhss gc_plan bndr alts
+  = do { tagged_cmms <- cgAltRhss gc_plan bndr alts
+
+       ; let { mb_deflt = case tagged_cmms of
+                           ((DEFAULT,rhs) : _) -> Just rhs
+                           _other              -> Nothing
+                            -- DEFAULT is always first, if present
+
+              ; branches = [ (dataConTagZ con, cmm)
+                           | (DataAlt con, cmm) <- tagged_cmms ]
+              }
+
+       ; return (mb_deflt, branches)
+       }
+
+
+-------------------
+cgAltRhss :: (GcPlan,ReturnKind) -> NonVoid Id -> [StgAlt]
+          -> FCode [(AltCon, CmmAGraph)]
+cgAltRhss gc_plan bndr alts = do
+  dflags <- getDynFlags
+  let
+    base_reg = idToReg dflags bndr
     cg_alt :: StgAlt -> FCode (AltCon, CmmAGraph)
     cg_alt (con, bndrs, _uses, rhs)
-      = getCodeR		  $
-	maybeAltHeapCheck gc_plan $
-	do { _ <- bindConArgs con base_reg bndrs
-	   ; cgExpr rhs
-	   ; return con }
+      = getCodeR                  $
+        maybeAltHeapCheck gc_plan $
+        do { _ <- bindConArgs con base_reg bndrs
+           ; _ <- cgExpr rhs
+           ; return con }
+  forkAlts (map cg_alt alts)
 
-maybeAltHeapCheck :: GcPlan -> FCode a -> FCode a
-maybeAltHeapCheck NoGcInAlts        code = code
-maybeAltHeapCheck (GcInAlts regs _) code = altHeapCheck regs code
+maybeAltHeapCheck :: (GcPlan,ReturnKind) -> FCode a -> FCode a
+maybeAltHeapCheck (NoGcInAlts,_)  code = code
+maybeAltHeapCheck (GcInAlts regs, AssignedDirectly) code =
+  altHeapCheck regs code
+maybeAltHeapCheck (GcInAlts regs, ReturnedTo lret off) code =
+  altHeapCheckReturnsTo regs lret off code
 
 -----------------------------------------------------------------------------
--- 	Tail calls
+--      Tail calls
 -----------------------------------------------------------------------------
 
-cgConApp :: DataCon -> [StgArg] -> FCode ()
+cgConApp :: DataCon -> [StgArg] -> FCode ReturnKind
 cgConApp con stg_args
-  | isUnboxedTupleCon con	-- Unboxed tuple: assign and return
+  | isUnboxedTupleCon con       -- Unboxed tuple: assign and return
   = do { arg_exprs <- getNonVoidArgAmodes stg_args
        ; tickyUnboxedTupleReturn (length arg_exprs)
        ; emitReturn arg_exprs }
 
-  | otherwise	--  Boxed constructors; allocate and return
-  = ASSERT( stg_args `lengthIs` dataConRepArity con )
-    do	{ (idinfo, init) <- buildDynCon (dataConWorkId con) currentCCS con stg_args
-	   	-- The first "con" says that the name bound to this closure is
-		-- is "con", which is a bit of a fudge, but it only affects profiling
+  | otherwise   --  Boxed constructors; allocate and return
+  = ASSERT( stg_args `lengthIs` dataConRepRepArity con )
+    do  { (idinfo, fcode_init) <- buildDynCon (dataConWorkId con) False
+                                     currentCCS con stg_args
+                -- The first "con" says that the name bound to this
+                -- closure is is "con", which is a bit of a fudge, but
+                -- it only affects profiling (hence the False)
 
-        ; emit init
-	; emitReturn [idInfoToAmode idinfo] }
+        ; emit =<< fcode_init
+        ; emitReturn [idInfoToAmode idinfo] }
+
+cgIdApp :: Id -> [StgArg] -> FCode ReturnKind
+cgIdApp fun_id [] | isVoidTy (idType fun_id) = emitReturn []
+cgIdApp fun_id args = do
+    dflags         <- getDynFlags
+    fun_info       <- getCgIdInfo fun_id
+    self_loop_info <- getSelfLoop
+    let cg_fun_id   = cg_id fun_info
+           -- NB: use (cg_id fun_info) instead of fun_id, because
+           -- the former may be externalised for -split-objs.
+           -- See Note [Externalise when splitting] in StgCmmMonad
+
+        fun_arg     = StgVarArg cg_fun_id
+        fun_name    = idName    cg_fun_id
+        fun         = idInfoToAmode fun_info
+        lf_info     = cg_lf         fun_info
+        node_points dflags = nodeMustPointToIt dflags lf_info
+    case (getCallMethod dflags fun_name cg_fun_id lf_info (length args) (cg_loc fun_info) self_loop_info) of
+
+            -- A value in WHNF, so we can just return it.
+        ReturnIt -> emitReturn [fun]    -- ToDo: does ReturnIt guarantee tagged?
+
+        EnterIt -> ASSERT( null args )  -- Discarding arguments
+                   emitEnter fun
+
+        SlowCall -> do      -- A slow function call via the RTS apply routines
+                { tickySlowCall lf_info args
+                ; emitComment $ mkFastString "slowCall"
+                ; slowCall fun args }
+
+        -- A direct function call (possibly with some left-over arguments)
+        DirectEntry lbl arity -> do
+                { tickyDirectCall arity args
+                ; if node_points dflags
+                     then directCall NativeNodeCall   lbl arity (fun_arg:args)
+                     else directCall NativeDirectCall lbl arity args }
+
+        -- Let-no-escape call or self-recursive tail-call
+        JumpToIt blk_id lne_regs -> do
+          { adjustHpBackwards -- always do this before a tail-call
+          ; cmm_args <- getNonVoidArgAmodes args
+          ; emitMultiAssign lne_regs cmm_args
+          ; emit (mkBranch blk_id)
+          ; return AssignedDirectly }
+
+-- Note [Self-recursive tail calls]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- Self-recursive tail calls can be optimized into a local jump in the same
+-- way as let-no-escape bindings (see Note [What is a non-escaping let] in
+-- stgSyn/CoreToStg.lhs). Consider this:
+--
+-- foo.info:
+--     a = R1  // calling convention
+--     b = R2
+--     goto L1
+-- L1: ...
+--     ...
+-- ...
+-- L2: R1 = x
+--     R2 = y
+--     call foo(R1,R2)
+--
+-- Instead of putting x and y into registers (or other locations required by the
+-- calling convention) and performing a call we can put them into local
+-- variables a and b and perform jump to L1:
+--
+-- foo.info:
+--     a = R1
+--     b = R2
+--     goto L1
+-- L1: ...
+--     ...
+-- ...
+-- L2: a = x
+--     b = y
+--     goto L1
+--
+-- This can be done only when function is calling itself in a tail position
+-- and only if the call passes number of parameters equal to function's arity.
+-- Note that this cannot be performed if a function calls itself with a
+-- continuation.
+--
+-- This in fact implements optimization known as "loopification". It was
+-- described in "Low-level code optimizations in the Glasgow Haskell Compiler"
+-- by Krzysztof Woś, though we use different approach. Krzysztof performed his
+-- optimization at the Cmm level, whereas we perform ours during code generation
+-- (Stg-to-Cmm pass) essentially making sure that optimized Cmm code is
+-- generated in the first place.
+--
+-- Implementation is spread across a couple of places in the code:
+--
+--   * FCode monad stores additional information in its reader environment
+--     (cgd_self_loop field). This information tells us which function can
+--     tail call itself in an optimized way (it is the function currently
+--     being compiled), what is the label of a loop header (L1 in example above)
+--     and information about local registers in which we should arguments
+--     before making a call (this would be a and b in example above).
+--
+--   * Whenever we are compiling a function, we set that information to reflect
+--     the fact that function currently being compiled can be jumped to, instead
+--     of called. This is done in closureCodyBody in StgCmmBind.
+--
+--   * We also have to emit a label to which we will be jumping. We make sure
+--     that the label is placed after a stack check but before the heap
+--     check. The reason is that making a recursive tail-call does not increase
+--     the stack so we only need to check once. But it may grow the heap, so we
+--     have to repeat the heap check in every self-call. This is done in
+--     do_checks in StgCmmHeap.
+--
+--   * When we begin compilation of another closure we remove the additional
+--     information from the environment. This is done by forkClosureBody
+--     in StgCmmMonad. Other functions that duplicate the environment -
+--     forkLneBody, forkAlts, codeOnly - duplicate that information. In other
+--     words, we only need to clean the environment of the self-loop information
+--     when compiling right hand side of a closure (binding).
+--
+--   * When compiling a call (cgIdApp) we use getCallMethod to decide what kind
+--     of call will be generated. getCallMethod decides to generate a self
+--     recursive tail call when (a) environment stores information about
+--     possible self tail-call; (b) that tail call is to a function currently
+--     being compiled; (c) number of passed arguments is equal to function's
+--     arity. (d) loopification is turned on via -floopification command-line
+--     option.
+--
+--   * Command line option to turn loopification on and off is implemented in
+--     DynFlags.
+--
 
 
-cgIdApp :: Id -> [StgArg] -> FCode ()
-cgIdApp fun_id [] | isVoidId fun_id = emitReturn []
-cgIdApp fun_id args
-  = do 	{ fun_info <- getCgIdInfo fun_id
-        ; case maybeLetNoEscape fun_info of
-            Just (blk_id, lne_regs) -> cgLneJump blk_id lne_regs args
-            Nothing -> cgTailCall fun_id fun_info args }
+emitEnter :: CmmExpr -> FCode ReturnKind
+emitEnter fun = do
+  { dflags <- getDynFlags
+  ; adjustHpBackwards
+  ; sequel <- getSequel
+  ; updfr_off <- getUpdFrameOff
+  ; case sequel of
+      -- For a return, we have the option of generating a tag-test or
+      -- not.  If the value is tagged, we can return directly, which
+      -- is quicker than entering the value.  This is a code
+      -- size/speed trade-off: when optimising for speed rather than
+      -- size we could generate the tag test.
+      --
+      -- Right now, we do what the old codegen did, and omit the tag
+      -- test, just generating an enter.
+      Return _ -> do
+        { let entry = entryCode dflags $ closureInfoPtr dflags $ CmmReg nodeReg
+        ; emit $ mkJump dflags NativeNodeCall entry
+                        [cmmUntag dflags fun] updfr_off
+        ; return AssignedDirectly
+        }
 
-cgLneJump :: BlockId -> [LocalReg] -> [StgArg] -> FCode ()
-cgLneJump blk_id lne_regs args	-- Join point; discard sequel
-  = do	{ cmm_args <- getNonVoidArgAmodes args
-      	; emit (mkMultiAssign lne_regs cmm_args
-		<*> mkBranch blk_id) }
-    
-cgTailCall :: Id -> CgIdInfo -> [StgArg] -> FCode ()
-cgTailCall fun_id fun_info args = do
-    dflags <- getDynFlags
-    case (getCallMethod dflags fun_name (idCafInfo fun_id) lf_info (length args)) of
-
-	    -- A value in WHNF, so we can just return it.
-      	ReturnIt -> emitReturn [fun]	-- ToDo: does ReturnIt guarantee tagged?
-    
-      	EnterIt -> ASSERT( null args )	-- Discarding arguments
-      		do { let fun' = CmmLoad fun (cmmExprType fun)
-                   ; [ret,call] <- forkAlts [
-      			getCode $ emitReturn [fun],	-- Is tagged; no need to untag
-      			getCode $ do -- emit (mkAssign nodeReg fun)
-                         emitCall (NativeNodeCall, NativeReturn)
-                                  (entryCode fun') [fun]]  -- Not tagged
-      		   ; emit (mkCmmIfThenElse (cmmIsTagged fun) ret call) }
-
-      	SlowCall -> do 	    -- A slow function call via the RTS apply routines
-      		{ tickySlowCall lf_info args
-                ; emit $ mkComment $ mkFastString "slowCall"
-      		; slowCall fun args }
-    
-      	-- A direct function call (possibly with some left-over arguments)
-      	DirectEntry lbl arity -> do
-		{ tickyDirectCall arity args
- 		; if node_points then
-                    do emit $ mkComment $ mkFastString "directEntry"
-                       emit (mkAssign nodeReg fun)
-                       directCall lbl arity args
-		  else do emit $ mkComment $ mkFastString "directEntry else"
-                          directCall lbl arity args }
-
-	JumpToIt {} -> panic "cgTailCall"	-- ???
-
-  where
-    fun_name 	= idName            fun_id
-    fun         = idInfoToAmode     fun_info
-    lf_info     = cgIdInfoLF        fun_info
-    node_points = nodeMustPointToIt lf_info
-
-
-{- Note [case on Bool]
-   ~~~~~~~~~~~~~~~~~~~
-A case on a Boolean value does two things:
-  1. It looks up the Boolean in a closure table and assigns the
-     result to the binder.
-  2. It branches to the True or False case through analysis
-     of the closure assigned to the binder.
-But the indirection through the closure table is unnecessary
-if the assignment to the binder will be dead code (use isDeadBndr).
-
-The following example illustrates how badly the code turns out:
-  STG:
-    case <=## [ww_s7Hx y_s7HD] of wild2_sbH8 {
-      GHC.Types.False -> <true  code> // sbH8 dead
-      GHC.Types.True  -> <false code> // sbH8 dead
-    };
-  Cmm:
-    _s7HD::F64 = F64[_sbH7::I64 + 7];  // MidAssign
-    _ccsW::I64 = %MO_F_Le_W64(_s7Hx::F64, _s7HD::F64);  // MidAssign
-    // emitReturn  // MidComment
-    _sbH8::I64 = I64[ghczmprim_GHCziBool_Bool_closure_tbl + (_ccsW::I64 << 3)];  // MidAssign
-    _ccsX::I64 = _sbH8::I64 & 7;  // MidAssign
-    if (_ccsX::I64 >= 2) goto ccsH; else goto ccsI;  // LastCondBranch
-
-The assignments to _sbH8 and _ccsX are completely unnecessary.
-Instead, we should branch based on the value of _ccsW.
--}
-
-{- Note [Better Alt Heap Checks]
-If two function calls can share a return point, then they will also
-get the same info table. Therefore, it's worth our effort to make
-those opportunities appear as frequently as possible.
-
-Here are a few examples of how it should work:
-
-  STG:
-    case f x of
-      True  -> <True code -- including allocation>
-      False -> <False code>
-  Cmm:
-      r = call f(x) returns to L;
-   L:
-      if r & 7 >= 2 goto L1 else goto L2;
-   L1:
-      if Hp > HpLim then
-        r = gc(r);
-        goto L;
-      <True code -- including allocation>
-   L2:
-      <False code>
-Note that the code following both the call to f(x) and the code to gc(r)
-should be the same, which will allow the common blockifier to discover
-that they are the same. Therefore, both function calls will return to the same
-block, and they will use the same info table.        
-
-Here's an example of the Cmm code we want from a primOp.
-The primOp doesn't produce an info table for us to reuse, but that's okay:
-we should still generate the same code:
-  STG:
-    case f x of
-      0 -> <0-case code -- including allocation>
-      _ -> <default-case code>
-  Cmm:
-      r = a +# b;
-   L:
-      if r == 0 then goto L1 else goto L2;
-   L1:
-      if Hp > HpLim then
-        r = gc(r);
-        goto L;
-      <0-case code -- including allocation>
-   L2:
-      <default-case code>
--}
-
+      -- The result will be scrutinised in the sequel.  This is where
+      -- we generate a tag-test to avoid entering the closure if
+      -- possible.
+      --
+      -- The generated code will be something like this:
+      --
+      --    R1 = fun  -- copyout
+      --    if (fun & 7 != 0) goto Lcall else goto Lret
+      --  Lcall:
+      --    call [fun] returns to Lret
+      --  Lret:
+      --    fun' = R1  -- copyin
+      --    ...
+      --
+      -- Note in particular that the label Lret is used as a
+      -- destination by both the tag-test and the call.  This is
+      -- becase Lret will necessarily be a proc-point, and we want to
+      -- ensure that we generate only one proc-point for this
+      -- sequence.
+      --
+      -- Furthermore, we tell the caller that we generated a native
+      -- return continuation by returning (ReturnedTo Lret off), so
+      -- that the continuation can be reused by the heap-check failure
+      -- code in the enclosing case expression.
+      --
+      AssignTo res_regs _ -> do
+       { lret <- newLabelC
+       ; let (off, _, copyin) = copyInOflow dflags NativeReturn (Young lret) res_regs []
+       ; lcall <- newLabelC
+       ; updfr_off <- getUpdFrameOff
+       ; let area = Young lret
+       ; let (outArgs, regs, copyout) = copyOutOflow dflags NativeNodeCall Call area
+                                          [fun] updfr_off []
+         -- refer to fun via nodeReg after the copyout, to avoid having
+         -- both live simultaneously; this sometimes enables fun to be
+         -- inlined in the RHS of the R1 assignment.
+       ; let entry = entryCode dflags (closureInfoPtr dflags (CmmReg nodeReg))
+             the_call = toCall entry (Just lret) updfr_off off outArgs regs
+       ; emit $
+           copyout <*>
+           mkCbranch (cmmIsTagged dflags (CmmReg nodeReg)) lret lcall <*>
+           outOfLine lcall the_call <*>
+           mkLabel lret <*>
+           copyin
+       ; return (ReturnedTo lret off)
+       }
+  }

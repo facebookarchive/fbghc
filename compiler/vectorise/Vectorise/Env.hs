@@ -1,24 +1,18 @@
-
 module Vectorise.Env (
-	Scope(..),
+  Scope(..),
 
-	-- * Local Environments
-	LocalEnv(..),
-	emptyLocalEnv,
-	
-	-- * Global Environments
-	GlobalEnv(..),
-	initGlobalEnv,
-	extendImportedVarsEnv,
-	extendScalars,
-	setFamEnv,
-        extendFamEnv,
-	extendTyConsEnv,
-	extendDataConsEnv,
-	extendPAFunsEnv,
-	setPRFunsEnv,
-	setBoxedTyConsEnv,
-	updVectInfo
+  -- * Local Environments
+  LocalEnv(..),
+  emptyLocalEnv,
+
+  -- * Global Environments
+  GlobalEnv(..),
+  initGlobalEnv,
+  extendImportedVarsEnv,
+  extendFamEnv,
+  setPAFunsEnv,
+  setPRFunsEnv,
+  modVectInfo
 ) where
 
 import HscTypes
@@ -26,187 +20,210 @@ import InstEnv
 import FamInstEnv
 import CoreSyn
 import Type
+import Class
 import TyCon
 import DataCon
 import VarEnv
 import VarSet
 import Var
+import NameSet
 import Name
 import NameEnv
 import FastString
 
 
--- | Indicates what scope something (a variable) is in.
+import Data.Maybe
+
+
+-- |Indicates what scope something (a variable) is in.
+--
 data Scope a b 
-	= Global a 
-	| Local  b
+        = Global a 
+        | Local  b
 
 
 -- LocalEnv -------------------------------------------------------------------
--- | The local environment.
+
+-- |The local environment.
+--
 data LocalEnv
-	= LocalEnv {
-        -- Mapping from local variables to their vectorised and lifted versions.
-            local_vars		:: VarEnv (Var, Var)
+        = LocalEnv
+        { local_vars      :: VarEnv (Var, Var)
+          -- ^Mapping from local variables to their vectorised and lifted versions.
 
-        -- In-scope type variables.
-        , local_tyvars		:: [TyVar]
+        , local_tyvars    :: [TyVar]
+          -- ^In-scope type variables.
 
-        -- Mapping from tyvars to their PA dictionaries.
-        , local_tyvar_pa	:: VarEnv CoreExpr
+        , local_tyvar_pa  :: VarEnv CoreExpr
+          -- ^Mapping from tyvars to their PA dictionaries.
 
-        -- Local binding name.
-        , local_bind_name	:: FastString
+        , local_bind_name :: FastString
+          -- ^Local binding name. This is only used to generate better names for hoisted
+          -- expressions.
         }
 
-
--- | Create an empty local environment.
+-- |Create an empty local environment.
+--
 emptyLocalEnv :: LocalEnv
-emptyLocalEnv = LocalEnv {
-                   local_vars     = emptyVarEnv
-                 , local_tyvars   = []
-                 , local_tyvar_pa = emptyVarEnv
-                 , local_bind_name  = fsLit "fn"
-                 }
+emptyLocalEnv = LocalEnv
+                { local_vars      = emptyVarEnv
+                , local_tyvars    = []
+                , local_tyvar_pa  = emptyVarEnv
+                , local_bind_name = fsLit "fn"
+                }
 
 
 -- GlobalEnv ------------------------------------------------------------------
--- | The global environment.
---      These are things the exist at top-level.
+
+-- |The global environment: entities that exist at top-level.
+--
 data GlobalEnv 
-        = GlobalEnv {
-        -- | Mapping from global variables to their vectorised versions — aka the /vectorisation
-        --   map/.
-          global_vars           :: VarEnv Var
+        = GlobalEnv
+        { global_vect_avoid           :: Bool
+          -- ^'True' implies to avoid vectorisation as far as possible.
 
-        -- | Mapping from global variables that have a vectorisation declaration to the right-hand
-        --   side of that declaration and its type.  This mapping only applies to non-scalar
-        --   vectorisation declarations.  All variables with a scalar vectorisation declaration are
-        --   mentioned in 'global_scalars'.
-        , global_vect_decls     :: VarEnv (Type, CoreExpr)
+        , global_vars                 :: VarEnv Var
+          -- ^Mapping from global variables to their vectorised versions — aka the /vectorisation
+          -- map/.
 
-        -- | Purely scalar variables. Code which mentions only these variables doesn't have to be
-        --   lifted.  This includes variables from the current module that have a scalar
-        --   vectorisation declaration and those that the vectoriser determines to be scalar.
-        , global_scalars        :: VarSet
+        , global_parallel_vars        :: VarSet
+          -- ^The domain of 'global_vars'.
+          --
+          -- This information is not redundant as it is impossible to extract the domain from a
+          -- 'VarEnv' (which is keyed on uniques alone). Moreover, we have mapped variables that
+          -- do not involve parallelism — e.g., the workers of vectorised, but scalar data types.
+          -- In addition, workers of parallel data types that we could not vectorise also need to
+          -- be tracked.
 
-        -- | Exported variables which have a vectorised version.
-        , global_exported_vars	:: VarEnv (Var, Var)
+        , global_vect_decls           :: VarEnv (Maybe (Type, CoreExpr))
+          -- ^Mapping from global variables that have a vectorisation declaration to the right-hand
+          -- side of that declaration and its type and mapping variables that have NOVECTORISE
+          -- declarations to 'Nothing'.
 
-        -- | Mapping from TyCons to their vectorised versions.
-        --   TyCons which do not have to be vectorised are mapped to themselves.
-        , global_tycons		:: NameEnv TyCon
+        , global_tycons               :: NameEnv TyCon
+          -- ^Mapping from TyCons to their vectorised versions. The vectorised version will be
+          -- identical to the original version if it is not changed by vectorisation. In any case,
+          -- if a tycon appears in the domain of this mapping, it was successfully vectorised.
 
-        -- | Mapping from DataCons to their vectorised versions.
-        , global_datacons       :: NameEnv DataCon
+        , global_parallel_tycons      :: NameSet
+          -- ^Type constructors whose definition directly or indirectly includes a parallel type,
+          -- such as '[::]'.
+          --
+          -- NB: This information is not redundant as some types have got a mapping in
+          --     'global_tycons' (to a type other than themselves) and are still not parallel. An
+          --     example is '(->)'. Moreover, some types have *not* got a mapping in 'global_tycons'
+          --     (because they couldn't be vectorised), but still contain parallel types.
+        
+        , global_datacons             :: NameEnv DataCon
+          -- ^Mapping from DataCons to their vectorised versions.
 
-        -- | Mapping from TyCons to their PA dfuns.
-        , global_pa_funs        :: NameEnv Var
+        , global_pa_funs              :: NameEnv Var
+          -- ^Mapping from TyCons to their PA dfuns.
 
-        -- | Mapping from TyCons to their PR dfuns.
-        , global_pr_funs	:: NameEnv Var
+        , global_pr_funs              :: NameEnv Var
+          -- ^Mapping from TyCons to their PR dfuns.
 
-        -- | Mapping from unboxed TyCons to their boxed versions.
-        , global_boxed_tycons	:: NameEnv TyCon
+        , global_inst_env             :: (InstEnv, InstEnv)
+          -- ^External package inst-env & home-package inst-env for class instances.
 
-        -- | External package inst-env & home-package inst-env for class instances.
-        , global_inst_env	:: (InstEnv, InstEnv)
+        , global_fam_inst_env         :: FamInstEnvs
+          -- ^External package inst-env & home-package inst-env for family instances.
 
-        -- | External package inst-env & home-package inst-env for family instances.
-        , global_fam_inst_env	:: FamInstEnvs
-
-        -- | Hoisted bindings.
-        , global_bindings	:: [(Var, CoreExpr)]
+        , global_bindings             :: [(Var, CoreExpr)]
+          -- ^Hoisted bindings — temporary storage for toplevel bindings during code gen.
         }
 
--- | Create an initial global environment
-initGlobalEnv :: VectInfo -> [CoreVect] -> (InstEnv, InstEnv) -> FamInstEnvs -> GlobalEnv
-initGlobalEnv info vectDecls instEnvs famInstEnvs
+-- |Create an initial global environment.
+--
+-- We add scalar variables and type constructors identified by vectorisation pragmas already here
+-- to the global table, so that we can query scalarness during vectorisation, and especially, when
+-- vectorising the scalar entities' definitions themselves.
+--
+initGlobalEnv :: Bool -> VectInfo -> [CoreVect] -> (InstEnv, InstEnv) -> FamInstEnvs -> GlobalEnv
+initGlobalEnv vectAvoid info vectDecls instEnvs famInstEnvs
   = GlobalEnv 
-  { global_vars          = mapVarEnv snd $ vectInfoVar info
-  , global_vect_decls    = mkVarEnv vects
-  , global_scalars       = mkVarSet scalars
-  , global_exported_vars = emptyVarEnv
-  , global_tycons        = mapNameEnv snd $ vectInfoTyCon info
-  , global_datacons      = mapNameEnv snd $ vectInfoDataCon info
-  , global_pa_funs       = mapNameEnv snd $ vectInfoPADFun info
-  , global_pr_funs       = emptyNameEnv
-  , global_boxed_tycons  = emptyNameEnv
-  , global_inst_env      = instEnvs
-  , global_fam_inst_env  = famInstEnvs
-  , global_bindings      = []
+  { global_vect_avoid           = vectAvoid
+  , global_vars                 = mapVarEnv snd $ vectInfoVar info
+  , global_vect_decls           = mkVarEnv vects
+  , global_parallel_vars        = vectInfoParallelVars info
+  , global_parallel_tycons      = vectInfoParallelTyCons info
+  , global_tycons               = mapNameEnv snd $ vectInfoTyCon info
+  , global_datacons             = mapNameEnv snd $ vectInfoDataCon info
+  , global_pa_funs              = emptyNameEnv
+  , global_pr_funs              = emptyNameEnv
+  , global_inst_env             = instEnvs
+  , global_fam_inst_env         = famInstEnvs
+  , global_bindings             = []
   }
   where
-    vects   = [(var, (varType var, exp)) | Vect var (Just exp) <- vectDecls]
-    scalars = [var                       | Vect var Nothing    <- vectDecls]
+    vects         = [(var, Just (ty, exp)) | Vect   var   exp@(Var rhs_var) <- vectDecls
+                                           , let ty = varType rhs_var] ++
+                                        -- FIXME: we currently only allow RHSes consisting of a
+                                        --   single variable to be able to obtain the type without
+                                        --   inference — see also 'TcBinds.tcVect'
+                    [(var, Nothing)        | NoVect var                     <- vectDecls]
 
 
 -- Operators on Global Environments -------------------------------------------
--- | Extend the list of global variables in an environment.
+
+-- |Extend the list of global variables in an environment.
+--
 extendImportedVarsEnv :: [(Var, Var)] -> GlobalEnv -> GlobalEnv
 extendImportedVarsEnv ps genv
-  = genv { global_vars	 = extendVarEnvList (global_vars genv) ps }
+  = genv { global_vars = extendVarEnvList (global_vars genv) ps }
 
--- | Extend the set of scalar variables in an environment.
-extendScalars :: [Var] -> GlobalEnv -> GlobalEnv
-extendScalars vs genv
-  = genv { global_scalars = extendVarSetList (global_scalars genv) vs }
-
--- | Set the list of type family instances in an environment.
-setFamEnv :: FamInstEnv -> GlobalEnv -> GlobalEnv
-setFamEnv l_fam_inst genv
-  = genv { global_fam_inst_env = (g_fam_inst, l_fam_inst) }
-  where (g_fam_inst, _) = global_fam_inst_env genv
-
+-- |Extend the list of type family instances.
+--
 extendFamEnv :: [FamInst] -> GlobalEnv -> GlobalEnv
 extendFamEnv new genv
   = genv { global_fam_inst_env = (g_fam_inst, extendFamInstEnvList l_fam_inst new) }
   where (g_fam_inst, l_fam_inst) = global_fam_inst_env genv
 
+-- |Set the list of PA functions in an environment.
+--
+setPAFunsEnv :: [(Name, Var)] -> GlobalEnv -> GlobalEnv
+setPAFunsEnv ps genv = genv { global_pa_funs = mkNameEnv ps }
 
--- | Extend the list of type constructors in an environment.
-extendTyConsEnv :: [(Name, TyCon)] -> GlobalEnv -> GlobalEnv
-extendTyConsEnv ps genv
-  = genv { global_tycons = extendNameEnvList (global_tycons genv) ps }
-
-
--- | Extend the list of data constructors in an environment.
-extendDataConsEnv :: [(Name, DataCon)] -> GlobalEnv -> GlobalEnv
-extendDataConsEnv ps genv
-  = genv { global_datacons = extendNameEnvList (global_datacons genv) ps }
-
-
--- | Extend the list of PA functions in an environment.
-extendPAFunsEnv :: [(Name, Var)] -> GlobalEnv -> GlobalEnv
-extendPAFunsEnv ps genv
-  = genv { global_pa_funs = extendNameEnvList (global_pa_funs genv) ps }
-
-
--- | Set the list of PR functions in an environment.
+-- |Set the list of PR functions in an environment.
+--
 setPRFunsEnv :: [(Name, Var)] -> GlobalEnv -> GlobalEnv
-setPRFunsEnv ps genv
-  = genv { global_pr_funs = mkNameEnv ps }
+setPRFunsEnv ps genv = genv { global_pr_funs = mkNameEnv ps }
 
-
--- | Set the list of boxed type constructor in an environment.
-setBoxedTyConsEnv :: [(Name, TyCon)] -> GlobalEnv -> GlobalEnv
-setBoxedTyConsEnv ps genv
-  = genv { global_boxed_tycons = mkNameEnv ps }
-
-
--- | TODO: What is this for?
-updVectInfo :: GlobalEnv -> TypeEnv -> VectInfo -> VectInfo
-updVectInfo env tyenv info
+-- |Compute vectorisation information that goes into 'ModGuts' (and is stored in interface files).
+-- The incoming 'vectInfo' is that from the 'HscEnv' and 'EPS'.  The outgoing one contains only the
+-- declarations for the currently compiled module; this includes variables, type constructors, and
+-- data constructors referenced in VECTORISE pragmas, even if they are defined in an imported
+-- module.
+--
+-- The variables explicitly include class selectors and dfuns.
+--
+modVectInfo :: GlobalEnv -> [Id] -> [TyCon] -> [CoreVect]-> VectInfo -> VectInfo
+modVectInfo env mg_ids mg_tyCons vectDecls info
   = info 
-    { vectInfoVar     = global_exported_vars env
-    , vectInfoTyCon   = mk_env typeEnvTyCons global_tycons
-    , vectInfoDataCon = mk_env typeEnvDataCons global_datacons
-    , vectInfoPADFun  = mk_env typeEnvTyCons global_pa_funs
+    { vectInfoVar            = mk_env ids      (global_vars     env)
+    , vectInfoTyCon          = mk_env tyCons   (global_tycons   env)
+    , vectInfoDataCon        = mk_env dataCons (global_datacons env)
+    , vectInfoParallelVars   = (global_parallel_vars   env `minusVarSet`  vectInfoParallelVars   info)
+                               `intersectVarSet` (mkVarSet ids)
+    , vectInfoParallelTyCons =  global_parallel_tycons env `minusNameSet` vectInfoParallelTyCons info
     }
   where
-    mk_env from_tyenv from_env 
-	= mkNameEnv [(name, (from,to))
-                        | from     <- from_tyenv tyenv
-                        , let name =  getName from
-                        , Just to  <- [lookupNameEnv (from_env env) name]]
-
+    vectIds         = [id    | Vect     id    _   <- vectDecls] ++
+                      [id    | VectInst id        <- vectDecls]
+    vectTypeTyCons  = [tycon | VectType _ tycon _ <- vectDecls] ++
+                      [tycon | VectClass tycon    <- vectDecls]
+    vectDataCons    = concatMap tyConDataCons vectTypeTyCons
+    ids             = mg_ids ++ vectIds ++ dataConIds ++ selIds
+    tyCons          = mg_tyCons ++ vectTypeTyCons
+    dataCons        = concatMap tyConDataCons mg_tyCons ++ vectDataCons
+    dataConIds      = map dataConWorkId dataCons
+    selIds          = concat [ classAllSelIds cls 
+                             | tycon <- tyCons
+                             , cls <- maybeToList . tyConClass_maybe $ tycon]
+    
+    -- Produce an entry for every declaration that is mentioned in the domain of the 'inspectedEnv'
+    mk_env decls inspectedEnv
+      = mkNameEnv [(name, (decl, to))
+                  | decl     <- decls
+                  , let name = getName decl
+                  , Just to  <- [lookupNameEnv inspectedEnv name]]

@@ -35,11 +35,8 @@
 #include "Profiling.h"
 #include "Timer.h"
 #include "Globals.h"
+#include "FileLock.h"
 void exitLinker( void );	// there is no Linker.h file to include
-
-#if defined(RTS_GTK_FRONTPANEL)
-#include "FrontPanel.h"
-#endif
 
 #if defined(PROFILING)
 # include "ProfHeap.h"
@@ -52,7 +49,6 @@ void exitLinker( void );	// there is no Linker.h file to include
 
 #if !defined(mingw32_HOST_OS)
 #include "posix/TTY.h"
-#include "posix/FileLock.h"
 #endif
 
 #ifdef HAVE_UNISTD_H
@@ -68,6 +64,14 @@ void exitLinker( void );	// there is no Linker.h file to include
 
 // Count of how many outstanding hs_init()s there have been.
 static int hs_init_count = 0;
+
+static void flushStdHandles(void);
+
+const RtsConfig defaultRtsConfig  = {
+    .rts_opts_enabled = RtsOptsSafeOnly,
+    .rts_opts = NULL,
+    .rts_hs_main = rtsFalse
+};
 
 /* -----------------------------------------------------------------------------
    Initialise floating point unit on x86 (currently disabled; See Note
@@ -104,6 +108,20 @@ x86_init_fpu ( void )
 void
 hs_init(int *argc, char **argv[])
 {
+    hs_init_ghc(argc, argv, defaultRtsConfig);
+}
+
+void
+hs_init_with_rtsopts(int *argc, char **argv[])
+{
+    RtsConfig rts_opts = defaultRtsConfig; /* by value */
+    rts_opts.rts_opts_enabled = RtsOptsAll;
+    hs_init_ghc(argc, argv, rts_opts);
+}
+
+void
+hs_init_ghc(int *argc, char **argv[], RtsConfig rts_config)
+{
     hs_init_count++;
     if (hs_init_count > 1) {
 	// second and subsequent inits are ignored
@@ -114,6 +132,9 @@ hs_init(int *argc, char **argv[])
 
     /* Initialise the stats department, phase 0 */
     initStats0();
+
+    /* Initialize system timer before starting to collect stats */
+    initializeTimer();
 
     /* Next we do is grab the start time...just in case we're
      * collecting timing statistics.
@@ -128,9 +149,17 @@ hs_init(int *argc, char **argv[])
     defaultsHook();
 
     /* Parse the flags, separating the RTS flags from the programs args */
-    if (argc != NULL && argv != NULL) {
-	setFullProgArgv(*argc,*argv);
-        setupRtsFlags(argc, *argv);
+    if (argc == NULL || argv == NULL) {
+        // Use a default for argc & argv if either is not supplied
+        int my_argc = 1;
+        char *my_argv[] = { "<unknown>", NULL };
+        setFullProgArgv(my_argc,my_argv);
+        setupRtsFlags(&my_argc, my_argv,
+                      rts_config.rts_opts_enabled, rts_config.rts_opts, rts_config.rts_hs_main);
+    } else {
+        setFullProgArgv(*argc,*argv);
+        setupRtsFlags(argc, *argv,
+                      rts_config.rts_opts_enabled, rts_config.rts_opts, rts_config.rts_hs_main);
     }
 
     /* Initialise the stats department, phase 1 */
@@ -144,20 +173,24 @@ hs_init(int *argc, char **argv[])
 #ifdef TRACING
     initTracing();
 #endif
-    /* Dtrace events are always enabled
+    /* Trace the startup event
      */
-    dtraceEventStartup();
+    traceEventStartup();
 
     /* initialise scheduler data structures (needs to be done before
      * initStorage()).
      */
     initScheduler();
 
+    /* Trace some basic information about the process */
+    traceWallClockTime();
+    traceOSProcessInfo();
+
     /* initialize the storage manager */
     initStorage();
 
     /* initialise the stable pointer table */
-    initStablePtrTable();
+    initStableTables();
 
     /* Add some GC roots for things in the base package that the RTS
      * knows about.  We don't know whether these turn out to be CAFs
@@ -165,6 +198,7 @@ hs_init(int *argc, char **argv[])
      */
     getStablePtr((StgPtr)runIO_closure);
     getStablePtr((StgPtr)runNonIO_closure);
+    getStablePtr((StgPtr)flushStdHandles_closure);
 
     getStablePtr((StgPtr)runFinalizerBatch_closure);
 
@@ -178,6 +212,7 @@ hs_init(int *argc, char **argv[])
 
     getStablePtr((StgPtr)runSparks_closure);
     getStablePtr((StgPtr)ensureIOManagerIsRunning_closure);
+    getStablePtr((StgPtr)ioManagerCapabilitiesChanged_closure);
 #ifndef mingw32_HOST_OS
     getStablePtr((StgPtr)runHandlers_closure);
 #endif
@@ -186,9 +221,7 @@ hs_init(int *argc, char **argv[])
     initGlobalStore();
 
     /* initialise file locking, if necessary */
-#if !defined(mingw32_HOST_OS)    
     initFileLocking();
-#endif
 
 #if defined(DEBUG)
     /* initialise thread label table (tso->char*) */
@@ -209,15 +242,9 @@ hs_init(int *argc, char **argv[])
         initDefaultHandlers();
     }
 #endif
- 
+
 #if defined(mingw32_HOST_OS) && !defined(THREADED_RTS)
     startupAsyncIO();
-#endif
-
-#ifdef RTS_GTK_FRONTPANEL
-    if (RtsFlags.GcFlags.frontpanel) {
-	initFrontPanel();
-    }
 #endif
 
 #if X86_INIT_FPU
@@ -265,7 +292,7 @@ hs_add_root(void (*init_root)(void) STG_UNUSED)
  *       False ==> threads doing foreign calls may return in the
  *                 future, but will immediately block on a mutex.
  *                 (capability->lock).
- * 
+ *
  * If this RTS is a DLL that we're about to unload, then you want
  * safe=True, otherwise the thread might return to code that has been
  * unloaded.  If this is a standalone program that is about to exit,
@@ -277,6 +304,8 @@ hs_add_root(void (*init_root)(void) STG_UNUSED)
 static void
 hs_exit_(rtsBool wait_foreign)
 {
+    nat g;
+
     if (hs_init_count <= 0) {
 	errorBelch("warning: too many hs_exit()s");
 	return;
@@ -289,16 +318,15 @@ hs_exit_(rtsBool wait_foreign)
 
     /* start timing the shutdown */
     stat_startExit();
-    
+
     OnExitHook();
+
+    flushStdHandles();
 
     // sanity check
 #if defined(DEBUG)
     checkFPUStack();
 #endif
-
-    // Free the full argv storage
-    freeFullProgArgv();
 
 #if defined(THREADED_RTS)
     ioManagerDie();
@@ -308,8 +336,10 @@ hs_exit_(rtsBool wait_foreign)
     exitScheduler(wait_foreign);
 
     /* run C finalizers for all active weak pointers */
-    runAllCFinalizers(weak_ptr_list);
-    
+    for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        runAllCFinalizers(generations[g].weak_ptr_list);
+    }
+
 #if defined(RTS_USER_SIGNALS)
     if (RtsFlags.MiscFlags.install_signal_handlers) {
         freeSignalHandlers();
@@ -321,7 +351,7 @@ hs_exit_(rtsBool wait_foreign)
     exitTimer(wait_foreign);
 
     // set the terminal settings back to what they were
-#if !defined(mingw32_HOST_OS)    
+#if !defined(mingw32_HOST_OS)
     resetTerminalSettings();
 #endif
 
@@ -330,14 +360,14 @@ hs_exit_(rtsBool wait_foreign)
 
     /* stop timing the shutdown, we're about to print stats */
     stat_endExit();
-    
+
     /* shutdown the hpc support (if needed) */
     exitHpc();
 
     // clean up things from the storage manager's point of view.
     // also outputs the stats (+RTS -s) info.
     exitStorage();
-    
+
     /* free the tasks */
     freeScheduler();
 
@@ -348,25 +378,17 @@ hs_exit_(rtsBool wait_foreign)
     exitLinker();
 
     /* free file locking tables, if necessary */
-#if !defined(mingw32_HOST_OS)    
     freeFileLocking();
-#endif
 
     /* free the stable pointer table */
-    exitStablePtrTable();
+    exitStableTables();
 
 #if defined(DEBUG)
     /* free the thread label table */
     freeThreadLabelTable();
 #endif
 
-#ifdef RTS_GTK_FRONTPANEL
-    if (RtsFlags.GcFlags.frontpanel) {
-	stopFrontPanel();
-    }
-#endif
-
-#if defined(PROFILING) 
+#if defined(PROFILING)
     reportCCSProfiling();
 #endif
 
@@ -402,6 +424,19 @@ hs_exit_(rtsBool wait_foreign)
     // heap memory (e.g. by being passed a ByteArray#).
     freeStorage(wait_foreign);
 
+    // Free the various argvs
+    freeRtsArgs();
+}
+
+// Flush stdout and stderr.  We do this during shutdown so that it
+// happens even when the RTS is being used as a library, without a
+// main (#5594)
+static void flushStdHandles(void)
+{
+    Capability *cap;
+    cap = rts_lock();
+    rts_evalIO(&cap, flushStdHandles_closure, NULL);
+    rts_unlock(cap);
 }
 
 // The real hs_exit():
@@ -420,34 +455,82 @@ shutdownHaskell(void)
 }
 
 void
-shutdownHaskellAndExit(int n)
+shutdownHaskellAndExit(int n, int fastExit)
 {
-    // we're about to exit(), no need to wait for foreign calls to return.
-    hs_exit_(rtsFalse);
+    if (!fastExit) {
+        // even if hs_init_count > 1, we still want to shut down the RTS
+        // and exit immediately (see #5402)
+        hs_init_count = 1;
 
-    if (hs_init_count == 0) {
-	stg_exit(n);
+        // we're about to exit(), no need to wait for foreign calls to return.
+        hs_exit_(rtsFalse);
     }
+
+    stg_exit(n);
 }
 
 #ifndef mingw32_HOST_OS
+static void exitBySignal(int sig) GNUC3_ATTRIBUTE(__noreturn__);
+
 void
-shutdownHaskellAndSignal(int sig)
+shutdownHaskellAndSignal(int sig, int fastExit)
 {
-    hs_exit_(rtsFalse);
-    kill(getpid(),sig);
+    if (!fastExit) {
+        hs_exit_(rtsFalse);
+    }
+
+    exitBySignal(sig);
+}
+
+void
+exitBySignal(int sig)
+{
+    // We're trying to kill ourselves with a given signal.
+    // That's easier said that done because:
+    //  - signals can be ignored have handlers set for them
+    //  - signals can be masked
+    //  - signals default action can do things other than terminate:
+    //    + can do nothing
+    //    + can do weirder things: stop/continue the process
+
+    struct sigaction dfl;
+    sigset_t sigset;
+
+    // So first of all, we reset the signal to use the default action.
+    (void)sigemptyset(&dfl.sa_mask);
+    dfl.sa_flags = 0;
+    dfl.sa_handler = SIG_DFL;
+    (void)sigaction(sig, &dfl, NULL);
+
+    // Then we unblock the signal so we can deliver it to ourselves
+    sigemptyset(&sigset);
+    sigaddset(&sigset, sig);
+    sigprocmask(SIG_UNBLOCK, &sigset, NULL);
+
+    switch (sig) {
+      case SIGSTOP: case SIGTSTP: case SIGTTIN: case SIGTTOU: case SIGCONT:
+        // These signals stop (or continue) the process, so are no good for
+        // exiting.
+        exit(0xff);
+
+      default:
+        kill(getpid(),sig);
+        // But it's possible the signal is one where the default action is to
+        // ignore, in which case we'll still be alive... so just exit.
+        exit(0xff);
+    }
 }
 #endif
 
-/* 
+/*
  * called from STG-land to exit the program
  */
 
 void (*exitFn)(int) = 0;
 
-void  
+void
 stg_exit(int n)
-{ 
+{
   if (exitFn)
     (*exitFn)(n);
   exit(n);

@@ -1,10 +1,10 @@
 /* ---------------------------------------------------------------------------
  *
- * (c) The GHC Team, 2003-2006
+ * (c) The GHC Team, 2003-2012
  *
  * Capabilities
  *
- * A Capability represent the token required to execute STG code,
+ * A Capability represents the token required to execute STG code,
  * and all the state an OS thread/task needs to run Haskell code:
  * its STG registers, a pointer to its TSO, a nursery etc. During
  * STG execution, a pointer to the capabilitity is kept in a
@@ -27,12 +27,21 @@
 #include "STM.h"
 #include "RtsUtils.h"
 
+#include <string.h>
+
 // one global capability, this is the Capability for non-threaded
 // builds, and for +RTS -N1
 Capability MainCapability;
 
 nat n_capabilities = 0;
-Capability *capabilities = NULL;
+nat enabled_capabilities = 0;
+
+// The array of Capabilities.  It's important that when we need
+// to allocate more Capabilities we don't have to move the existing
+// Capabilities, because there may be pointers to them in use
+// (e.g. threads in waitForReturnCapability(), see #8209), so this is
+// an array of Capability* rather than an array of Capability.
+Capability **capabilities = NULL;
 
 // Holds the Capability which last became free.  This is used so that
 // an in-call has a chance of quickly finding a free Capability.
@@ -40,13 +49,17 @@ Capability *capabilities = NULL;
 // locking, so we don't do that.
 Capability *last_free_capability = NULL;
 
-/* GC indicator, in scope for the scheduler, init'ed to false */
-volatile StgWord waiting_for_gc = 0;
+/*
+ * Indicates that the RTS wants to synchronise all the Capabilities
+ * for some reason.  All Capabilities should stop and return to the
+ * scheduler.
+ */
+volatile StgWord pending_sync = 0;
 
 /* Let foreign code get the current Capability -- assuming there is one!
  * This is useful for unsafe foreign calls because they are called with
  * the current Capability held, but they are not passed it. For example,
- * see see the integer-gmp package which calls allocateLocal() in its
+ * see see the integer-gmp package which calls allocate() in its
  * stgAllocForGMP() function (which gets called by gmp functions).
  * */
 Capability * rts_unsafeGetMyCapability (void)
@@ -92,12 +105,17 @@ findSpark (Capability *cap)
       //   spark = reclaimSpark(cap->sparks);
       // However, measurements show that this makes at least one benchmark
       // slower (prsa) and doesn't affect the others.
-      spark = tryStealSpark(cap);
+      spark = tryStealSpark(cap->sparks);
+      while (spark != NULL && fizzledSpark(spark)) {
+          cap->spark_stats.fizzled++;
+          traceEventSparkFizzle(cap);
+          spark = tryStealSpark(cap->sparks);
+      }
       if (spark != NULL) {
-          cap->sparks_converted++;
+          cap->spark_stats.converted++;
 
           // Post event for running a spark from capability's own pool.
-          traceEventRunSpark(cap, cap->r.rCurrentTSO);
+          traceEventSparkRun(cap);
 
           return spark;
       }
@@ -114,14 +132,19 @@ findSpark (Capability *cap)
       /* visit cap.s 0..n-1 in sequence until a theft succeeds. We could
       start at a random place instead of 0 as well.  */
       for ( i=0 ; i < n_capabilities ; i++ ) {
-          robbed = &capabilities[i];
+          robbed = capabilities[i];
           if (cap == robbed)  // ourselves...
               continue;
 
           if (emptySparkPoolCap(robbed)) // nothing to steal here
               continue;
 
-          spark = tryStealSpark(robbed);
+          spark = tryStealSpark(robbed->sparks);
+          while (spark != NULL && fizzledSpark(spark)) {
+              cap->spark_stats.fizzled++;
+              traceEventSparkFizzle(cap);
+              spark = tryStealSpark(robbed->sparks);
+          }
           if (spark == NULL && !emptySparkPoolCap(robbed)) {
               // we conflicted with another thread while trying to steal;
               // try again later.
@@ -129,9 +152,8 @@ findSpark (Capability *cap)
           }
 
           if (spark != NULL) {
-              cap->sparks_converted++;
-
-              traceEventStealSpark(cap, cap->r.rCurrentTSO, robbed->no);
+              cap->spark_stats.converted++;
+              traceEventSparkSteal(cap, robbed->no);
               
               return spark;
           }
@@ -153,7 +175,7 @@ anySparks (void)
     nat i;
 
     for (i=0; i < n_capabilities; i++) {
-        if (!emptySparkPoolCap(&capabilities[i])) {
+        if (!emptySparkPoolCap(capabilities[i])) {
             return rtsTrue;
         }
     }
@@ -211,6 +233,8 @@ initCapability( Capability *cap, nat i )
 
     cap->no = i;
     cap->in_haskell        = rtsFalse;
+    cap->idle              = 0;
+    cap->disabled          = rtsFalse;
 
     cap->run_queue_hd      = END_TSO_QUEUE;
     cap->run_queue_tl      = END_TSO_QUEUE;
@@ -224,12 +248,15 @@ initCapability( Capability *cap, nat i )
     cap->returning_tasks_hd = NULL;
     cap->returning_tasks_tl = NULL;
     cap->inbox              = (Message*)END_TSO_QUEUE;
-    cap->sparks_created     = 0;
-    cap->sparks_dud         = 0;
-    cap->sparks_converted   = 0;
-    cap->sparks_gcd         = 0;
-    cap->sparks_fizzled     = 0;
+    cap->sparks             = allocSparkPool();
+    cap->spark_stats.created    = 0;
+    cap->spark_stats.dud        = 0;
+    cap->spark_stats.overflowed = 0;
+    cap->spark_stats.converted  = 0;
+    cap->spark_stats.gcd        = 0;
+    cap->spark_stats.fizzled    = 0;
 #endif
+    cap->total_allocated        = 0;
 
     cap->f.stgEagerBlackholeInfo = (W_)&__stg_EAGER_BLACKHOLE_info;
     cap->f.stgGCEnter1     = (StgFunPtr)__stg_gc_enter_1;
@@ -253,6 +280,20 @@ initCapability( Capability *cap, nat i )
     cap->transaction_tokens = 0;
     cap->context_switch = 0;
     cap->pinned_object_block = NULL;
+    cap->pinned_object_blocks = NULL;
+
+#ifdef PROFILING
+    cap->r.rCCCS = CCS_SYSTEM;
+#else
+    cap->r.rCCCS = NULL;
+#endif
+
+    traceCapCreate(cap);
+    traceCapsetAssignCap(CAPSET_OSPROCESS_DEFAULT, i);
+    traceCapsetAssignCap(CAPSET_CLOCKDOMAIN_DEFAULT, i);
+#if defined(THREADED_RTS)
+    traceSparkCounters(cap);
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -266,8 +307,12 @@ initCapability( Capability *cap, nat i )
 void
 initCapabilities( void )
 {
+    /* Declare a couple capability sets representing the process and
+       clock domain. Each capability will get added to these capsets. */
+    traceCapsetCreate(CAPSET_OSPROCESS_DEFAULT, CapsetTypeOsProcess);
+    traceCapsetCreate(CAPSET_CLOCKDOMAIN_DEFAULT, CapsetTypeClockdomain);
+
 #if defined(THREADED_RTS)
-    nat i;
 
 #ifndef REG_Base
     // We can't support multiple CPUs if BaseReg is not a register
@@ -277,36 +322,62 @@ initCapabilities( void )
     }
 #endif
 
+    n_capabilities = 0;
+    moreCapabilities(0, RtsFlags.ParFlags.nNodes);
     n_capabilities = RtsFlags.ParFlags.nNodes;
-
-    if (n_capabilities == 1) {
-	capabilities = &MainCapability;
-	// THREADED_RTS must work on builds that don't have a mutable
-	// BaseReg (eg. unregisterised), so in this case
-	// capabilities[0] must coincide with &MainCapability.
-    } else {
-	capabilities = stgMallocBytes(n_capabilities * sizeof(Capability),
-				      "initCapabilities");
-    }
-
-    for (i = 0; i < n_capabilities; i++) {
-	initCapability(&capabilities[i], i);
-    }
-
-    debugTrace(DEBUG_sched, "allocated %d capabilities", n_capabilities);
 
 #else /* !THREADED_RTS */
 
     n_capabilities = 1;
-    capabilities = &MainCapability;
+    capabilities = stgMallocBytes(sizeof(Capability*), "initCapabilities");
+    capabilities[0] = &MainCapability;
     initCapability(&MainCapability, 0);
 
 #endif
 
+    enabled_capabilities = n_capabilities;
+
     // There are no free capabilities to begin with.  We will start
     // a worker Task to each Capability, which will quickly put the
     // Capability on the free list when it finds nothing to do.
-    last_free_capability = &capabilities[0];
+    last_free_capability = capabilities[0];
+}
+
+void
+moreCapabilities (nat from USED_IF_THREADS, nat to USED_IF_THREADS)
+{
+#if defined(THREADED_RTS)
+    nat i;
+    Capability **old_capabilities = capabilities;
+
+    capabilities = stgMallocBytes(to * sizeof(Capability*), "moreCapabilities");
+
+    if (to == 1) {
+        // THREADED_RTS must work on builds that don't have a mutable
+        // BaseReg (eg. unregisterised), so in this case
+	// capabilities[0] must coincide with &MainCapability.
+        capabilities[0] = &MainCapability;
+        initCapability(&MainCapability, 0);
+    }
+    else
+    {
+        for (i = 0; i < to; i++) {
+            if (i < from) {
+                capabilities[i] = old_capabilities[i];
+            } else {
+                capabilities[i] = stgMallocBytes(sizeof(Capability),
+                                                 "moreCapabilities");
+                initCapability(capabilities[i], i);
+            }
+        }
+    }
+
+    debugTrace(DEBUG_sched, "allocated %d more capabilities", to - from);
+
+    if (old_capabilities != NULL) {
+        stgFree(old_capabilities);
+    }
+#endif
 }
 
 /* ----------------------------------------------------------------------------
@@ -314,11 +385,19 @@ initCapabilities( void )
  * soon as possible.
  * ------------------------------------------------------------------------- */
 
-void setContextSwitches(void)
+void contextSwitchAllCapabilities(void)
 {
     nat i;
     for (i=0; i < n_capabilities; i++) {
-        contextSwitchCapability(&capabilities[i]);
+        contextSwitchCapability(capabilities[i]);
+    }
+}
+
+void interruptAllCapabilities(void)
+{
+    nat i;
+    for (i=0; i < n_capabilities; i++) {
+        interruptCapability(capabilities[i]);
     }
 }
 
@@ -342,15 +421,17 @@ giveCapabilityToTask (Capability *cap USED_IF_DEBUG, Task *task)
 {
     ASSERT_LOCK_HELD(&cap->lock);
     ASSERT(task->cap == cap);
-    debugTrace(DEBUG_sched, "passing capability %d to %s %p",
+    debugTrace(DEBUG_sched, "passing capability %d to %s %#" FMT_HexWord64,
                cap->no, task->incall->tso ? "bound task" : "worker",
-               (void *)task->id);
+               serialisableTaskId(task));
     ACQUIRE_LOCK(&task->lock);
-    task->wakeup = rtsTrue;
-    // the wakeup flag is needed because signalCondition() doesn't
-    // flag the condition if the thread is already runniing, but we want
-    // it to be sticky.
-    signalCondition(&task->cond);
+    if (task->wakeup == rtsFalse) {
+        task->wakeup = rtsTrue;
+        // the wakeup flag is needed because signalCondition() doesn't
+        // flag the condition if the thread is already runniing, but we want
+        // it to be sticky.
+        signalCondition(&task->cond);
+    }
     RELEASE_LOCK(&task->lock);
 }
 #endif
@@ -384,23 +465,25 @@ releaseCapability_ (Capability* cap,
 	return;
     }
 
-    if (waiting_for_gc == PENDING_GC_SEQ) {
+    // If there is a pending sync, then we should just leave the
+    // Capability free.  The thread trying to sync will be about to
+    // call waitForReturnCapability().
+    if (pending_sync != 0 && pending_sync != SYNC_GC_PAR) {
       last_free_capability = cap; // needed?
-      debugTrace(DEBUG_sched, "GC pending, set capability %d free", cap->no);
+      debugTrace(DEBUG_sched, "sync pending, set capability %d free", cap->no);
       return;
     } 
 
-
     // If the next thread on the run queue is a bound thread,
     // give this Capability to the appropriate Task.
-    if (!emptyRunQueue(cap) && cap->run_queue_hd->bound) {
+    if (!emptyRunQueue(cap) && peekRunQueue(cap)->bound) {
 	// Make sure we're not about to try to wake ourselves up
 	// ASSERT(task != cap->run_queue_hd->bound);
         // assertion is false: in schedule() we force a yield after
 	// ThreadBlocked, but the thread may be back on the run queue
 	// by now.
-	task = cap->run_queue_hd->bound->task;
-	giveCapabilityToTask(cap,task);
+	task = peekRunQueue(cap)->bound->task;
+	giveCapabilityToTask(cap, task);
 	return;
     }
 
@@ -421,14 +504,17 @@ releaseCapability_ (Capability* cap,
     // anything else to do, give the Capability to a worker thread.
     if (always_wakeup || 
         !emptyRunQueue(cap) || !emptyInbox(cap) ||
-        !emptySparkPoolCap(cap) || globalWorkToDo()) {
+        (!cap->disabled && !emptySparkPoolCap(cap)) || globalWorkToDo()) {
 	if (cap->spare_workers) {
-	    giveCapabilityToTask(cap,cap->spare_workers);
+	    giveCapabilityToTask(cap, cap->spare_workers);
 	    // The worker Task pops itself from the queue;
 	    return;
 	}
     }
 
+#ifdef PROFILING
+    cap->r.rCCCS = CCS_IDLE;
+#endif
     last_free_capability = cap;
     debugTrace(DEBUG_sched, "freeing capability %d", cap->no);
 }
@@ -495,7 +581,7 @@ releaseCapabilityAndQueueWorker (Capability* cap USED_IF_THREADS)
 #endif
 
 /* ----------------------------------------------------------------------------
- * waitForReturnCapability( Task *task )
+ * waitForReturnCapability (Capability **pCap, Task *task)
  *
  * Purpose:  when an OS thread returns from an external call,
  * it calls waitForReturnCapability() (via Schedule.resumeThread())
@@ -524,8 +610,8 @@ waitForReturnCapability (Capability **pCap, Task *task)
 	    // otherwise, search for a free capability
             cap = NULL;
 	    for (i = 0; i < n_capabilities; i++) {
-		if (!capabilities[i].running_task) {
-                    cap = &capabilities[i];
+                if (!capabilities[i]->running_task) {
+                    cap = capabilities[i];
 		    break;
 		}
 	    }
@@ -580,7 +666,11 @@ waitForReturnCapability (Capability **pCap, Task *task)
 
     }
 
-    ASSERT_FULL_CAPABILITY_INVARIANTS(cap,task);
+#ifdef PROFILING
+    cap->r.rCCCS = CCS_SYSTEM;
+#endif
+
+    ASSERT_FULL_CAPABILITY_INVARIANTS(cap, task);
 
     debugTrace(DEBUG_sched, "resuming capability %d", cap->no);
 
@@ -593,16 +683,22 @@ waitForReturnCapability (Capability **pCap, Task *task)
  * yieldCapability
  * ------------------------------------------------------------------------- */
 
-void
-yieldCapability (Capability** pCap, Task *task)
+/* See Note [GC livelock] in Schedule.c for why we have gcAllowed
+   and return the rtsBool */
+rtsBool /* Did we GC? */
+yieldCapability (Capability** pCap, Task *task, rtsBool gcAllowed)
 {
     Capability *cap = *pCap;
 
-    if (waiting_for_gc == PENDING_GC_PAR) {
+    if ((pending_sync == SYNC_GC_PAR) && gcAllowed) {
         traceEventGcStart(cap);
         gcWorkerThread(cap);
         traceEventGcEnd(cap);
-        return;
+        traceSparkCounters(cap);
+        // See Note [migrated bound threads 2]
+        if (task->cap == cap) {
+            return rtsTrue;
+        }
     }
 
 	debugTrace(DEBUG_sched, "giving up capability %d", cap->no);
@@ -630,7 +726,15 @@ yieldCapability (Capability** pCap, Task *task)
 		continue;
 	    }
 
-	    if (task->incall->tso == NULL) {
+            if (task->cap != cap) {
+                // see Note [migrated bound threads]
+                debugTrace(DEBUG_sched,
+                           "task has been migrated to cap %d", task->cap->no);
+		RELEASE_LOCK(&cap->lock);
+		continue;
+	    }
+
+            if (task->incall->tso == NULL) {
 		ASSERT(cap->spare_workers != NULL);
 		// if we're not at the front of the queue, release it
 		// again.  This is unlikely to happen.
@@ -643,20 +747,53 @@ yieldCapability (Capability** pCap, Task *task)
 		task->next = NULL;
                 cap->n_spare_workers--;
             }
-	    cap->running_task = task;
+
+            cap->running_task = task;
 	    RELEASE_LOCK(&cap->lock);
 	    break;
 	}
 
-	debugTrace(DEBUG_sched, "resuming capability %d", cap->no);
+        debugTrace(DEBUG_sched, "resuming capability %d", cap->no);
 	ASSERT(cap->running_task == task);
+
+#ifdef PROFILING
+        cap->r.rCCCS = CCS_SYSTEM;
+#endif
 
     *pCap = cap;
 
     ASSERT_FULL_CAPABILITY_INVARIANTS(cap,task);
 
-    return;
+    return rtsFalse;
 }
+
+// Note [migrated bound threads]
+//
+// There's a tricky case where:
+//    - cap A is running an unbound thread T1
+//    - there is a bound thread T2 at the head of the run queue on cap A
+//    - T1 makes a safe foreign call, the task bound to T2 is woken up on cap A
+//    - T1 returns quickly grabbing A again (T2 is still waking up on A)
+//    - T1 blocks, the scheduler migrates T2 to cap B
+//    - the task bound to T2 wakes up on cap B
+//
+// We take advantage of the following invariant:
+//
+//  - A bound thread can only be migrated by the holder of the
+//    Capability on which the bound thread currently lives.  So, if we
+//    hold Capabilty C, and task->cap == C, then task cannot be
+//    migrated under our feet.
+
+// Note [migrated bound threads 2]
+//
+// Second tricky case;
+//   - A bound Task becomes a GC thread
+//   - scheduleDoGC() migrates the thread belonging to this Task,
+//     because the Capability it is on is disabled
+//   - after GC, gcWorkerThread() returns, but now we are
+//     holding a Capability that is not the same as task->cap
+//   - Hence we must check for this case and immediately give up the
+//     cap we hold.
 
 /* ----------------------------------------------------------------------------
  * prodCapability
@@ -677,6 +814,31 @@ prodCapability (Capability *cap, Task *task)
 }
 
 /* ----------------------------------------------------------------------------
+ * tryGrabCapability
+ *
+ * Attempt to gain control of a Capability if it is free.
+ *
+ * ------------------------------------------------------------------------- */
+
+rtsBool
+tryGrabCapability (Capability *cap, Task *task)
+{
+    if (cap->running_task != NULL) return rtsFalse;
+    ACQUIRE_LOCK(&cap->lock);
+    if (cap->running_task != NULL) {
+	RELEASE_LOCK(&cap->lock);
+	return rtsFalse;
+    }
+    task->cap = cap;
+    cap->running_task = task;
+    RELEASE_LOCK(&cap->lock);
+    return rtsTrue;
+}
+
+
+#endif /* THREADED_RTS */
+
+/* ----------------------------------------------------------------------------
  * shutdownCapability
  *
  * At shutdown time, we want to let everything exit as cleanly as
@@ -684,7 +846,7 @@ prodCapability (Capability *cap, Task *task)
  * allow the workers to stop.
  *
  * This function should be called when interrupted and
- * shutting_down_scheduler = rtsTrue, thus any worker that wakes up
+ * sched_state = SCHED_SHUTTING_DOWN, thus any worker that wakes up
  * will exit the scheduler and call taskStop(), and any bound thread
  * that wakes up will return to its caller.  Runnable threads are
  * killed.
@@ -692,8 +854,11 @@ prodCapability (Capability *cap, Task *task)
  * ------------------------------------------------------------------------- */
 
 void
-shutdownCapability (Capability *cap, Task *task, rtsBool safe)
+shutdownCapability (Capability *cap USED_IF_THREADS,
+                    Task *task USED_IF_THREADS,
+                    rtsBool safe USED_IF_THREADS)
 {
+#if defined(THREADED_RTS)
     nat i;
 
     task->cap = cap;
@@ -730,7 +895,7 @@ shutdownCapability (Capability *cap, Task *task, rtsBool safe)
             for (t = cap->spare_workers; t != NULL; t = t->next) {
                 if (!osThreadIsAlive(t->id)) {
                     debugTrace(DEBUG_sched, 
-                               "worker thread %p has died unexpectedly", (void *)t->id);
+                               "worker thread %p has died unexpectedly", (void *)(size_t)t->id);
                     cap->n_spare_workers--;
                     if (!prev) {
                         cap->spare_workers = t->next;
@@ -774,7 +939,7 @@ shutdownCapability (Capability *cap, Task *task, rtsBool safe)
             continue;
         }
 
-        traceEventShutdown(cap);
+        traceSparkCounters(cap);
 	RELEASE_LOCK(&cap->lock);
 	break;
     }
@@ -785,32 +950,21 @@ shutdownCapability (Capability *cap, Task *task, rtsBool safe)
     // threads performing foreign calls that will eventually try to 
     // return via resumeThread() and attempt to grab cap->lock.
     // closeMutex(&cap->lock);
+#endif
 }
 
-/* ----------------------------------------------------------------------------
- * tryGrabCapability
- *
- * Attempt to gain control of a Capability if it is free.
- *
- * ------------------------------------------------------------------------- */
-
-rtsBool
-tryGrabCapability (Capability *cap, Task *task)
+void
+shutdownCapabilities(Task *task, rtsBool safe)
 {
-    if (cap->running_task != NULL) return rtsFalse;
-    ACQUIRE_LOCK(&cap->lock);
-    if (cap->running_task != NULL) {
-	RELEASE_LOCK(&cap->lock);
-	return rtsFalse;
+    nat i;
+    for (i=0; i < n_capabilities; i++) {
+        ASSERT(task->incall->tso == NULL);
+        shutdownCapability(capabilities[i], task, safe);
     }
-    task->cap = cap;
-    cap->running_task = task;
-    RELEASE_LOCK(&cap->lock);
-    return rtsTrue;
+#if defined(THREADED_RTS)
+    ASSERT(checkSparkCountInvariant());
+#endif
 }
-
-
-#endif /* THREADED_RTS */
 
 static void
 freeCapability (Capability *cap)
@@ -820,6 +974,9 @@ freeCapability (Capability *cap)
 #if defined(THREADED_RTS)
     freeSparkPool(cap->sparks);
 #endif
+    traceCapsetRemoveCap(CAPSET_OSPROCESS_DEFAULT, cap->no);
+    traceCapsetRemoveCap(CAPSET_CLOCKDOMAIN_DEFAULT, cap->no);
+    traceCapDelete(cap);
 }
 
 void
@@ -828,11 +985,16 @@ freeCapabilities (void)
 #if defined(THREADED_RTS)
     nat i;
     for (i=0; i < n_capabilities; i++) {
-        freeCapability(&capabilities[i]);
+        freeCapability(capabilities[i]);
+        if (capabilities[i] != &MainCapability)
+            stgFree(capabilities[i]);
     }
 #else
     freeCapability(&MainCapability);
 #endif
+    stgFree(capabilities);
+    traceCapsetDelete(CAPSET_OSPROCESS_DEFAULT);
+    traceCapsetDelete(CAPSET_CLOCKDOMAIN_DEFAULT);
 }
 
 /* ---------------------------------------------------------------------------
@@ -877,6 +1039,37 @@ markCapabilities (evac_fn evac, void *user)
 {
     nat n;
     for (n = 0; n < n_capabilities; n++) {
-        markCapability(evac, user, &capabilities[n], rtsFalse);
+        markCapability(evac, user, capabilities[n], rtsFalse);
     }
 }
+
+#if defined(THREADED_RTS)
+rtsBool checkSparkCountInvariant (void)
+{
+    SparkCounters sparks = { 0, 0, 0, 0, 0, 0 };
+    StgWord64 remaining = 0;
+    nat i;
+
+    for (i = 0; i < n_capabilities; i++) {
+        sparks.created   += capabilities[i]->spark_stats.created;
+        sparks.dud       += capabilities[i]->spark_stats.dud;
+        sparks.overflowed+= capabilities[i]->spark_stats.overflowed;
+        sparks.converted += capabilities[i]->spark_stats.converted;
+        sparks.gcd       += capabilities[i]->spark_stats.gcd;
+        sparks.fizzled   += capabilities[i]->spark_stats.fizzled;
+        remaining        += sparkPoolSize(capabilities[i]->sparks);
+    }
+    
+    /* The invariant is
+     *   created = converted + remaining + gcd + fizzled
+     */
+    debugTrace(DEBUG_sparks,"spark invariant: %ld == %ld + %ld + %ld + %ld "
+                            "(created == converted + remaining + gcd + fizzled)",
+                            sparks.created, sparks.converted, remaining,
+                            sparks.gcd, sparks.fizzled);
+
+    return (sparks.created ==
+              sparks.converted + remaining + sparks.gcd + sparks.fizzled);
+
+}
+#endif

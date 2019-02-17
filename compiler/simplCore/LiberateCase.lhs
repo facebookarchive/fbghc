@@ -4,6 +4,13 @@
 \section[LiberateCase]{Unroll recursion to allow evals to be lifted from a loop}
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module LiberateCase ( liberateCase ) where
 
 #include "HsVersions.h"
@@ -117,7 +124,7 @@ and the level of @h@ is zero (NB not one).
 %************************************************************************
 
 \begin{code}
-liberateCase :: DynFlags -> [CoreBind] -> [CoreBind]
+liberateCase :: DynFlags -> CoreProgram -> CoreProgram
 liberateCase dflags binds = do_prog (initEnv dflags) binds
   where
     do_prog _   [] = []
@@ -161,7 +168,7 @@ libCaseBind env (Rec pairs)
 
     rhs_small_enough id rhs	-- Note [Small enough]
 	=  idArity id > 0	-- Note [Only functions!]
-	&& maybe True (\size -> couldBeSmallEnoughToInline size rhs)
+	&& maybe True (\size -> couldBeSmallEnoughToInline (lc_dflags env) size rhs)
                       (bombOutSize env)
 \end{code}
 
@@ -199,8 +206,9 @@ libCase :: LibCaseEnv
 libCase env (Var v)             = libCaseId env v
 libCase _   (Lit lit)           = Lit lit
 libCase _   (Type ty)           = Type ty
+libCase _   (Coercion co)       = Coercion co
 libCase env (App fun arg)       = App (libCase env fun) (libCase env arg)
-libCase env (Note note body)    = Note note (libCase env body)
+libCase env (Tick tickish body) = Tick tickish (libCase env body)
 libCase env (Cast e co)         = Cast (libCase env e) co
 
 libCase env (Lam binder body)
@@ -269,7 +277,7 @@ We get the following levels
 Then 'x' is being scrutinised at a deeper level than its binding, so
 it's added to lc_sruts:  [(x,1)]  
 
-We do *not* want to specialise the call to 'f', becuase 'x' is not free 
+We do *not* want to specialise the call to 'f', because 'x' is not free 
 in 'f'.  So here the bind-level of 'x' (=1) is not <= the bind-level of 'f' (=0).
 
 We *do* want to specialise the call to 'g', because 'x' is free in g.
@@ -358,9 +366,7 @@ topLevel = 0
 \begin{code}
 data LibCaseEnv
   = LibCaseEnv {
-	lc_size :: Maybe Int,	-- Bomb-out size for deciding if
-				-- potential liberatees are too big.
-				-- (passed in from cmd-line args)
+        lc_dflags :: DynFlags,
 
 	lc_lvl :: LibCaseLevel,	-- Current level
 		-- The level is incremented when (and only when) going
@@ -397,13 +403,16 @@ data LibCaseEnv
 
 initEnv :: DynFlags -> LibCaseEnv
 initEnv dflags 
-  = LibCaseEnv { lc_size = liberateCaseThreshold dflags,
+  = LibCaseEnv { lc_dflags = dflags,
 		 lc_lvl = 0,
 		 lc_lvl_env = emptyVarEnv, 
 		 lc_rec_env = emptyVarEnv,
 		 lc_scruts = [] }
 
+-- Bomb-out size for deciding if
+-- potential liberatees are too big.
+-- (passed in from cmd-line args)
 bombOutSize :: LibCaseEnv -> Maybe Int
-bombOutSize = lc_size
+bombOutSize = liberateCaseThreshold . lc_dflags
 \end{code}
 

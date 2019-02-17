@@ -6,13 +6,13 @@
 --
 -----------------------------------------------------------------------------
 
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 module X86.Ppr (
-        pprNatCmmTop,
+        pprNatCmmDecl,
         pprBasicBlock,
         pprSectionHeader,
         pprData,
         pprInstr,
-        pprUserReg,
         pprSize,
         pprImm,
         pprDataItem,
@@ -32,130 +32,133 @@ import Reg
 import PprBase
 
 
-import OldCmm
+import BlockId
+import BasicTypes       (Alignment)
+import DynFlags
+import Cmm              hiding (topInfoTable)
 import CLabel
-import Config
 import Unique           ( pprUnique, Uniquable(..) )
-import Pretty
+import Platform
 import FastString
-import qualified Outputable
-import Outputable       (panic, Outputable)
+import Outputable
 
 import Data.Word
-import Distribution.System
 
-#if i386_TARGET_ARCH && darwin_TARGET_OS
 import Data.Bits
-#endif
 
 -- -----------------------------------------------------------------------------
 -- Printing this stuff out
 
-pprNatCmmTop :: NatCmmTop Instr -> Doc
-pprNatCmmTop (CmmData section dats) =
-  pprSectionHeader section $$ vcat (map pprData dats)
+pprNatCmmDecl :: NatCmmDecl (Alignment, CmmStatics) Instr -> SDoc
+pprNatCmmDecl (CmmData section dats) =
+  pprSectionHeader section $$ pprDatas dats
 
- -- special case for split markers:
-pprNatCmmTop (CmmProc [] lbl (ListGraph [])) = pprLabel lbl
+pprNatCmmDecl proc@(CmmProc top_info lbl _ (ListGraph blocks)) =
+  case topInfoTable proc of
+    Nothing ->
+       case blocks of
+         []     -> -- special case for split markers:
+           pprLabel lbl
+         blocks -> -- special case for code without info table:
+           pprSectionHeader Text $$
+           pprLabel lbl $$ -- blocks guaranteed not null, so label needed
+           vcat (map (pprBasicBlock top_info) blocks) $$
+           pprSizeDecl lbl
 
-pprNatCmmTop (CmmProc info lbl (ListGraph blocks)) =
-  pprSectionHeader Text $$
-  (if null info then -- blocks guaranteed not null, so label needed
-       pprLabel lbl
-   else
-#if HAVE_SUBSECTIONS_VIA_SYMBOLS
-            pprCLabel_asm (mkDeadStripPreventer $ entryLblToInfoLbl lbl)
-                <> char ':' $$
-#endif
-       vcat (map pprData info) $$
-       pprLabel (entryLblToInfoLbl lbl)
-  ) $$
-  vcat (map pprBasicBlock blocks)
-     -- above: Even the first block gets a label, because with branch-chain
-     -- elimination, it might be the target of a goto.
-#if HAVE_SUBSECTIONS_VIA_SYMBOLS
-        -- If we are using the .subsections_via_symbols directive
-        -- (available on recent versions of Darwin),
-        -- we have to make sure that there is some kind of reference
-        -- from the entry code to a label on the _top_ of of the info table,
-        -- so that the linker will not think it is unreferenced and dead-strip
-        -- it. That's why the label is called a DeadStripPreventer (_dsp).
-  $$ if not (null info)
-                    then text "\t.long "
-                      <+> pprCLabel_asm (entryLblToInfoLbl lbl)
-                      <+> char '-'
-                      <+> pprCLabel_asm (mkDeadStripPreventer $ entryLblToInfoLbl lbl)
-                    else empty
-#endif
-   $$ pprSizeDecl (if null info then lbl else entryLblToInfoLbl lbl)
+    Just (Statics info_lbl _) ->
+      sdocWithPlatform $ \platform ->
+      (if platformHasSubsectionsViaSymbols platform
+          then pprSectionHeader Text $$
+               ppr (mkDeadStripPreventer info_lbl) <> char ':'
+          else empty) $$
+      vcat (map (pprBasicBlock top_info) blocks) $$
+         -- above: Even the first block gets a label, because with branch-chain
+         -- elimination, it might be the target of a goto.
+            (if platformHasSubsectionsViaSymbols platform
+             then
+             -- If we are using the .subsections_via_symbols directive
+             -- (available on recent versions of Darwin),
+             -- we have to make sure that there is some kind of reference
+             -- from the entry code to a label on the _top_ of of the info table,
+             -- so that the linker will not think it is unreferenced and dead-strip
+             -- it. That's why the label is called a DeadStripPreventer (_dsp).
+                      text "\t.long "
+                  <+> ppr info_lbl
+                  <+> char '-'
+                  <+> ppr (mkDeadStripPreventer info_lbl)
+             else empty) $$
+      pprSizeDecl info_lbl
 
 -- | Output the ELF .size directive.
-pprSizeDecl :: CLabel -> Doc
-#if elf_OBJ_FORMAT
-pprSizeDecl lbl =
-    ptext (sLit "\t.size") <+> pprCLabel_asm lbl
-    <> ptext (sLit ", .-") <> pprCLabel_asm lbl
-#else
-pprSizeDecl _ = empty
-#endif
+pprSizeDecl :: CLabel -> SDoc
+pprSizeDecl lbl
+ = sdocWithPlatform $ \platform ->
+   if osElfTarget (platformOS platform)
+   then ptext (sLit "\t.size") <+> ppr lbl
+     <> ptext (sLit ", .-") <> ppr lbl
+   else empty
 
-pprBasicBlock :: NatBasicBlock Instr -> Doc
-pprBasicBlock (BasicBlock blockid instrs) =
-  pprLabel (mkAsmTempLabel (getUnique blockid)) $$
-  vcat (map pprInstr instrs)
+pprBasicBlock :: BlockEnv CmmStatics -> NatBasicBlock Instr -> SDoc
+pprBasicBlock info_env (BasicBlock blockid instrs)
+  = maybe_infotable $$
+    pprLabel (mkAsmTempLabel (getUnique blockid)) $$
+    vcat (map pprInstr instrs)
+  where
+    maybe_infotable = case mapLookup blockid info_env of
+       Nothing   -> empty
+       Just (Statics info_lbl info) ->
+           pprSectionHeader Text $$
+           vcat (map pprData info) $$
+           pprLabel info_lbl
 
+pprDatas :: (Alignment, CmmStatics) -> SDoc
+pprDatas (align, (Statics lbl dats))
+ = vcat (pprAlign align : pprLabel lbl : map pprData dats)
+ -- TODO: could remove if align == 1
 
-pprData :: CmmStatic -> Doc
-pprData (CmmAlign bytes)         = pprAlign bytes
-pprData (CmmDataLabel lbl)       = pprLabel lbl
-pprData (CmmString str)          = pprASCII str
+pprData :: CmmStatic -> SDoc
+pprData (CmmString str) = pprASCII str
 
-#if  darwin_TARGET_OS
-pprData (CmmUninitialised bytes) = ptext (sLit ".space ") <> int bytes
-#else
-pprData (CmmUninitialised bytes) = ptext (sLit ".skip ") <> int bytes
-#endif
+pprData (CmmUninitialised bytes)
+ = sdocWithPlatform $ \platform ->
+   if platformOS platform == OSDarwin then ptext (sLit ".space ") <> int bytes
+                                      else ptext (sLit ".skip ")  <> int bytes
 
-pprData (CmmStaticLit lit)       = pprDataItem lit
+pprData (CmmStaticLit lit) = pprDataItem lit
 
-pprGloblDecl :: CLabel -> Doc
+pprGloblDecl :: CLabel -> SDoc
 pprGloblDecl lbl
   | not (externallyVisibleCLabel lbl) = empty
-  | otherwise = ptext IF_ARCH_sparc((sLit ".global "),
-                                    (sLit ".globl ")) <>
-                pprCLabel_asm lbl
+  | otherwise = ptext (sLit ".globl ") <> ppr lbl
 
-pprTypeAndSizeDecl :: CLabel -> Doc
-#if elf_OBJ_FORMAT
+pprTypeAndSizeDecl :: CLabel -> SDoc
 pprTypeAndSizeDecl lbl
-  | not (externallyVisibleCLabel lbl) = empty
-  | otherwise = ptext (sLit ".type ") <>
-                pprCLabel_asm lbl <> ptext (sLit ", @object")
-#else
-pprTypeAndSizeDecl _
-  = empty
-#endif
+    = sdocWithPlatform $ \platform ->
+      if osElfTarget (platformOS platform) && externallyVisibleCLabel lbl
+      then ptext (sLit ".type ") <> ppr lbl <> ptext (sLit ", @object")
+      else empty
 
-pprLabel :: CLabel -> Doc
-pprLabel lbl = pprGloblDecl lbl $$ pprTypeAndSizeDecl lbl $$ (pprCLabel_asm lbl <> char ':')
+pprLabel :: CLabel -> SDoc
+pprLabel lbl = pprGloblDecl lbl
+            $$ pprTypeAndSizeDecl lbl
+            $$ (ppr lbl <> char ':')
 
 
-pprASCII :: [Word8] -> Doc
+pprASCII :: [Word8] -> SDoc
 pprASCII str
   = vcat (map do1 str) $$ do1 0
     where
-       do1 :: Word8 -> Doc
+       do1 :: Word8 -> SDoc
        do1 w = ptext (sLit "\t.byte\t") <> int (fromIntegral w)
 
-pprAlign :: Int -> Doc
-
-
+pprAlign :: Int -> SDoc
 pprAlign bytes
-        = ptext (sLit ".align ") <> int IF_OS_darwin(pow2, bytes)
+        = sdocWithPlatform $ \platform ->
+          ptext (sLit ".align ") <> int (alignment platform)
   where
-
-#if darwin_TARGET_OS
-        pow2 = log2 bytes
+        alignment platform = if platformOS platform == OSDarwin
+                             then log2 bytes
+                             else      bytes
 
         log2 :: Int -> Int  -- cache the common ones
         log2 1 = 0
@@ -163,47 +166,41 @@ pprAlign bytes
         log2 4 = 2
         log2 8 = 3
         log2 n = 1 + log2 (n `quot` 2)
-#endif
 
 -- -----------------------------------------------------------------------------
 -- pprInstr: print an 'Instr'
 
 instance Outputable Instr where
-    ppr instr = Outputable.docToSDoc $ pprInstr instr
+    ppr instr = pprInstr instr
 
 
-pprUserReg :: Reg -> Doc
-pprUserReg
- | cTargetArch == I386   = pprReg II32
- | cTargetArch == X86_64 = pprReg II64
- | otherwise             = panic "X86.Ppr.pprUserReg: not defined"
-
-pprReg :: Size -> Reg -> Doc
-
+pprReg :: Size -> Reg -> SDoc
 pprReg s r
   = case r of
-      RegReal    (RealRegSingle i) -> ppr_reg_no s i
+      RegReal    (RealRegSingle i) ->
+          sdocWithPlatform $ \platform ->
+          if target32Bit platform then ppr32_reg_no s i
+                                  else ppr64_reg_no s i
       RegReal    (RealRegPair _ _) -> panic "X86.Ppr: no reg pairs on this arch"
-      RegVirtual (VirtualRegI  u)  -> text "%vI_" <> asmSDoc (pprUnique u)
-      RegVirtual (VirtualRegHi u)  -> text "%vHi_" <> asmSDoc (pprUnique u)
-      RegVirtual (VirtualRegF  u)  -> text "%vF_" <> asmSDoc (pprUnique u)
-      RegVirtual (VirtualRegD  u)  -> text "%vD_" <> asmSDoc (pprUnique u)
-      RegVirtual (VirtualRegSSE  u) -> text "%vSSE_" <> asmSDoc (pprUnique u)
+      RegVirtual (VirtualRegI  u)  -> text "%vI_" <> pprUnique u
+      RegVirtual (VirtualRegHi u)  -> text "%vHi_" <> pprUnique u
+      RegVirtual (VirtualRegF  u)  -> text "%vF_" <> pprUnique u
+      RegVirtual (VirtualRegD  u)  -> text "%vD_" <> pprUnique u
+      RegVirtual (VirtualRegSSE  u) -> text "%vSSE_" <> pprUnique u
   where
-#if i386_TARGET_ARCH
-    ppr_reg_no :: Size -> Int -> Doc
-    ppr_reg_no II8   = ppr_reg_byte
-    ppr_reg_no II16  = ppr_reg_word
-    ppr_reg_no _    = ppr_reg_long
+    ppr32_reg_no :: Size -> Int -> SDoc
+    ppr32_reg_no II8   = ppr32_reg_byte
+    ppr32_reg_no II16  = ppr32_reg_word
+    ppr32_reg_no _     = ppr32_reg_long
 
-    ppr_reg_byte i = ptext
+    ppr32_reg_byte i = ptext
       (case i of {
          0 -> sLit "%al";     1 -> sLit "%bl";
          2 -> sLit "%cl";     3 -> sLit "%dl";
         _  -> sLit "very naughty I386 byte register"
       })
 
-    ppr_reg_word i = ptext
+    ppr32_reg_word i = ptext
       (case i of {
          0 -> sLit "%ax";     1 -> sLit "%bx";
          2 -> sLit "%cx";     3 -> sLit "%dx";
@@ -212,7 +209,7 @@ pprReg s r
         _  -> sLit "very naughty I386 word register"
       })
 
-    ppr_reg_long i = ptext
+    ppr32_reg_long i = ptext
       (case i of {
          0 -> sLit "%eax";    1 -> sLit "%ebx";
          2 -> sLit "%ecx";    3 -> sLit "%edx";
@@ -220,14 +217,14 @@ pprReg s r
          6 -> sLit "%ebp";    7 -> sLit "%esp";
          _  -> ppr_reg_float i
       })
-#elif x86_64_TARGET_ARCH
-    ppr_reg_no :: Size -> Int -> Doc
-    ppr_reg_no II8   = ppr_reg_byte
-    ppr_reg_no II16  = ppr_reg_word
-    ppr_reg_no II32  = ppr_reg_long
-    ppr_reg_no _    = ppr_reg_quad
 
-    ppr_reg_byte i = ptext
+    ppr64_reg_no :: Size -> Int -> SDoc
+    ppr64_reg_no II8   = ppr64_reg_byte
+    ppr64_reg_no II16  = ppr64_reg_word
+    ppr64_reg_no II32  = ppr64_reg_long
+    ppr64_reg_no _     = ppr64_reg_quad
+
+    ppr64_reg_byte i = ptext
       (case i of {
          0 -> sLit "%al";     1 -> sLit "%bl";
          2 -> sLit "%cl";     3 -> sLit "%dl";
@@ -240,7 +237,7 @@ pprReg s r
         _  -> sLit "very naughty x86_64 byte register"
       })
 
-    ppr_reg_word i = ptext
+    ppr64_reg_word i = ptext
       (case i of {
          0 -> sLit "%ax";     1 -> sLit "%bx";
          2 -> sLit "%cx";     3 -> sLit "%dx";
@@ -253,7 +250,7 @@ pprReg s r
         _  -> sLit "very naughty x86_64 word register"
       })
 
-    ppr_reg_long i = ptext
+    ppr64_reg_long i = ptext
       (case i of {
          0 -> sLit "%eax";    1  -> sLit "%ebx";
          2 -> sLit "%ecx";    3  -> sLit "%edx";
@@ -266,7 +263,7 @@ pprReg s r
         _  -> sLit "very naughty x86_64 register"
       })
 
-    ppr_reg_quad i = ptext
+    ppr64_reg_quad i = ptext
       (case i of {
          0 -> sLit "%rax";      1 -> sLit "%rbx";
          2 -> sLit "%rcx";      3 -> sLit "%rdx";
@@ -278,11 +275,7 @@ pprReg s r
         14 -> sLit "%r14";    15 -> sLit "%r15";
         _  -> ppr_reg_float i
       })
-#else
-     ppr_reg_no _ = panic "X86.Ppr.ppr_reg_no: no match"
-#endif
 
-#if defined(i386_TARGET_ARCH) || defined(x86_64_TARGET_ARCH)
 ppr_reg_float :: Int -> LitString
 ppr_reg_float i = case i of
         16 -> sLit "%fake0";  17 -> sLit "%fake1"
@@ -297,9 +290,8 @@ ppr_reg_float i = case i of
         36 -> sLit "%xmm12";  37 -> sLit "%xmm13"
         38 -> sLit "%xmm14";  39 -> sLit "%xmm15"
         _  -> sLit "very naughty x86 register"
-#endif
 
-pprSize :: Size -> Doc
+pprSize :: Size -> SDoc
 pprSize x
  = ptext (case x of
                 II8   -> sLit "b"
@@ -311,7 +303,7 @@ pprSize x
                 FF80  -> sLit "t"
                 )
 
-pprSize_x87 :: Size -> Doc
+pprSize_x87 :: Size -> SDoc
 pprSize_x87 x
   = ptext $ case x of
                 FF32  -> sLit "s"
@@ -319,7 +311,7 @@ pprSize_x87 x
                 FF80  -> sLit "t"
                 _     -> panic "X86.Ppr.pprSize_x87"
 
-pprCond :: Cond -> Doc
+pprCond :: Cond -> SDoc
 pprCond c
  = ptext (case c of {
                 GEU     -> sLit "ae";   LU    -> sLit "b";
@@ -333,11 +325,11 @@ pprCond c
                 ALWAYS  -> sLit "mp"})
 
 
-pprImm :: Imm -> Doc
+pprImm :: Imm -> SDoc
 pprImm (ImmInt i)     = int i
 pprImm (ImmInteger i) = integer i
-pprImm (ImmCLbl l)    = pprCLabel_asm l
-pprImm (ImmIndex l i) = pprCLabel_asm l <> char '+' <> int i
+pprImm (ImmCLbl l)    = ppr l
+pprImm (ImmIndex l i) = ppr l <> char '+' <> int i
 pprImm (ImmLit s)     = s
 
 pprImm (ImmFloat _)  = ptext (sLit "naughty float immediate")
@@ -349,7 +341,7 @@ pprImm (ImmConstantDiff a b) = pprImm a <> char '-'
 
 
 
-pprAddr :: AddrMode -> Doc
+pprAddr :: AddrMode -> SDoc
 pprAddr (ImmAddr imm off)
   = let pp_imm = pprImm imm
     in
@@ -361,10 +353,11 @@ pprAddr (ImmAddr imm off)
         pp_imm <> char '+' <> int off
 
 pprAddr (AddrBaseIndex base index displacement)
-  = let
+  = sdocWithPlatform $ \platform ->
+    let
         pp_disp  = ppr_disp displacement
         pp_off p = pp_disp <> char '(' <> p <> char ')'
-        pp_reg r = pprReg archWordSize r
+        pp_reg r = pprReg (archWordSize (target32Bit platform)) r
     in
     case (base, index) of
       (EABaseNone,  EAIndexNone) -> pp_disp
@@ -380,74 +373,65 @@ pprAddr (AddrBaseIndex base index displacement)
     ppr_disp imm        = pprImm imm
 
 
-pprSectionHeader :: Section -> Doc
-#if  i386_TARGET_ARCH
-
-#    if darwin_TARGET_OS
+pprSectionHeader :: Section -> SDoc
 pprSectionHeader seg
- = case seg of
-        Text                    -> ptext (sLit ".text\n\t.align 2")
-        Data                    -> ptext (sLit ".data\n\t.align 2")
-        ReadOnlyData            -> ptext (sLit ".const\n.align 2")
-        RelocatableReadOnlyData -> ptext (sLit ".const_data\n.align 2")
-        UninitialisedData       -> ptext (sLit ".data\n\t.align 2")
-        ReadOnlyData16          -> ptext (sLit ".const\n.align 4")
-        OtherSection _          -> panic "X86.Ppr.pprSectionHeader: unknown section"
-
-#    else
-pprSectionHeader seg
- = case seg of
-        Text                    -> ptext (sLit ".text\n\t.align 4,0x90")
-        Data                    -> ptext (sLit ".data\n\t.align 4")
-        ReadOnlyData            -> ptext (sLit ".section .rodata\n\t.align 4")
-        RelocatableReadOnlyData -> ptext (sLit ".section .data\n\t.align 4")
-        UninitialisedData       -> ptext (sLit ".section .bss\n\t.align 4")
-        ReadOnlyData16          -> ptext (sLit ".section .rodata\n\t.align 16")
-        OtherSection _          -> panic "X86.Ppr.pprSectionHeader: unknown section"
-
-#    endif
-
-#elif x86_64_TARGET_ARCH
-#    if  darwin_TARGET_OS
-pprSectionHeader seg
- = case seg of
-        Text                    -> ptext (sLit ".text\n.align 3")
-        Data                    -> ptext (sLit ".data\n.align 3")
-        ReadOnlyData            -> ptext (sLit ".const\n.align 3")
-        RelocatableReadOnlyData -> ptext (sLit ".const_data\n.align 3")
-        UninitialisedData       -> ptext (sLit ".data\n\t.align 3")
-        ReadOnlyData16          -> ptext (sLit ".const\n.align 4")
-        OtherSection _          -> panic "PprMach.pprSectionHeader: unknown section"
-
-#    else
-pprSectionHeader seg
- = case seg of
-        Text                    -> ptext (sLit ".text\n\t.align 8")
-        Data                    -> ptext (sLit ".data\n\t.align 8")
-        ReadOnlyData            -> ptext (sLit ".section .rodata\n\t.align 8")
-        RelocatableReadOnlyData -> ptext (sLit ".section .data\n\t.align 8")
-        UninitialisedData       -> ptext (sLit ".section .bss\n\t.align 8")
-        ReadOnlyData16          -> ptext (sLit ".section .rodata.cst16\n\t.align 16")
-        OtherSection _          -> panic "PprMach.pprSectionHeader: unknown section"
-
-#    endif
-
-#else
-pprSectionHeader _              = panic "X86.Ppr.pprSectionHeader: not defined for this architecture"
-
-#endif
+ = sdocWithPlatform $ \platform ->
+   case platformOS platform of
+   OSDarwin
+    | target32Bit platform ->
+       case seg of
+           Text                    -> ptext (sLit ".text\n\t.align 2")
+           Data                    -> ptext (sLit ".data\n\t.align 2")
+           ReadOnlyData            -> ptext (sLit ".const\n.align 2")
+           RelocatableReadOnlyData -> ptext (sLit ".const_data\n.align 2")
+           UninitialisedData       -> ptext (sLit ".data\n\t.align 2")
+           ReadOnlyData16          -> ptext (sLit ".const\n.align 4")
+           OtherSection _          -> panic "X86.Ppr.pprSectionHeader: unknown section"
+    | otherwise ->
+       case seg of
+           Text                    -> ptext (sLit ".text\n.align 3")
+           Data                    -> ptext (sLit ".data\n.align 3")
+           ReadOnlyData            -> ptext (sLit ".const\n.align 3")
+           RelocatableReadOnlyData -> ptext (sLit ".const_data\n.align 3")
+           UninitialisedData       -> ptext (sLit ".data\n\t.align 3")
+           ReadOnlyData16          -> ptext (sLit ".const\n.align 4")
+           OtherSection _          -> panic "PprMach.pprSectionHeader: unknown section"
+   _
+    | target32Bit platform ->
+       case seg of
+           Text                    -> ptext (sLit ".text\n\t.align 4,0x90")
+           Data                    -> ptext (sLit ".data\n\t.align 4")
+           ReadOnlyData            -> ptext (sLit ".section .rodata\n\t.align 4")
+           RelocatableReadOnlyData -> ptext (sLit ".section .data\n\t.align 4")
+           UninitialisedData       -> ptext (sLit ".section .bss\n\t.align 4")
+           ReadOnlyData16          -> ptext (sLit ".section .rodata\n\t.align 16")
+           OtherSection _          -> panic "X86.Ppr.pprSectionHeader: unknown section"
+    | otherwise ->
+       case seg of
+           Text                    -> ptext (sLit ".text\n\t.align 8")
+           Data                    -> ptext (sLit ".data\n\t.align 8")
+           ReadOnlyData            -> ptext (sLit ".section .rodata\n\t.align 8")
+           RelocatableReadOnlyData -> ptext (sLit ".section .data\n\t.align 8")
+           UninitialisedData       -> ptext (sLit ".section .bss\n\t.align 8")
+           ReadOnlyData16          -> ptext (sLit ".section .rodata.cst16\n\t.align 16")
+           OtherSection _          -> panic "PprMach.pprSectionHeader: unknown section"
 
 
 
 
-pprDataItem :: CmmLit -> Doc
-pprDataItem lit
-  = vcat (ppr_item (cmmTypeSize $ cmmLitType lit) lit)
+pprDataItem :: CmmLit -> SDoc
+pprDataItem lit = sdocWithDynFlags $ \dflags -> pprDataItem' dflags lit
+
+pprDataItem' :: DynFlags -> CmmLit -> SDoc
+pprDataItem' dflags lit
+  = vcat (ppr_item (cmmTypeSize $ cmmLitType dflags lit) lit)
     where
+        platform = targetPlatform dflags
         imm = litToImm lit
 
         -- These seem to be common:
         ppr_item II8   _ = [ptext (sLit "\t.byte\t") <> pprImm imm]
+        ppr_item II16  _ = [ptext (sLit "\t.word\t") <> pprImm imm]
         ppr_item II32  _ = [ptext (sLit "\t.long\t") <> pprImm imm]
 
         ppr_item FF32  (CmmFloat r _)
@@ -458,58 +442,52 @@ pprDataItem lit
            = let bs = doubleToBytes (fromRational r)
              in  map (\b -> ptext (sLit "\t.byte\t") <> pprImm (ImmInt b)) bs
 
-#if i386_TARGET_ARCH || x86_64_TARGET_ARCH
-        ppr_item II16  _ = [ptext (sLit "\t.word\t") <> pprImm imm]
-#endif
-#if i386_TARGET_ARCH && darwin_TARGET_OS
-        ppr_item II64 (CmmInt x _)  =
-                [ptext (sLit "\t.long\t")
-                    <> int (fromIntegral (fromIntegral x :: Word32)),
-                 ptext (sLit "\t.long\t")
-                    <> int (fromIntegral
-                        (fromIntegral (x `shiftR` 32) :: Word32))]
-#endif
-#if i386_TARGET_ARCH || (darwin_TARGET_OS && x86_64_TARGET_ARCH)
-        ppr_item II64  _ = [ptext (sLit "\t.quad\t") <> pprImm imm]
-#endif
-#if x86_64_TARGET_ARCH && !darwin_TARGET_OS
-        -- x86_64: binutils can't handle the R_X86_64_PC64 relocation
-        -- type, which means we can't do pc-relative 64-bit addresses.
-        -- Fortunately we're assuming the small memory model, in which
-        -- all such offsets will fit into 32 bits, so we have to stick
-        -- to 32-bit offset fields and modify the RTS appropriately
-        --
-        -- See Note [x86-64-relative] in includes/rts/storage/InfoTables.h
-        --
-        ppr_item II64  x
-           | isRelativeReloc x =
-                [ptext (sLit "\t.long\t") <> pprImm imm,
-                 ptext (sLit "\t.long\t0")]
-           | otherwise =
-                [ptext (sLit "\t.quad\t") <> pprImm imm]
-           where
-                isRelativeReloc (CmmLabelDiffOff _ _ _) = True
-                isRelativeReloc _ = False
-#endif
+        ppr_item II64 _
+            = case platformOS platform of
+              OSDarwin
+               | target32Bit platform ->
+                  case lit of
+                  CmmInt x _ ->
+                      [ptext (sLit "\t.long\t")
+                          <> int (fromIntegral (fromIntegral x :: Word32)),
+                       ptext (sLit "\t.long\t")
+                          <> int (fromIntegral
+                              (fromIntegral (x `shiftR` 32) :: Word32))]
+                  _ -> panic "X86.Ppr.ppr_item: no match for II64"
+               | otherwise ->
+                  [ptext (sLit "\t.quad\t") <> pprImm imm]
+              _
+               | target32Bit platform ->
+                  [ptext (sLit "\t.quad\t") <> pprImm imm]
+               | otherwise ->
+                  -- x86_64: binutils can't handle the R_X86_64_PC64
+                  -- relocation type, which means we can't do
+                  -- pc-relative 64-bit addresses. Fortunately we're
+                  -- assuming the small memory model, in which all such
+                  -- offsets will fit into 32 bits, so we have to stick
+                  -- to 32-bit offset fields and modify the RTS
+                  -- appropriately
+                  --
+                  -- See Note [x86-64-relative] in includes/rts/storage/InfoTables.h
+                  --
+                  case lit of
+                  -- A relative relocation:
+                  CmmLabelDiffOff _ _ _ ->
+                      [ptext (sLit "\t.long\t") <> pprImm imm,
+                       ptext (sLit "\t.long\t0")]
+                  _ ->
+                      [ptext (sLit "\t.quad\t") <> pprImm imm]
 
         ppr_item _ _
                 = panic "X86.Ppr.ppr_item: no match"
 
 
 
-pprInstr :: Instr -> Doc
+pprInstr :: Instr -> SDoc
 
 pprInstr (COMMENT _) = empty -- nuke 'em
 {-
-pprInstr (COMMENT s)
-   =  IF_ARCH_alpha( ((<>) (ptext (sLit "\t# ")) (ftext s))
-     ,IF_ARCH_sparc( ((<>) (ptext (sLit "# "))   (ftext s))
-     ,IF_ARCH_i386( ((<>) (ptext (sLit "# "))   (ftext s))
-     ,IF_ARCH_x86_64( ((<>) (ptext (sLit "# "))   (ftext s))
-     ,IF_ARCH_powerpc( IF_OS_linux(
-        ((<>) (ptext (sLit "# ")) (ftext s)),
-        ((<>) (ptext (sLit "; ")) (ftext s)))
-     ,)))))
+pprInstr (COMMENT s) = ptext (sLit "# ") <> ftext s
 -}
 pprInstr (DELTA d)
    = pprInstr (COMMENT (mkFastString ("\tdelta = " ++ show d)))
@@ -552,7 +530,9 @@ pprInstr (MOVZxL sizes src dst) = pprSizeOpOpCoerce (sLit "movz") sizes II32 src
         -- the remaining zero-extension to 64 bits is automatic, and the 32-bit
         -- instruction is shorter.
 
-pprInstr (MOVSxL sizes src dst) = pprSizeOpOpCoerce (sLit "movs") sizes archWordSize src dst
+pprInstr (MOVSxL sizes src dst)
+  = sdocWithPlatform $ \platform ->
+    pprSizeOpOpCoerce (sLit "movs") sizes (archWordSize (target32Bit platform)) src dst
 
 -- here we do some patching, since the physical registers are only set late
 -- in the code generation.
@@ -595,7 +575,15 @@ pprInstr (XOR FF32 src dst) = pprOpOp (sLit "xorps") FF32 src dst
 pprInstr (XOR FF64 src dst) = pprOpOp (sLit "xorpd") FF64 src dst
 pprInstr (XOR size src dst) = pprSizeOpOp (sLit "xor")  size src dst
 
+pprInstr (POPCNT size src dst) = pprOpOp (sLit "popcnt") size src (OpReg dst)
+
+pprInstr (PREFETCH NTA size src ) =  pprSizeOp_ (sLit "prefetchnta") size src
+pprInstr (PREFETCH Lvl0 size src) = pprSizeOp_ (sLit "prefetcht0") size src
+pprInstr (PREFETCH Lvl1 size src) = pprSizeOp_ (sLit "prefetcht1") size src
+pprInstr (PREFETCH Lvl2 size src) = pprSizeOp_ (sLit "prefetcht2") size src
+
 pprInstr (NOT size op) = pprSizeOp (sLit "not") size op
+pprInstr (BSWAP size op) = pprSizeOp (sLit "bswap") size (OpReg op)
 pprInstr (NEGI size op) = pprSizeOp (sLit "neg") size op
 
 pprInstr (SHL size src dst) = pprShift (sLit "shl") size src dst
@@ -629,16 +617,18 @@ pprInstr (CLTD II64) = ptext (sLit "\tcqto")
 pprInstr (SETCC cond op) = pprCondInstr (sLit "set") cond (pprOperand II8 op)
 
 pprInstr (JXX cond blockid)
-  = pprCondInstr (sLit "j") cond (pprCLabel_asm lab)
+  = pprCondInstr (sLit "j") cond (ppr lab)
   where lab = mkAsmTempLabel (getUnique blockid)
 
-pprInstr (JXX_GBL cond imm) = pprCondInstr (sLit "j") cond (pprImm imm)
+pprInstr        (JXX_GBL cond imm) = pprCondInstr (sLit "j") cond (pprImm imm)
 
-pprInstr (JMP (OpImm imm)) = (<>) (ptext (sLit "\tjmp ")) (pprImm imm)
-pprInstr (JMP op)          = (<>) (ptext (sLit "\tjmp *")) (pprOperand archWordSize op)
-pprInstr (JMP_TBL op _ _ _)  = pprInstr (JMP op)
-pprInstr (CALL (Left imm) _)    = (<>) (ptext (sLit "\tcall ")) (pprImm imm)
-pprInstr (CALL (Right reg) _)   = (<>) (ptext (sLit "\tcall *")) (pprReg archWordSize reg)
+pprInstr        (JMP (OpImm imm) _) = ptext (sLit "\tjmp ") <> pprImm imm
+pprInstr (JMP op _)          = sdocWithPlatform $ \platform ->
+                               ptext (sLit "\tjmp *") <> pprOperand (archWordSize (target32Bit platform)) op
+pprInstr (JMP_TBL op _ _ _)  = pprInstr (JMP op [])
+pprInstr        (CALL (Left imm) _)    = ptext (sLit "\tcall ") <> pprImm imm
+pprInstr (CALL (Right reg) _)   = sdocWithPlatform $ \platform ->
+                                  ptext (sLit "\tcall *") <> pprReg (archWordSize (target32Bit platform)) reg
 
 pprInstr (IDIV sz op)   = pprSizeOp (sLit "idiv") sz op
 pprInstr (DIV sz op)    = pprSizeOp (sLit "div")  sz op
@@ -646,13 +636,14 @@ pprInstr (IMUL2 sz op)  = pprSizeOp (sLit "imul") sz op
 
 -- x86_64 only
 pprInstr (MUL size op1 op2) = pprSizeOpOp (sLit "mul") size op1 op2
+pprInstr (MUL2 size op) = pprSizeOp (sLit "mul") size op
 
 pprInstr (FDIV size op1 op2) = pprSizeOpOp (sLit "div") size op1 op2
 
 pprInstr (CVTSS2SD from to)      = pprRegReg (sLit "cvtss2sd") from to
 pprInstr (CVTSD2SS from to)      = pprRegReg (sLit "cvtsd2ss") from to
-pprInstr (CVTTSS2SIQ sz from to) = pprSizeOpReg (sLit "cvttss2si") sz from to
-pprInstr (CVTTSD2SIQ sz from to) = pprSizeOpReg (sLit "cvttsd2si") sz from to
+pprInstr (CVTTSS2SIQ sz from to) = pprSizeSizeOpReg (sLit "cvttss2si") FF32 sz from to
+pprInstr (CVTTSD2SIQ sz from to) = pprSizeSizeOpReg (sLit "cvttsd2si") FF64 sz from to
 pprInstr (CVTSI2SS sz from to)   = pprSizeOpReg (sLit "cvtsi2ss") sz from to
 pprInstr (CVTSI2SD sz from to)   = pprSizeOpReg (sLit "cvtsi2sd") sz from to
 
@@ -854,8 +845,8 @@ pprInstr g@(GMUL _ src1 src2 dst)
                    text " ; fmulp %st(0),", greg src2 1])
    | otherwise
    = pprG g (hcat [gtab, gpush src1 0,
-                   text " ; fmul ", greg src2 1, text ",%st(0)",
-                   gsemi, gpop dst 1])
+             text " ; fmul ", greg src2 1, text ",%st(0)",
+             gsemi, gpop dst 1])
 
 
 pprInstr g@(GSUB _ src1 src2 dst)
@@ -897,7 +888,8 @@ pprInstr _
         = panic "X86.Ppr.pprInstr: no match"
 
 
-pprTrigOp :: String -> Bool -> CLabel -> CLabel -> Reg -> Reg -> Size -> Doc
+pprTrigOp :: String -> Bool -> CLabel -> CLabel
+          -> Reg -> Reg -> Size -> SDoc
 pprTrigOp op -- fsin, fcos or fptan
           isTan -- we need a couple of extra steps if we're doing tan
           l1 l2 -- internal labels for us to use
@@ -912,7 +904,7 @@ pprTrigOp op -- fsin, fcos or fptan
       hcat [gtab, text "fnstsw %ax"] $$
       hcat [gtab, text "test   $0x400,%eax"] $$
       -- If we were in bounds then jump to the end
-      hcat [gtab, text "je     " <> pprCLabel_asm l1] $$
+      hcat [gtab, text "je     " <> ppr l1] $$
       -- Otherwise we need to shrink the value. Start by
       -- loading pi, doubleing it (by adding it to itself),
       -- and then swapping pi with the value, so the value we
@@ -922,16 +914,16 @@ pprTrigOp op -- fsin, fcos or fptan
       hcat [gtab, text "fxch   %st(1)"] $$
       -- Now we have a loop in which we make the value smaller,
       -- see if it's small enough, and loop if not
-      (pprCLabel_asm l2 <> char ':') $$
+      (ppr l2 <> char ':') $$
       hcat [gtab, text "fprem1"] $$
       -- My Debian libc uses fstsw here for the tan code, but I can't
       -- see any reason why it should need to be different for tan.
       hcat [gtab, text "fnstsw %ax"] $$
       hcat [gtab, text "test   $0x400,%eax"] $$
-      hcat [gtab, text "jne    " <> pprCLabel_asm l2] $$
+      hcat [gtab, text "jne    " <> ppr l2] $$
       hcat [gtab, text "fstp   %st(1)"] $$
       hcat [gtab, text op] $$
-      (pprCLabel_asm l1 <> char ':') $$
+      (ppr l1 <> char ':') $$
       -- Pop the 1.0 tan gave us
       (if isTan then hcat [gtab, text "fstp %st(0)"] else empty) $$
       -- Restore %eax
@@ -942,29 +934,29 @@ pprTrigOp op -- fsin, fcos or fptan
 --------------------------
 
 -- coerce %st(0) to the specified size
-gcoerceto :: Size -> Doc
+gcoerceto :: Size -> SDoc
 gcoerceto FF64 = empty
 gcoerceto FF32 = empty --text "subl $4,%esp ; fstps (%esp) ; flds (%esp) ; addl $4,%esp ; "
 gcoerceto _    = panic "X86.Ppr.gcoerceto: no match"
 
-gpush :: Reg -> RegNo -> Doc
+gpush :: Reg -> RegNo -> SDoc
 gpush reg offset
    = hcat [text "fld ", greg reg offset]
 
-gpop :: Reg -> RegNo -> Doc
+gpop :: Reg -> RegNo -> SDoc
 gpop reg offset
    = hcat [text "fstp ", greg reg offset]
 
-greg :: Reg -> RegNo -> Doc
+greg :: Reg -> RegNo -> SDoc
 greg reg offset = text "%st(" <> int (gregno reg - firstfake+offset) <> char ')'
 
-gsemi :: Doc
+gsemi :: SDoc
 gsemi = text " ; "
 
-gtab :: Doc
+gtab :: SDoc
 gtab  = char '\t'
 
-gsp :: Doc
+gsp :: SDoc
 gsp   = char ' '
 
 gregno :: Reg -> RegNo
@@ -972,12 +964,12 @@ gregno (RegReal (RealRegSingle i)) = i
 gregno _           = --pprPanic "gregno" (ppr other)
                      999   -- bogus; only needed for debug printing
 
-pprG :: Instr -> Doc -> Doc
+pprG :: Instr -> SDoc -> SDoc
 pprG fake actual
    = (char '#' <> pprGInstr fake) $$ actual
 
 
-pprGInstr :: Instr -> Doc
+pprGInstr :: Instr -> SDoc
 pprGInstr (GMOV src dst)   = pprSizeRegReg (sLit "gmov") FF64 src dst
 pprGInstr (GLD sz src dst) = pprSizeAddrReg (sLit "gld") sz src dst
 pprGInstr (GST sz src dst) = pprSizeRegAddr (sLit "gst") sz src dst
@@ -1007,27 +999,27 @@ pprGInstr (GDIV sz src1 src2 dst) = pprSizeRegRegReg (sLit "gdiv") sz src1 src2 
 
 pprGInstr _ = panic "X86.Ppr.pprGInstr: no match"
 
-pprDollImm :: Imm -> Doc
-pprDollImm i =  ptext (sLit "$") <> pprImm i
+pprDollImm :: Imm -> SDoc
+pprDollImm i = ptext (sLit "$") <> pprImm i
 
 
-pprOperand :: Size -> Operand -> Doc
+pprOperand :: Size -> Operand -> SDoc
 pprOperand s (OpReg r)   = pprReg s r
 pprOperand _ (OpImm i)   = pprDollImm i
 pprOperand _ (OpAddr ea) = pprAddr ea
 
 
-pprMnemonic_  :: LitString -> Doc
+pprMnemonic_  :: LitString -> SDoc
 pprMnemonic_ name =
    char '\t' <> ptext name <> space
 
 
-pprMnemonic  :: LitString -> Size -> Doc
+pprMnemonic  :: LitString -> Size -> SDoc
 pprMnemonic name size =
    char '\t' <> ptext name <> pprSize size <> space
 
 
-pprSizeImmOp :: LitString -> Size -> Imm -> Operand -> Doc
+pprSizeImmOp :: LitString -> Size -> Imm -> Operand -> SDoc
 pprSizeImmOp name size imm op1
   = hcat [
         pprMnemonic name size,
@@ -1038,7 +1030,14 @@ pprSizeImmOp name size imm op1
     ]
 
 
-pprSizeOp :: LitString -> Size -> Operand -> Doc
+pprSizeOp_ :: LitString -> Size -> Operand -> SDoc
+pprSizeOp_ name size op1
+  = hcat [
+        pprMnemonic_ name ,
+        pprOperand size op1
+    ]
+
+pprSizeOp :: LitString -> Size -> Operand -> SDoc
 pprSizeOp name size op1
   = hcat [
         pprMnemonic name size,
@@ -1046,7 +1045,7 @@ pprSizeOp name size op1
     ]
 
 
-pprSizeOpOp :: LitString -> Size -> Operand -> Operand -> Doc
+pprSizeOpOp :: LitString -> Size -> Operand -> Operand -> SDoc
 pprSizeOpOp name size op1 op2
   = hcat [
         pprMnemonic name size,
@@ -1056,7 +1055,7 @@ pprSizeOpOp name size op1 op2
     ]
 
 
-pprOpOp :: LitString -> Size -> Operand -> Operand -> Doc
+pprOpOp :: LitString -> Size -> Operand -> Operand -> SDoc
 pprOpOp name size op1 op2
   = hcat [
         pprMnemonic_ name,
@@ -1066,7 +1065,7 @@ pprOpOp name size op1 op2
     ]
 
 
-pprSizeReg :: LitString -> Size -> Reg -> Doc
+pprSizeReg :: LitString -> Size -> Reg -> SDoc
 pprSizeReg name size reg1
   = hcat [
         pprMnemonic name size,
@@ -1074,7 +1073,7 @@ pprSizeReg name size reg1
     ]
 
 
-pprSizeRegReg :: LitString -> Size -> Reg -> Reg -> Doc
+pprSizeRegReg :: LitString -> Size -> Reg -> Reg -> SDoc
 pprSizeRegReg name size reg1 reg2
   = hcat [
         pprMnemonic name size,
@@ -1084,27 +1083,28 @@ pprSizeRegReg name size reg1 reg2
     ]
 
 
-pprRegReg :: LitString -> Reg -> Reg -> Doc
+pprRegReg :: LitString -> Reg -> Reg -> SDoc
 pprRegReg name reg1 reg2
-  = hcat [
+  = sdocWithPlatform $ \platform ->
+    hcat [
         pprMnemonic_ name,
-        pprReg archWordSize reg1,
+        pprReg (archWordSize (target32Bit platform)) reg1,
         comma,
-        pprReg archWordSize reg2
+        pprReg (archWordSize (target32Bit platform)) reg2
     ]
 
 
-pprSizeOpReg :: LitString -> Size -> Operand -> Reg -> Doc
+pprSizeOpReg :: LitString -> Size -> Operand -> Reg -> SDoc
 pprSizeOpReg name size op1 reg2
-  = hcat [
+  = sdocWithPlatform $ \platform ->
+    hcat [
         pprMnemonic name size,
         pprOperand size op1,
         comma,
-        pprReg archWordSize reg2
+        pprReg (archWordSize (target32Bit platform)) reg2
     ]
 
-
-pprCondRegReg :: LitString -> Size -> Cond -> Reg -> Reg -> Doc
+pprCondRegReg :: LitString -> Size -> Cond -> Reg -> Reg -> SDoc
 pprCondRegReg name size cond reg1 reg2
   = hcat [
         char '\t',
@@ -1116,7 +1116,7 @@ pprCondRegReg name size cond reg1 reg2
         pprReg size reg2
     ]
 
-pprSizeSizeRegReg :: LitString -> Size -> Size -> Reg -> Reg -> Doc
+pprSizeSizeRegReg :: LitString -> Size -> Size -> Reg -> Reg -> SDoc
 pprSizeSizeRegReg name size1 size2 reg1 reg2
   = hcat [
         char '\t',
@@ -1125,13 +1125,20 @@ pprSizeSizeRegReg name size1 size2 reg1 reg2
         pprSize size2,
         space,
         pprReg size1 reg1,
-
         comma,
         pprReg size2 reg2
     ]
 
+pprSizeSizeOpReg :: LitString -> Size -> Size -> Operand -> Reg -> SDoc
+pprSizeSizeOpReg name size1 size2 op1 reg2
+  = hcat [
+        pprMnemonic name size2,
+        pprOperand size1 op1,
+        comma,
+        pprReg size2 reg2
+    ]
 
-pprSizeRegRegReg :: LitString -> Size -> Reg -> Reg -> Reg -> Doc
+pprSizeRegRegReg :: LitString -> Size -> Reg -> Reg -> Reg -> SDoc
 pprSizeRegRegReg name size reg1 reg2 reg3
   = hcat [
         pprMnemonic name size,
@@ -1143,7 +1150,7 @@ pprSizeRegRegReg name size reg1 reg2 reg3
     ]
 
 
-pprSizeAddrReg :: LitString -> Size -> AddrMode -> Reg -> Doc
+pprSizeAddrReg :: LitString -> Size -> AddrMode -> Reg -> SDoc
 pprSizeAddrReg name size op dst
   = hcat [
         pprMnemonic name size,
@@ -1153,7 +1160,7 @@ pprSizeAddrReg name size op dst
     ]
 
 
-pprSizeRegAddr :: LitString -> Size -> Reg -> AddrMode -> Doc
+pprSizeRegAddr :: LitString -> Size -> Reg -> AddrMode -> SDoc
 pprSizeRegAddr name size src op
   = hcat [
         pprMnemonic name size,
@@ -1163,7 +1170,7 @@ pprSizeRegAddr name size src op
     ]
 
 
-pprShift :: LitString -> Size -> Operand -> Operand -> Doc
+pprShift :: LitString -> Size -> Operand -> Operand -> SDoc
 pprShift name size src dest
   = hcat [
         pprMnemonic name size,
@@ -1173,7 +1180,7 @@ pprShift name size src dest
     ]
 
 
-pprSizeOpOpCoerce :: LitString -> Size -> Size -> Operand -> Operand -> Doc
+pprSizeOpOpCoerce :: LitString -> Size -> Size -> Operand -> Operand -> SDoc
 pprSizeOpOpCoerce name size1 size2 op1 op2
   = hcat [ char '\t', ptext name, pprSize size1, pprSize size2, space,
         pprOperand size1 op1,
@@ -1182,7 +1189,7 @@ pprSizeOpOpCoerce name size1 size2 op1 op2
     ]
 
 
-pprCondInstr :: LitString -> Cond -> Doc -> Doc
+pprCondInstr :: LitString -> Cond -> SDoc -> SDoc
 pprCondInstr name cond arg
   = hcat [ char '\t', ptext name, pprCond cond, space, arg]
 

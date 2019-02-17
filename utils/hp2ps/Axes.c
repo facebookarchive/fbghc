@@ -21,15 +21,14 @@ static void YAxisMark PROTO((floatish, floatish, mkb)); /* forward */
 static floatish Round PROTO((floatish)); /* forward */
 
 void
-Axes()
+Axes(void)
 {
     XAxis();
     YAxis();
 }
 
 static void
-XAxisMark(x, num)
-  floatish x; floatish num;
+XAxisMark(floatish x, floatish num)
 {
     /* calibration mark */
     fprintf(psfp, "%f %f moveto\n", xpage(x), ypage(0.0));
@@ -54,7 +53,7 @@ extern floatish xrange;
 extern char *sampleunitstring;
 
 static void
-XAxis()
+XAxis(void)
 {
     floatish increment, i; 
     floatish t, x;
@@ -93,8 +92,7 @@ XAxis()
 }
 
 static void
-YAxisMark(y, num, unit)
-  floatish y; floatish num; mkb unit;
+YAxisMark(floatish y, floatish num, mkb unit)
 {
     /* calibration mark */
     fprintf(psfp, "%f %f moveto\n", xpage(0.0), ypage(y));
@@ -141,7 +139,7 @@ extern floatish yrange;
 extern char *valueunitstring;
 
 static void
-YAxis()
+YAxis(void)
 {
     floatish increment, i;
     floatish t, y;
@@ -200,20 +198,23 @@ YAxis()
 static floatish OneTwoFive PROTO((floatish)); /* forward */
 
 static floatish
-Round(y)
-  floatish y;
+Round(floatish y)
 {
     int i;
 
     if (y > 10.0) {
-	for (i = 0; y > 10.0; y /= 10.0, i++) ;
+	for (i = 0; y > 10.0; y /= 10.0, i++)
+	    ;
 	y = OneTwoFive(y);
-	for ( ; i > 0; y = y * 10.0, i--) ;
+	for ( ; i > 0; y = y * 10.0, i--) 
+	    ;
 
     } else if (y < 1.0) {
-	for (i = 0; y < 1.0; y *= 10.0, i++) ;
+	for (i = 0; y < 1.0; y *= 10.0, i++) 
+	    ;
         y = OneTwoFive(y);
-        for ( ; i > 0; y = y / 10.0, i--) ;
+        for ( ; i > 0; y = y / 10.0, i--) 
+            ;
  
     } else {
 	y = OneTwoFive(y);
@@ -228,8 +229,7 @@ Round(y)
  */
 
 static floatish
-OneTwoFive(y)
-  floatish y;
+OneTwoFive(floatish y)
 {
     if (y > 4.0) {
 	return (5.0);

@@ -51,7 +51,7 @@ Foreign function interface (FFI)
 	calling arbitrary IO procedures in some part of the program.)
 </para>
 <para>The Haskell FFI already specifies that arguments and results of
-foreign imports and exports will be automatically unwrapped if they are 
+foreign imports and exports will be automatically unwrapped if they are
 newtypes (Section 3.2 of the FFI addendum).  GHC extends the FFI by automatically unwrapping any newtypes that
 wrap the IO monad itself.
 More precisely, wherever the FFI specification requires an IO type, GHC will
@@ -75,7 +75,8 @@ OK:
 	  This is used to import functions written in Cmm code that follow an
 	  internal GHC calling convention. This feature is not intended for
 	  use outside of the core libraries that come with GHC. For more
-	  details see the GHC developer wiki.
+	  details see the <ulink linkend="http://ghc.haskell.org/trac/ghc/wiki/Commentary/PrimOps">
+          GHC developer wiki</ulink>.
 	</para>
       </sect2>
 
@@ -96,21 +97,23 @@ OK:
           the time, then the program will not respond to the user
           interrupt.
         </para>
-        
+
         <para>
           The problem is that it is not possible in general to
           interrupt a foreign call safely.  However, GHC does provide
           a way to interrupt blocking system calls which works for
-          most system calls on both Unix and Windows.  A foreign call
+          most system calls on both Unix and Windows.  When the
+          <literal>InterruptibleFFI</literal> extension is enabled,
+          a foreign call
           can be annotated with <literal>interruptible</literal> instead
           of <literal>safe</literal> or <literal>unsafe</literal>:
 
 <programlisting>
-foreign import ccall interruptible 
+foreign import ccall interruptible
    "sleep" :: CUint -> IO CUint
 </programlisting>
 
-          <literal>interruptble</literal> behaves exactly as
+          <literal>interruptible</literal> behaves exactly as
           <literal>safe</literal>, except that when
           a <literal>throwTo</literal> is directed at a thread in an
           interruptible foreign call, an OS-specific mechanism will be
@@ -158,6 +161,92 @@ foreign import ccall interruptible
           handle <literal>ERROR_OPERATION_ABORTED</literal>.
         </para>
       </sect2>
+
+      <sect2 id="ffi-capi">
+        <title>The CAPI calling convention</title>
+        <para>
+          The <literal>CApiFFI</literal> extension allows a calling
+          convention of <literal>capi</literal> to be used in foreign
+          declarations, e.g.
+
+<programlisting>
+foreign import capi "header.h f" f :: CInt -> IO CInt
+</programlisting>
+
+          Rather than generating code to call <literal>f</literal>
+          according to the platform's ABI, we instead call
+          <literal>f</literal> using the C API defined in the header
+          <literal>header.h</literal>. Thus <literal>f</literal> can be
+          called even if it may be defined as a CPP
+          <literal>#define</literal> rather than a proper function.
+        </para>
+
+        <para>
+          When using <literal>capi</literal>, it is also possible to
+          import values, rather than functions. For example,
+
+<programlisting>
+foreign import capi "pi.h value pi" c_pi :: CDouble
+</programlisting>
+
+          will work regardless of whether <literal>pi</literal> is
+          defined as
+<programlisting>
+const double pi = 3.14;
+</programlisting>
+          or with
+<programlisting>
+#define pi 3.14
+</programlisting>
+        </para>
+
+        <para>
+          In order to tell GHC the C type that a Haskell type
+          corresponds to when it is used with the CAPI, a
+          <literal>CTYPE</literal> pragma can be used on the type
+          definition. The header which defines the type can optionally
+          also be specified. The syntax looks like:
+
+<programlisting>
+data    {-# CTYPE "unistd.h" "useconds_t" #-} T = ...
+newtype {-# CTYPE            "useconds_t" #-} T = ...
+</programlisting>
+        </para>
+      </sect2>
+
+      <sect2>
+        <title><literal>hs_thread_done()</literal></title>
+
+<programlisting>
+void hs_thread_done(void);
+</programlisting>
+
+        <para>
+          GHC allocates a small amount of thread-local memory when a
+          thread calls a Haskell function via a <literal>foreign
+          export</literal>.  This memory is not normally freed until
+          <literal>hs_exit()</literal>; the memory is cached so that
+          subsequent calls into Haskell are fast.  However, if your
+          application is long-running and repeatedly creates new
+          threads that call into Haskell, you probably want to arrange
+          that this memory is freed in those threads that have
+          finished calling Haskell functions.  To do this, call
+          <literal>hs_thread_done()</literal> from the thread whose
+          memory you want to free.
+        </para>
+
+        <para>
+          Calling <literal>hs_thread_done()</literal> is entirely
+          optional.  You can call it as often or as little as you
+          like.  It is safe to call it from a thread that has never
+          called any Haskell functions, or one that never will.  If
+          you forget to call it, the worst that can happen is that
+          some memory remains allocated until
+          <literal>hs_exit()</literal> is called.  If you call it too
+          often, the worst that can happen is that the next call to a
+          Haskell function incurs some extra overhead.
+        </para>
+      </sect2>
   </sect1>
 
   <sect1 id="ffi-ghc">
@@ -174,7 +263,7 @@ foreign import ccall interruptible
       </indexterm>
 
       <para>When GHC compiles a module (say <filename>M.hs</filename>)
-      which uses <literal>foreign export</literal> or 
+      which uses <literal>foreign export</literal> or
       <literal>foreign import "wrapper"</literal>, it generates two
       additional files, <filename>M_stub.c</filename> and
       <filename>M_stub.h</filename>.  GHC will automatically compile
@@ -220,10 +309,10 @@ extern HsInt foo(HsInt a0);</programlisting>
         <filename>M_stub.o</filename> in the final link command line, or
         you'll get link errors for the missing function(s) (this isn't
         necessary when building your program with <literal>ghc
-        &ndash;&ndash;make</literal>, as GHC will automatically link in the
+        --make</literal>, as GHC will automatically link in the
         correct bits).</para>
 
-      <sect3 id="using-own-main"> 
+      <sect3 id="using-own-main">
 	<title>Using your own <literal>main()</literal></title>
 
 	<para>Normally, GHC's runtime system provides a
@@ -276,40 +365,7 @@ int main(int argc, char *argv[])
 	(i.e. those arguments between
 	<literal>+RTS...-RTS</literal>).</para>
 
-      <informaltable>
-	<tgroup cols="2" align="left" colsep="1" rowsep="1">
-	  <thead>
-	    <row>
-	      <entry>Character</entry>
-	      <entry>Replacement</entry>
-	    </row>
-	  </thead>
-	  <tbody>
-	    <row>
-	      <entry><literal>.</literal></entry>
-	      <entry><literal>zd</literal></entry>
-	    </row>
-	    <row>
-	      <entry><literal>_</literal></entry>
-	      <entry><literal>zu</literal></entry>
-	    </row>
-	    <row>
-	      <entry><literal>`</literal></entry>
-	      <entry><literal>zq</literal></entry>
-	    </row>
-	    <row>
-	      <entry><literal>Z</literal></entry>
-	      <entry><literal>ZZ</literal></entry>
-	    </row>
-	    <row>
-	      <entry><literal>z</literal></entry>
-	      <entry><literal>zz</literal></entry>
-	    </row>
-          </tbody>
-        </tgroup>
-      </informaltable>
-
-	<para>After we've finished invoking our Haskell functions, we
+        <para>After we've finished invoking our Haskell functions, we
 	can call <literal>hs_exit()</literal>, which terminates the
 	RTS.</para>
 
@@ -320,7 +376,7 @@ int main(int argc, char *argv[])
 	<literal>hs_exit()</literal> will actually de-initialise the
 	system.  NOTE that currently GHC's runtime cannot reliably
 	re-initialise after this has happened,
-	see <xref linkend="ffi-divergence" />.</para>
+        see <xref linkend="infelicities-ffi" />.</para>
 	</footnote>.</para>
 
 	<para>NOTE: when linking the final program, it is normally
@@ -329,6 +385,85 @@ int main(int argc, char *argv[])
 	<option>-no-hs-main</option><indexterm><primary><option>-no-hs-main</option></primary>
 	  </indexterm>, otherwise GHC will try to link
 	to the <literal>Main</literal> Haskell module.</para>
+
+        <para>To use <literal>+RTS</literal> flags
+          with <literal>hs_init()</literal>, we have to modify the
+          example slightly.  By default, GHC's RTS will only accept
+          "safe"
+          <literal>+RTS</literal> flags (see
+          <xref linkend="options-linker" />), and
+          the <option>-rtsopts</option><indexterm><primary><option>-rtsopts</option></primary></indexterm> link-time flag overrides this.
+          However, <option>-rtsopts</option> has no effect
+          when <option>-no-hs-main</option> is in use (and the same
+          goes for <option>-with-rtsopts</option>).  To set these
+          options we have to call a GHC-specific API instead
+          of <option>hs_init()</option>:</para>
+
+<programlisting>
+#include &lt;stdio.h&gt;
+#include "HsFFI.h"
+
+#ifdef __GLASGOW_HASKELL__
+#include "foo_stub.h"
+#include "Rts.h"
+#endif
+
+int main(int argc, char *argv[])
+{
+  int i;
+
+#if __GLASGOW_HASKELL__ >= 703
+  {
+      RtsConfig conf = defaultRtsConfig;
+      conf.rts_opts_enabled = RtsOptsAll;
+      hs_init_ghc(&amp;argc, &amp;argv, conf);
+  }
+#else
+  hs_init(&amp;argc, &amp;argv);
+#endif
+
+  for (i = 0; i &lt; 5; i++) {
+    printf("%d\n", foo(2500));
+  }
+
+  hs_exit();
+  return 0;
+}</programlisting>
+
+      <para>Note two changes: we included <literal>Rts.h</literal>,
+        which defines the GHC-specific external RTS interface, and we
+        called <literal>hs_init_ghc()</literal> instead
+        of <literal>hs_init()</literal>, passing an argument of
+        type <literal>RtsConfig</literal>.
+        <literal>RtsConfig</literal> is a struct with various fields
+        that affect the behaviour of the runtime system.  Its
+        definition is:</para>
+
+<programlisting>
+typedef struct {
+    RtsOptsEnabledEnum rts_opts_enabled;
+    const char *rts_opts;
+} RtsConfig;
+
+extern const RtsConfig defaultRtsConfig;
+
+typedef enum {
+    RtsOptsNone,         // +RTS causes an error
+    RtsOptsSafeOnly,     // safe RTS options allowed; others cause an error
+    RtsOptsAll           // all RTS options allowed
+  } RtsOptsEnabledEnum;
+</programlisting>
+
+      <para>There is a default
+        value <literal>defaultRtsConfig</literal> that should be used
+        to initialise variables of type <literal>RtsConfig</literal>.
+        More fields will undoubtedly be added
+        to <literal>RtsConfig</literal> in the future, so in order to
+        keep your code forwards-compatible it is best to initialise
+        with <literal>defaultRtsConfig</literal> and then modify the
+        required fields, as in the code sample above.</para>
+
+
       </sect3>
 
       <sect3 id="ffi-library">
@@ -346,21 +481,25 @@ int main(int argc, char *argv[])
           implemented in C or C++.  For example:</para>
 
 <programlisting>
- HsBool mylib_init(void){
-   int argc = ...
-   char *argv[] = ...
+#include &lt;stdlib.h&gt;
+#include "HsFFI.h"
 
-   // Initialize Haskell runtime
-   hs_init(&amp;argc, &amp;argv);
+HsBool mylib_init(void){
+  int argc = 2;
+  char *argv[] = { "+RTS", "-A32m", NULL };
+  char **pargv = argv;
 
-   // do any other initialization here and
-   // return false if there was a problem
-   return HS_BOOL_TRUE;
- }
+  // Initialize Haskell runtime
+  hs_init(&amp;argc, &amp;pargv);
 
- void mylib_end(void){
-   hs_exit();
- }
+  // do any other initialization here and
+  // return false if there was a problem
+  return HS_BOOL_TRUE;
+}
+
+void mylib_end(void){
+  hs_exit();
+}
 </programlisting>
 
         <para>The initialisation routine, <literal>mylib_init</literal>, calls
@@ -371,7 +510,7 @@ int main(int argc, char *argv[])
       </sect3>
 
     </sect2>
-    
+
     <sect2 id="glasgow-foreign-headers">
       <title>Using header files</title>
 
@@ -386,7 +525,8 @@ int main(int argc, char *argv[])
 
       <para>GHC no longer includes external header files when
         compiling via C, so this checking is not performed.  The
-        change was made for compatibility with the native code backend
+        change was made for compatibility with the
+        <ulink linkend="native-code-gen">native code generator</ulink>
         (<literal>-fasm</literal>) and to comply strictly with the FFI
         specification, which requires that FFI calls are not subject
         to macro expansion and other CPP conversions that may be
@@ -396,7 +536,7 @@ int main(int argc, char *argv[])
         available when compiling an inlined version of a foreign call,
         so the compiler is free to inline foreign calls in any
         context.</para>
-        
+
       <para>The <literal>-&num;include</literal> option is now
         deprecated, and the <literal>include-files</literal> field
         in a Cabal package specification is ignored.</para>
@@ -481,17 +621,17 @@ int main(int argc, char *argv[])
 	</varlistentry>
       </variablelist>
     </sect2>
-    
+
     <sect2 id="ffi-threads">
       <title>Multi-threading and the FFI</title>
-      
+
       <para>In order to use the FFI in a multi-threaded setting, you must
         use the <option>-threaded</option> option
         (see <xref linkend="options-linker" />).</para>
-        
+
       <sect3>
         <title>Foreign imports and multi-threading</title>
-        
+
         <para>When you call a <literal>foreign import</literal>ed
           function that is annotated as <literal>safe</literal> (the
           default), and the program was linked
@@ -500,7 +640,7 @@ int main(int argc, char *argv[])
           program was linked without <option>-threaded</option>,
           then the other Haskell threads will be blocked until the
           call returns.</para>
-        
+
         <para>This means that if you need to make a foreign call to
           a function that takes a long time or blocks indefinitely,
           then you should mark it <literal>safe</literal> and
@@ -540,7 +680,7 @@ int main(int argc, char *argv[])
       <sect3 id="haskell-threads-and-os-threads">
         <title>The relationship between Haskell threads and OS
           threads</title>
-        
+
         <para>Normally there is no fixed relationship between Haskell
           threads and OS threads.  This means that when you make a
           foreign call, that call may take place in an unspecified OS
@@ -560,10 +700,10 @@ int main(int argc, char *argv[])
           for the <ulink url="&libraryBaseLocation;/Control-Concurrent.html"><literal>Control.Concurrent</literal></ulink>
           module.</para>
       </sect3>
-      
+
       <sect3>
         <title>Foreign exports and multi-threading</title>
-        
+
         <para>When the program is linked
           with <option>-threaded</option>, then you may
           invoke <literal>foreign export</literal>ed functions from
@@ -612,7 +752,7 @@ int main(int argc, char *argv[])
           isn't necessary to ensure that the threads have exited first.
           (Unofficially, if you want to use this fast and loose version of
           <literal>hs_exit()</literal>, then call
-          <literal>shutdownHaskellAndExit()</literal> instead).</para> 
+          <literal>shutdownHaskellAndExit()</literal> instead).</para>
       </sect3>
     </sect2>
 

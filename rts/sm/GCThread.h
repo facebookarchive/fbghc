@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  * 
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
 
@@ -122,9 +122,10 @@ typedef struct gc_thread_ {
     OSThreadId id;                 // The OS thread that this struct belongs to
     SpinLock   gc_spin;
     SpinLock   mut_spin;
-    volatile rtsBool wakeup;
+    volatile StgWord wakeup;       // NB not StgWord8; only StgWord is guaranteed atomic
 #endif
     nat thread_index;              // a zero based index identifying the thread
+    rtsBool idle;                  // sitting out of this GC cycle
 
     bdescr * free_blocks;          // a buffer of free blocks for this thread
                                    //  during GC without accessing the block
@@ -133,7 +134,7 @@ typedef struct gc_thread_ {
     StgClosure* static_objects;      // live static objects
     StgClosure* scavenged_static_objects;   // static objects scavenged so far
 
-    lnat gc_count;                 // number of GCs this thread has done
+    W_ gc_count;                 // number of GCs this thread has done
 
     // block that is currently being scanned
     bdescr *     scan_bd;
@@ -165,7 +166,7 @@ typedef struct gc_thread_ {
                                    // instead of the to-space
                                    // corresponding to the object
 
-    lnat thunk_selector_depth;     // used to avoid unbounded recursion in 
+    W_ thunk_selector_depth;     // used to avoid unbounded recursion in 
                                    // evacuate() for THUNK_SELECTOR
 
 #ifdef USE_PAPI
@@ -175,16 +176,16 @@ typedef struct gc_thread_ {
     // -------------------
     // stats
 
-    lnat copied;
-    lnat scanned;
-    lnat any_work;
-    lnat no_work;
-    lnat scav_find_work;
+    W_ copied;
+    W_ scanned;
+    W_ any_work;
+    W_ no_work;
+    W_ scav_find_work;
 
-    Ticks gc_start_cpu;   // process CPU time
-    Ticks gc_start_elapsed;  // process elapsed time
-    Ticks gc_start_thread_cpu; // thread CPU time
-    lnat gc_start_faults;
+    Time gc_start_cpu;   // process CPU time
+    Time gc_start_elapsed;  // process elapsed time
+    Time gc_start_thread_cpu; // thread CPU time
+    W_ gc_start_faults;
 
     // -------------------
     // workspaces
@@ -201,6 +202,10 @@ typedef struct gc_thread_ {
 extern nat n_gc_threads;
 
 extern gc_thread **gc_threads;
+
+#if defined(THREADED_RTS) && defined(llvm_CC_FLAVOR)
+extern ThreadLocalKey gctKey;
+#endif
 
 #include "EndPrivate.h"
 

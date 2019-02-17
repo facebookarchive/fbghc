@@ -26,7 +26,12 @@
 // Task lists and global counters.
 // Locks required: all_tasks_mutex.
 Task *all_tasks = NULL;
-static nat taskCount;
+
+nat taskCount;
+nat workerCount;
+nat currentWorkerCount;
+nat peakWorkerCount;
+
 static int tasksInitialized = 0;
 
 static void   freeTask  (Task *task);
@@ -61,8 +66,11 @@ void
 initTaskManager (void)
 {
     if (!tasksInitialized) {
-	taskCount = 0;
-	tasksInitialized = 1;
+        taskCount = 0;
+        workerCount = 0;
+        currentWorkerCount = 0;
+        peakWorkerCount = 0;
+        tasksInitialized = 1;
 #if defined(THREADED_RTS)
 #if !defined(MYTASK_USE_TLV)
 	newThreadLocalKey(&currentTaskKey);
@@ -81,7 +89,7 @@ freeTaskManager (void)
     ACQUIRE_LOCK(&all_tasks_mutex);
 
     for (task = all_tasks; task != NULL; task = next) {
-        next = task->all_link;
+        next = task->all_next;
         if (task->stopped) {
             freeTask(task);
         } else {
@@ -96,9 +104,11 @@ freeTaskManager (void)
 
     RELEASE_LOCK(&all_tasks_mutex);
 
-#if defined(THREADED_RTS) && !defined(MYTASK_USE_TLV)
+#if defined(THREADED_RTS)
     closeMutex(&all_tasks_mutex); 
+#if !defined(MYTASK_USE_TLV)
     freeThreadLocalKey(&currentTaskKey);
+#endif
 #endif
 
     tasksInitialized = 0;
@@ -122,6 +132,44 @@ allocTask (void)
         setMyTask(task);
         return task;
     }
+}
+
+void freeMyTask (void)
+{
+    Task *task;
+
+    task = myTask();
+
+    if (task == NULL) return;
+
+    if (!task->stopped) {
+        errorBelch(
+            "freeMyTask() called, but the Task is not stopped; ignoring");
+        return;
+    }
+
+    if (task->worker) {
+        errorBelch("freeMyTask() called on a worker; ignoring");
+        return;
+    }
+
+    ACQUIRE_LOCK(&all_tasks_mutex);
+
+    if (task->all_prev) {
+        task->all_prev->all_next = task->all_next;
+    } else {
+        all_tasks = task->all_next;
+    }
+    if (task->all_next) {
+        task->all_next->all_prev = task->all_prev;
+    }
+
+    taskCount--;
+
+    RELEASE_LOCK(&all_tasks_mutex);
+
+    freeTask(task);
+    setMyTask(NULL);
 }
 
 static void
@@ -153,9 +201,6 @@ freeTask (Task *task)
 static Task*
 newTask (rtsBool worker)
 {
-#if defined(THREADED_RTS)
-    Ticks currentElapsedTime, currentUserTime;
-#endif
     Task *task;
 
 #define ROUND_TO_CACHE_LINE(x) ((((x)+63) / 64) * 64)
@@ -175,26 +220,25 @@ newTask (rtsBool worker)
     task->wakeup = rtsFalse;
 #endif
 
-#if defined(THREADED_RTS)
-    currentUserTime = getThreadCPUTime();
-    currentElapsedTime = getProcessElapsedTime();
-    task->mut_time = 0;
-    task->mut_etime = 0;
-    task->gc_time = 0;
-    task->gc_etime = 0;
-    task->muttimestart = currentUserTime;
-    task->elapsedtimestart = currentElapsedTime;
-#endif
-
     task->next = NULL;
 
     ACQUIRE_LOCK(&all_tasks_mutex);
 
-    task->all_link = all_tasks;
+    task->all_prev = NULL;
+    task->all_next = all_tasks;
+    if (all_tasks != NULL) {
+        all_tasks->all_prev = task;
+    }
     all_tasks = task;
 
     taskCount++;
-
+    if (worker) {
+        workerCount++;
+        currentWorkerCount++;
+        if (currentWorkerCount > peakWorkerCount) {
+            peakWorkerCount = currentWorkerCount;
+        }
+    }
     RELEASE_LOCK(&all_tasks_mutex);
 
     return task;
@@ -213,7 +257,7 @@ newInCall (Task *task)
         task->spare_incalls = incall->next;
         task->n_spare_incalls--;
     } else {
-        incall = stgMallocBytes((sizeof(InCall)), "newBoundTask");
+        incall = stgMallocBytes((sizeof(InCall)), "newInCall");
     }
 
     incall->tso = NULL;
@@ -303,43 +347,21 @@ discardTasksExcept (Task *keep)
     // Wipe the task list, except the current Task.
     ACQUIRE_LOCK(&all_tasks_mutex);
     for (task = all_tasks; task != NULL; task=next) {
-        next = task->all_link;
+        next = task->all_next;
         if (task != keep) {
-            debugTrace(DEBUG_sched, "discarding task %ld", (long)TASK_ID(task));
+            debugTrace(DEBUG_sched, "discarding task %" FMT_SizeT "", (size_t)TASK_ID(task));
+            // Note that we do not traceTaskDelete here because
+            // we are not really deleting a task.
+            // The OS threads for all these tasks do not exist in
+            // this process (since we're currently
+            // in the child of a forkProcess).
             freeTask(task);
         }
     }
     all_tasks = keep;
-    keep->all_link = NULL;
+    keep->all_next = NULL;
+    keep->all_prev = NULL;
     RELEASE_LOCK(&all_tasks_mutex);
-}
-
-void
-taskTimeStamp (Task *task USED_IF_THREADS)
-{
-#if defined(THREADED_RTS)
-    Ticks currentElapsedTime, currentUserTime;
-
-    currentUserTime = getThreadCPUTime();
-    currentElapsedTime = getProcessElapsedTime();
-
-    task->mut_time =
-	currentUserTime - task->muttimestart - task->gc_time;
-    task->mut_etime = 
-        currentElapsedTime - task->elapsedtimestart - task->gc_etime;
-
-    if (task->gc_time   < 0) { task->gc_time   = 0; }
-    if (task->gc_etime  < 0) { task->gc_etime  = 0; }
-    if (task->mut_time  < 0) { task->mut_time  = 0; }
-    if (task->mut_etime < 0) { task->mut_etime = 0; }
-#endif
-}
-
-void
-taskDoneGC (Task *task, Ticks cpu_time, Ticks elapsed_time)
-{
-    task->gc_time  += cpu_time;
-    task->gc_etime += elapsed_time;
 }
 
 #if defined(THREADED_RTS)
@@ -347,27 +369,29 @@ taskDoneGC (Task *task, Ticks cpu_time, Ticks elapsed_time)
 void
 workerTaskStop (Task *task)
 {
-    OSThreadId id;
-    id = osThreadId();
+    DEBUG_ONLY( OSThreadId id );
+    DEBUG_ONLY( id = osThreadId() );
     ASSERT(task->id == id);
     ASSERT(myTask() == task);
 
-    task->cap = NULL;
-    taskTimeStamp(task);
-    task->stopped = rtsTrue;
-}
+    ACQUIRE_LOCK(&all_tasks_mutex);
 
-#endif
+    if (task->all_prev) {
+        task->all_prev->all_next = task->all_next;
+    } else {
+        all_tasks = task->all_next;
+    }
+    if (task->all_next) {
+        task->all_next->all_prev = task->all_prev;
+    }
 
-#ifdef DEBUG
+    currentWorkerCount--;
 
-static void *taskId(Task *task)
-{
-#ifdef THREADED_RTS
-    return (void *)task->id;
-#else
-    return (void *)task;
-#endif
+    RELEASE_LOCK(&all_tasks_mutex);
+
+    traceTaskDelete(task);
+
+    freeTask(task);
 }
 
 #endif
@@ -393,6 +417,9 @@ workerStart(Task *task)
 
     newInCall(task);
 
+    // Everything set up; emit the event before the worker starts working.
+    traceTaskCreate(task, cap);
+
     scheduleWorker(cap,task);
 }
 
@@ -411,6 +438,8 @@ startWorkerTask (Capability *cap)
   // worker thread reads it.
   ACQUIRE_LOCK(&task->lock);
 
+  // We don't emit a task creation event here, but in workerStart,
+  // where the kernel thread id is known.
   task->cap = cap;
 
   // Give the capability directly to the worker; we can't let anyone
@@ -439,7 +468,8 @@ interruptWorkerTask (Task *task)
   ASSERT(osThreadId() != task->id);    // seppuku not allowed
   ASSERT(task->incall->suspended_tso); // use this only for FFI calls
   interruptOSThread(task->id);
-  debugTrace(DEBUG_sched, "interrupted worker task %p", taskId(task));
+  debugTrace(DEBUG_sched, "interrupted worker task %#" FMT_HexWord64,
+             serialisableTaskId(task));
 }
 
 #endif /* THREADED_RTS */
@@ -452,8 +482,9 @@ void
 printAllTasks(void)
 {
     Task *task;
-    for (task = all_tasks; task != NULL; task = task->all_link) {
-	debugBelch("task %p is %s, ", taskId(task), task->stopped ? "stopped" : "alive");
+    for (task = all_tasks; task != NULL; task = task->all_next) {
+	debugBelch("task %#" FMT_HexWord64 " is %s, ", serialisableTaskId(task),
+                   task->stopped ? "stopped" : "alive");
 	if (!task->stopped) {
 	    if (task->cap) {
 		debugBelch("on capability %d, ", task->cap->no);

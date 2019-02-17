@@ -100,7 +100,7 @@ $ ./prog -f +RTS -H32m -S -RTS -h foo bar
         <para>
           If you absolutely positively want all the rest of the options
           in a command line to go to the program (and not the RTS), use a
-          <option>&ndash;&ndash;RTS</option><indexterm><primary><option>--RTS</option></primary></indexterm>.
+          <option>--RTS</option><indexterm><primary><option>--RTS</option></primary></indexterm>.
         </para>
 
         <para>
@@ -135,8 +135,10 @@ $ ./prog -f +RTS -H32m -S -RTS -h foo bar
         <para>
           GHC lets you change the default RTS options for a program at
           compile time, using the <literal>-with-rtsopts</literal>
-          flag (<xref linkend="options-linker" />). For example, to
-          set <literal>-H128m -K64m</literal>, link
+          flag (<xref linkend="options-linker" />).  A common use for this is
+          to give your program a default heap and/or stack size that is
+          greater than the default.  For example, to set <literal>-H128m
+            -K64m</literal>, link
           with <literal>-with-rtsopts="-H128m -K64m"</literal>.
         </para>
       </sect3>
@@ -187,37 +189,17 @@ $ ./prog -f +RTS -H32m -S -RTS -h foo bar
     <indexterm><primary>RTS hooks</primary></indexterm>
     <indexterm><primary>RTS behaviour, changing</primary></indexterm>
 
-    <para>GHC lets you exercise rudimentary control over the RTS
+    <para>GHC lets you exercise rudimentary control over certain RTS
     settings for any given program, by compiling in a
     &ldquo;hook&rdquo; that is called by the run-time system.  The RTS
-    contains stub definitions for all these hooks, but by writing your
+    contains stub definitions for these hooks, but by writing your
     own version and linking it on the GHC command line, you can
     override the defaults.</para>
 
     <para>Owing to the vagaries of DLL linking, these hooks don't work
     under Windows when the program is built dynamically.</para>
 
-    <para>The hook <literal>ghc_rts_opts</literal><indexterm><primary><literal>ghc_rts_opts</literal></primary>
-      </indexterm>lets you set RTS
-    options permanently for a given program, in the same way as the
-    newer <option>-with-rtsopts</option> linker option does.  A common use for this is
-    to give your program a default heap and/or stack size that is
-    greater than the default.  For example, to set <literal>-H128m
-    -K1m</literal>, place the following definition in a C source
-    file:</para>
-
-<programlisting>
-char *ghc_rts_opts = "-H128m -K1m";
-</programlisting>
-
-    <para>Compile the C file, and include the object file on the
-    command line when you link your Haskell program.</para>
-
-    <para>These flags are interpreted first, before any RTS flags from
-    the <literal>GHCRTS</literal> environment variable and any flags
-    on the command line.</para>
-
-    <para>You can also change the messages printed when the runtime
+    <para>You can change the messages printed when the runtime
     system &ldquo;blows up,&rdquo; e.g., on stack overflow.  The hooks
     for these are as follows:</para>
 
@@ -254,11 +236,6 @@ char *ghc_rts_opts = "-H128m -K1m";
 	</listitem>
       </varlistentry>
     </variablelist>
-
-    <para>For examples of the use of these hooks, see GHC's own
-    versions in the file
-    <filename>ghc/compiler/parser/hschooks.c</filename> in a GHC
-    source tree.</para>
   </sect3>
 
     </sect2>
@@ -329,7 +306,7 @@ char *ghc_rts_opts = "-H128m -K1m";
            with a message like &ldquo;<literal>failed to mmap() memory below 2Gb</literal>&rdquo;.  If you need to use this option to get GHCi working
            on your machine, please file a bug.
          </para>
-         
+
          <para>
            On 64-bit machines, the RTS needs to allocate memory in the
            low 2Gb of the address space.  Support for this across
@@ -495,7 +472,7 @@ char *ghc_rts_opts = "-H128m -K1m";
             generation <replaceable>gen</replaceable> and higher.
             Omitting <replaceable>gen</replaceable> turns off the
             parallel GC completely, reverting to sequential GC.</para>
-          
+
           <para>The default parallel GC settings are usually suitable
             for parallel programs (i.e. those
             using <literal>par</literal>, Strategies, or with multiple
@@ -509,7 +486,7 @@ char *ghc_rts_opts = "-H128m -K1m";
             restrict parallel GC to the old generation
             with <literal>-qg1</literal>.</para>
         </listitem>
-      </varlistentry>        
+      </varlistentry>
 
       <varlistentry>
         <term>
@@ -524,7 +501,7 @@ char *ghc_rts_opts = "-H128m -K1m";
             generation <replaceable>gen</replaceable> and higher.
             Omitting <replaceable>gen</replaceable> disables
             load-balancing entirely.</para>
-          
+
           <para>
             Load-balancing shares out the work of GC between the
             available cores.  This is a good idea when the heap is
@@ -543,26 +520,34 @@ char *ghc_rts_opts = "-H128m -K1m";
 
       <varlistentry>
 	<term>
-          <option>-H</option><replaceable>size</replaceable>
+          <option>-H</option><optional><replaceable>size</replaceable></optional>
           <indexterm><primary><option>-H</option></primary><secondary>RTS option</secondary></indexterm>
           <indexterm><primary>heap size, suggested</primary></indexterm>
         </term>
 	<listitem>
 	  <para>&lsqb;Default: 0&rsqb; This option provides a
-          &ldquo;suggested heap size&rdquo; for the garbage collector.  The
-          garbage collector will use about this much memory until the
-          program residency grows and the heap size needs to be
-          expanded to retain reasonable performance.</para>
+            &ldquo;suggested heap size&rdquo; for the garbage
+            collector.  Think
+            of <option>-H<replaceable>size</replaceable></option> as a
+            variable <option>-A</option> option.  It says: I want to
+            use at least <replaceable>size</replaceable> bytes, so use
+            whatever is left over to increase the <option>-A</option>
+            value.</para>
 
-	  <para>By default, the heap will start small, and grow and
-          shrink as necessary.  This can be bad for performance, so if
-          you have plenty of memory it's worthwhile supplying a big
-          <option>-H</option><replaceable>size</replaceable>.  For
-          improving GC performance, using
-          <option>-H</option><replaceable>size</replaceable> is
-          usually a better bet than
-          <option>-A</option><replaceable>size</replaceable>.</para>
-	</listitem>
+          <para>This option does not put
+            a <emphasis>limit</emphasis> on the heap size: the heap
+            may grow beyond the given size as usual.</para>
+
+          <para>If <replaceable>size</replaceable> is omitted, then
+            the garbage collector will take the size of the heap at
+            the previous GC as the <replaceable>size</replaceable>.
+            This has the effect of allowing for a
+            larger <option>-A</option> value but without increasing
+            the overall memory requirements of the program.  It can be
+            useful when the default small <option>-A</option> value is
+            suboptimal, as it can be in programs that create large
+            amounts of long-lived data.</para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -691,10 +676,12 @@ char *ghc_rts_opts = "-H128m -K1m";
           <indexterm><primary>stack, maximum size</primary></indexterm>
         </term>
 	<listitem>
-	  <para>&lsqb;Default: 8M&rsqb; Set the maximum stack size for
-          an individual thread to <replaceable>size</replaceable>
-          bytes.  If the thread attempts to exceed this limit, it will
-            be send the <literal>StackOverflow</literal> exception.
+	  <para>&lsqb;Default: 80% physical memory size&rsqb; Set the
+          maximum stack size for an individual thread to
+          <replaceable>size</replaceable> bytes. If the thread
+          attempts to exceed this limit, it will be sent the
+          <literal>StackOverflow</literal> exception. The
+          limit can be disabled entirely by specifying a size of zero.
           </para>
           <para>
             This option is there mainly to stop the program eating up
@@ -745,6 +732,10 @@ char *ghc_rts_opts = "-H128m -K1m";
 
       <varlistentry>
         <term>
+          <option>-T</option>
+          <indexterm><primary><option>-T</option></primary><secondary>RTS option</secondary></indexterm>
+        </term>
+        <term>
           <option>-t</option><optional><replaceable>file</replaceable></optional>
           <indexterm><primary><option>-t</option></primary><secondary>RTS option</secondary></indexterm>
         </term>
@@ -766,6 +757,7 @@ char *ghc_rts_opts = "-H128m -K1m";
 	  garbage collector, the amount of memory allocated, the
 	  maximum size of the heap, and so on.  The three
 	  variants give different levels of detail:
+          <option>-T</option> collects the data but produces no output
 	  <option>-t</option> produces a single line of output in the
 	  same format as GHC's <option>-Rghc-timing</option> option,
 	  <option>-s</option> produces a more detailed summary at the
@@ -777,6 +769,12 @@ char *ghc_rts_opts = "-H128m -K1m";
           <replaceable>file</replaceable>.  If
           <replaceable>file</replaceable> is omitted, then the output
           is sent to <constant>stderr</constant>.</para>
+
+    <para>
+        If you use the <literal>-T</literal> flag then, you should
+        access the statistics using
+        <ulink url="&libraryBaseLocation;/GHC-Stats.html">GHC.Stats</ulink>.
+    </para>
 
     <para>
         If you use the <literal>-t</literal> flag then, when your
@@ -817,7 +815,7 @@ char *ghc_rts_opts = "-H128m -K1m";
       </listitem>
       <listitem>
         <para>
-          The peak memory the RTS has allocated from the OS. 
+          The peak memory the RTS has allocated from the OS.
         </para>
       </listitem>
       <listitem>
@@ -1012,12 +1010,12 @@ char *ghc_rts_opts = "-H128m -K1m";
       </listitem>
       <listitem>
         <para>
-          How many page faults occured this garbage collection.
+          How many page faults occurred this garbage collection.
         </para>
       </listitem>
       <listitem>
         <para>
-          How many page faults occured since the end of the last garbage
+          How many page faults occurred since the end of the last garbage
           collection.
         </para>
       </listitem>
@@ -1060,7 +1058,7 @@ char *ghc_rts_opts = "-H128m -K1m";
               option</secondary></indexterm>
         </term>
         <listitem>
-          <para>Generates a basic heap profile, in the
+          <para>(can be shortened to <option>-h</option>.) Generates a basic heap profile, in the
             file <literal><replaceable>prog</replaceable>.hp</literal>.
             To produce the heap profile graph,
             use <command>hp2ps</command> (see <xref linkend="hp2ps"
@@ -1093,7 +1091,7 @@ char *ghc_rts_opts = "-H128m -K1m";
         <para>
           In binary format to a file for later analysis by a
           variety of tools.  One such tool
-          is <ulink url="http://hackage.haskell.org/package/ThreadScope">ThreadScope</ulink><indexterm><primary>ThreadScope</primary></indexterm>,
+          is <ulink url="http://www.haskell.org/haskellwiki/ThreadScope">ThreadScope</ulink><indexterm><primary>ThreadScope</primary></indexterm>,
           which interprets the event log to produce a visual parallel
           execution profile of the program.
         </para>
@@ -1114,11 +1112,67 @@ char *ghc_rts_opts = "-H128m -K1m";
         <listitem>
           <para>
             Log events in binary format to the
-            file <filename><replaceable>program</replaceable>.eventlog</filename>,
-            where <replaceable>flags</replaceable> is a sequence of
-            zero or more characters indicating which kinds of events
-            to log.  Currently there is only one type
-            supported: <literal>-ls</literal>, for scheduler events.
+            file <filename><replaceable>program</replaceable>.eventlog</filename>.
+            Without any <replaceable>flags</replaceable> specified, this logs a
+            default set of events, suitable for use with tools like ThreadScope.
+          </para>
+
+          <para>
+            For some special use cases you may want more control over which
+            events are included. The <replaceable>flags</replaceable> is a
+            sequence of zero or more characters indicating which classes of
+            events to log. Currently these the classes of events that can
+            be enabled/disabled:
+            <simplelist>
+              <member>
+                <option>s</option> &#8212; scheduler events, including Haskell
+                thread creation and start/stop events. Enabled by default.
+              </member>
+              <member>
+                <option>g</option> &#8212; GC events, including GC start/stop.
+                Enabled by default.
+              </member>
+              <member>
+                <option>p</option> &#8212; parallel sparks (sampled).
+                Enabled by default.
+              </member>
+              <member>
+                <option>f</option> &#8212; parallel sparks (fully accurate).
+                Disabled by default.
+              </member>
+              <member>
+                <option>u</option> &#8212; user events. These are events emitted
+                from Haskell code using functions such as 
+                <literal>Debug.Trace.traceEvent</literal>. Enabled by default.
+              </member>
+            </simplelist>
+          </para>
+
+          <para>            
+            You can disable specific classes, or enable/disable all classes at
+            once:
+            <simplelist>
+              <member>
+                <option>a</option> &#8212; enable all event classes listed above
+              </member>
+              <member>
+                <option>-<replaceable>x</replaceable></option> &#8212; disable the
+                given class of events, for any event class listed above or
+                <option>-a</option> for all classes
+              </member>
+            </simplelist>
+            For example, <option>-l-ag</option> would disable all event classes
+            (<option>-a</option>) except for GC events (<option>g</option>).
+          </para>
+
+          <para>            
+            For spark events there are two modes: sampled and fully accurate.
+            There are various events in the life cycle of each spark, usually
+            just creating and running, but there are some more exceptional
+            possibilities. In the sampled mode the number of occurrences of each
+            kind of spark event is sampled at frequent intervals. In the fully
+            accurate mode every spark event is logged individually. The latter
+            has a higher runtime overhead and is not enabled by default.
           </para>
 
           <para>
@@ -1128,7 +1182,7 @@ char *ghc_rts_opts = "-H128m -K1m";
             the <ulink url="http://hackage.haskell.org/package/ghc-events">ghc-events</ulink>
             library.  To dump the contents of
             a <literal>.eventlog</literal> file as text, use the
-            tool <literal>show-ghc-events</literal> that comes with
+            tool <literal>ghc-events show</literal> that comes with
             the <ulink url="http://hackage.haskell.org/package/ghc-events">ghc-events</ulink>
             package.
           </para>
@@ -1209,7 +1263,7 @@ char *ghc_rts_opts = "-H128m -K1m";
         </term>
 	<listitem>
 	  <para>
-            An RTS debugging flag; only availble if the program was
+            An RTS debugging flag; only available if the program was
 	    linked with the <option>-debug</option> option.  Various
 	    values of <replaceable>x</replaceable> are provided to
 	    enable debug messages and additional runtime sanity checks
@@ -1256,34 +1310,60 @@ char *ghc_rts_opts = "-H128m -K1m";
 	<listitem>
 	  <para>(Only available when the program is compiled for
 	  profiling.)  When an exception is raised in the program,
-	  this option causes the current cost-centre-stack to be
-	  dumped to <literal>stderr</literal>.</para>
+          this option causes a stack trace to be
+          dumped to <literal>stderr</literal>.</para>
 
 	  <para>This can be particularly useful for debugging: if your
 	  program is complaining about a <literal>head []</literal>
 	  error and you haven't got a clue which bit of code is
 	  causing it, compiling with <literal>-prof
-	  -auto-all</literal> and running with <literal>+RTS -xc
+          -fprof-auto</literal> and running with <literal>+RTS -xc
 	  -RTS</literal> will tell you exactly the call stack at the
 	  point the error was raised.</para>
 
-	  <para>The output contains one line for each exception raised
-	  in the program (the program might raise and catch several
-	  exceptions during its execution), where each line is of the
-	  form:</para>
+          <para>The output contains one report for each exception
+          raised in the program (the program might raise and catch
+          several exceptions during its execution), where each report
+          looks something like this:
+          </para>
 
 <screen>
-&lt; cc<subscript>1</subscript>, ..., cc<subscript>n</subscript> &gt;
+*** Exception raised (reporting due to +RTS -xc), stack trace:
+  GHC.List.CAF
+  --> evaluated by: Main.polynomial.table_search,
+  called from Main.polynomial.theta_index,
+  called from Main.polynomial,
+  called from Main.zonal_pressure,
+  called from Main.make_pressure.p,
+  called from Main.make_pressure,
+  called from Main.compute_initial_state.p,
+  called from Main.compute_initial_state,
+  called from Main.CAF
+  ...
 </screen>
-	  <para>each <literal>cc</literal><subscript>i</subscript> is
-	  a cost centre in the program (see <xref
-	  linkend="cost-centres"/>), and the sequence represents the
-	  &ldquo;call stack&rdquo; at the point the exception was
-	  raised.  The leftmost item is the innermost function in the
-	  call stack, and the rightmost item is the outermost
-	  function.</para>
+          <para>The stack trace may often begin with something
+          uninformative like <literal>GHC.List.CAF</literal>; this is
+          an artifact of GHC's optimiser, which lifts out exceptions
+          to the top-level where the profiling system assigns them to
+          the cost centre "CAF".  However, <literal>+RTS -xc</literal>
+          doesn't just print the current stack, it looks deeper and
+          reports the stack at the time the CAF was evaluated, and it
+          may report further stacks until a non-CAF stack is found.  In
+          the example above, the next stack (after <literal>-->
+          evaluated by</literal>) contains plenty of information about
+          what the program was doing when it evaluated <literal>head
+          []</literal>.</para>
 
-	</listitem>
+          <para>Implementation details aside, the function names in
+          the stack should hopefully give you enough clues to track
+          down the bug.</para>
+
+          <para>
+            See also the function <literal>traceStack</literal> in the
+            module <literal>Debug.Trace</literal> for another way to
+            view call stacks.
+          </para>
+        </listitem>
       </varlistentry>
 
       <varlistentry>
@@ -1303,7 +1383,7 @@ char *ghc_rts_opts = "-H128m -K1m";
 
   </sect2>
 
-  <sect2>
+  <sect2 id="ghc-info">
     <title>Getting information about the RTS</title>
 
     <indexterm><primary>RTS</primary></indexterm>
@@ -1357,7 +1437,7 @@ $ ./a.out +RTS --info
         <term><literal>RTS way</literal></term>
         <listitem>
           <para>The variant (&ldquo;way&rdquo;) of the runtime. The
-          most common values are <literal>rts</literal> (vanilla),
+          most common values are <literal>rts_v</literal> (vanilla),
           <literal>rts_thr</literal> (threaded runtime, i.e. linked using the
           <literal>-threaded</literal> option) and <literal>rts_p</literal>
           (profiling runtime, i.e. linked using the <literal>-prof</literal>
@@ -1423,7 +1503,8 @@ $ ./a.out +RTS --info
       <varlistentry>
         <term><literal>Compiler unregistered</literal></term>
         <listitem>
-          <para>Was this program compiled with an &ldquo;unregistered&rdquo;
+          <para>Was this program compiled with an
+          <link linkend="unreg">&ldquo;unregistered&rdquo;</link>
           version of GHC? (I.e., a version of GHC that has no platform-specific
           optimisations compiled in, usually because this is a currently
           unsupported platform.) This value will usually be no, unless you're

@@ -20,6 +20,9 @@ module Llvm (
         LlvmBlocks, LlvmBlock(..), LlvmBlockId,
         LlvmParamAttr(..), LlvmParameter,
 
+        -- * Fence synchronization
+        LlvmSyncOrdering(..),
+
         -- * Call Handling
         LlvmCallConvention(..), LlvmCallType(..), LlvmParameterListType(..),
         LlvmLinkageType(..), LlvmFuncAttr(..),
@@ -29,24 +32,30 @@ module Llvm (
 
         -- * Variables and Type System
         LlvmVar(..), LlvmStatic(..), LlvmLit(..), LlvmType(..),
-        LlvmAlias, LMGlobal, LMString, LMSection, LMAlign,
+        LlvmAlias, LMGlobal(..), LMString, LMSection, LMAlign,
+        LMConst(..),
 
         -- ** Some basic types
         i64, i32, i16, i8, i1, i8Ptr, llvmWord, llvmWordPtr,
 
+        -- ** Metadata types
+        MetaExpr(..), MetaAnnot(..), MetaDecl(..),
+
         -- ** Operations on the type system.
-        isGlobal, getLitType, getLit, getName, getPlainName, getVarType,
-        getLink, getStatType, getGlobalVar, getGlobalType, pVarLift, pVarLower,
-        pLift, pLower, isInt, isFloat, isPointer, llvmWidthInBits,
+        isGlobal, getLitType, getVarType,
+        getLink, getStatType, pVarLift, pVarLower,
+        pLift, pLower, isInt, isFloat, isPointer, isVector, llvmWidthInBits,
 
         -- * Pretty Printing
+        ppLit, ppName, ppPlainName,
         ppLlvmModule, ppLlvmComments, ppLlvmComment, ppLlvmGlobals,
         ppLlvmGlobal, ppLlvmFunctionDecls, ppLlvmFunctionDecl, ppLlvmFunctions,
-        ppLlvmFunction, ppLlvmAlias, ppLlvmAliases, llvmSDoc
+        ppLlvmFunction, ppLlvmAlias, ppLlvmAliases, ppLlvmMetas, ppLlvmMeta,
 
     ) where
 
 import Llvm.AbsSyn
+import Llvm.MetaData
 import Llvm.PpLlvm
 import Llvm.Types
 

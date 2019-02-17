@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module SPARC.Imm (
 	-- immediate values
 	Imm(..),
@@ -8,12 +15,10 @@ module SPARC.Imm (
 
 where
 
-import OldCmm
+import Cmm
 import CLabel
-import BlockId
 
-import Pretty
-import Panic
+import Outputable
 
 -- | An immediate value.
 --	Not all of these are directly representable by the machine. 
@@ -29,7 +34,7 @@ data Imm
 	| ImmCLbl	CLabel	    
 
 	-- Simple string
-	| ImmLit	Doc	    
+	| ImmLit	SDoc
 	| ImmIndex	CLabel Int
 	| ImmFloat	Rational
 	| ImmDouble	Rational
@@ -65,7 +70,6 @@ litToImm lit
 		(ImmConstantDiff (ImmCLbl l1) (ImmCLbl l2))
 		(ImmInt off)
 
-	CmmBlock id	-> ImmCLbl (infoTblLbl id)
-	_		-> panic "SPARC.Regs.litToImm: no match"
+        _               -> panic "SPARC.Regs.litToImm: no match"
 
 

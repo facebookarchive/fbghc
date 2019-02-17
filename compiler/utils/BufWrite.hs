@@ -10,12 +10,20 @@
 --
 -----------------------------------------------------------------------------
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module BufWrite (
 	BufHandle(..),
 	newBufHandle,
 	bPutChar,
 	bPutStr,
 	bPutFS,
+	bPutFZS,
 	bPutLitString,
 	bFlush,
   ) where
@@ -27,8 +35,11 @@ import FastTypes
 import FastMutInt
 
 import Control.Monad	( when )
+import Data.ByteString (ByteString)
+import qualified Data.ByteString.Unsafe as BS
 import Data.Char	( ord )
 import Foreign
+import Foreign.C.String
 import System.IO
 
 -- -----------------------------------------------------------------------------
@@ -77,18 +88,26 @@ bPutStr (BufHandle buf r hdl) str = do
 		loop cs (i+1)
   
 bPutFS :: BufHandle -> FastString -> IO ()
-bPutFS b@(BufHandle buf r hdl) fs@(FastString _ len _ fp _) =
- withForeignPtr fp $ \ptr -> do
+bPutFS b fs = bPutBS b $ fastStringToByteString fs
+
+bPutFZS :: BufHandle -> FastZString -> IO ()
+bPutFZS b fs = bPutBS b $ fastZStringToByteString fs
+
+bPutBS :: BufHandle -> ByteString -> IO ()
+bPutBS b bs = BS.unsafeUseAsCStringLen bs $ bPutCStringLen b
+
+bPutCStringLen :: BufHandle -> CStringLen -> IO ()
+bPutCStringLen b@(BufHandle buf r hdl) cstr@(ptr, len) = do
   i <- readFastMutInt r
   if (i + len) >= buf_size
-	then do hPutBuf hdl buf i
-		writeFastMutInt r 0
-		if (len >= buf_size) 
-		    then hPutBuf hdl ptr len
-		    else bPutFS b fs
-	else do
-		copyBytes (buf `plusPtr` i) ptr len
-		writeFastMutInt r (i+len)
+        then do hPutBuf hdl buf i
+                writeFastMutInt r 0
+                if (len >= buf_size)
+                    then hPutBuf hdl ptr len
+                    else bPutCStringLen b cstr
+        else do
+                copyBytes (buf `plusPtr` i) ptr len
+                writeFastMutInt r (i + len)
 
 bPutLitString :: BufHandle -> LitString -> FastInt -> IO ()
 bPutLitString b@(BufHandle buf r hdl) a len_ = a `seq` do

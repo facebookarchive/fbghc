@@ -63,6 +63,7 @@ processHeapClosureForDead( StgClosure *c )
     case STACK:
     case MVAR_CLEAN:
     case MVAR_DIRTY:
+    case TVAR:
     case MUT_ARR_PTRS_CLEAN:
     case MUT_ARR_PTRS_DIRTY:
     case MUT_ARR_PTRS_FROZEN:
@@ -133,7 +134,6 @@ processHeapClosureForDead( StgClosure *c )
     case CATCH_FRAME:
     case UNDERFLOW_FRAME:
     case STOP_FRAME:
-    case RET_DYN:
     case RET_BCO:
     case RET_SMALL:
     case RET_BIG:
@@ -172,21 +172,16 @@ processHeapForDead( bdescr *bd )
 static void
 processNurseryForDead( void )
 {
-    StgPtr p, bdLimit;
+    StgPtr p;
     bdescr *bd;
 
-    bd = MainCapability.r.rNursery->blocks;
-    while (bd->start < bd->free) {
-	p = bd->start;
-	bdLimit = bd->start + BLOCK_SIZE_W;
-	while (p < bd->free && p < bdLimit) {
-	    p += processHeapClosureForDead((StgClosure *)p);
-	    while (p < bd->free && p < bdLimit && !*p)  // skip slop
-		p++;
-	}
-	bd = bd->link;
-	if (bd == NULL)
-	    break;
+    for (bd = MainCapability.r.rNursery->blocks; bd != NULL; bd = bd->link) {
+        p = bd->start;
+        while (p < bd->free) {
+            while (p < bd->free && !*p) p++; // skip slop
+            if (p >= bd->free) break;
+            p += processHeapClosureForDead((StgClosure *)p);
+        }
     }
 }
 
@@ -212,7 +207,7 @@ processChainForDead( bdescr *bd )
  * current garbage collection.  This function is called from a garbage
  * collector right before tidying up, when all dead closures are still
  * stored in the heap and easy to identify.  Generations 0 through N
- * have just beed garbage collected.
+ * have just been garbage collected.
  * ----------------------------------------------------------------------- */
 void
 LdvCensusForDead( nat N )

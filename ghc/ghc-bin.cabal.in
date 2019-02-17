@@ -26,11 +26,11 @@ Flag ghci
 Executable ghc
     Main-Is: Main.hs
     Build-Depends: base       >= 3   && < 5,
-                   array      >= 0.1 && < 0.4,
-                   bytestring >= 0.9 && < 0.10,
-                   directory  >= 1   && < 1.2,
-                   process    >= 1   && < 1.1,
-                   filepath   >= 1   && < 1.3,
+                   array      >= 0.1 && < 0.6,
+                   bytestring >= 0.9 && < 0.11,
+                   directory  >= 1   && < 1.3,
+                   process    >= 1   && < 1.3,
+                   filepath   >= 1   && < 1.4,
                    ghc
     if os(windows)
         Build-Depends: Win32
@@ -44,13 +44,10 @@ Executable ghc
         CPP-Options: -DGHCI
         GHC-Options: -fno-warn-name-shadowing
         Other-Modules: InteractiveUI, GhciMonad, GhciTags
-        Build-Depends: mtl, haskeline
+        Build-Depends: transformers, haskeline
         Extensions: ForeignFunctionInterface,
                     UnboxedTuples,
                     FlexibleInstances,
                     MagicHash
 
-    Extensions: CPP, PatternGuards
-    if impl(ghc >= 7.1)
-        Extensions: NondecreasingIndentation
-
+    Extensions: CPP, PatternGuards, NondecreasingIndentation

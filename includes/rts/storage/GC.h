@@ -53,33 +53,44 @@
  *
  * ------------------------------------------------------------------------- */
 
+// A count of blocks needs to store anything up to the size of memory
+// divided by the block size.  The safest thing is therefore to use a
+// type that can store the full range of memory addresses,
+// ie. StgWord.  Note that we have had some tricky int overflows in a
+// couple of cases caused by using ints rather than longs (e.g. #5086)
+
+typedef StgWord memcount;
+
 typedef struct nursery_ {
     bdescr *       blocks;
-    unsigned int   n_blocks;
+    memcount       n_blocks;
 } nursery;
 
 typedef struct generation_ {
-    unsigned int   no;			// generation number
+    nat            no;			// generation number
 
     bdescr *       blocks;	        // blocks in this gen
-    unsigned int   n_blocks;	        // number of blocks
-    unsigned int   n_words;             // number of used words
+    memcount       n_blocks;            // number of blocks
+    memcount       n_words;             // number of used words
 
     bdescr *       large_objects;	// large objects (doubly linked)
-    unsigned int   n_large_blocks;      // no. of blocks used by large objs
-    unsigned long  n_new_large_words;   // words of new large objects
-                                        // (for allocation stats)
+    memcount       n_large_blocks;      // no. of blocks used by large objs
+    memcount       n_large_words;       // no. of words used by large objs
+    memcount       n_new_large_words;   // words of new large objects
+                                        // (for doYouWantToGC())
 
-    unsigned int   max_blocks;		// max blocks
+    memcount       max_blocks;          // max blocks
 
     StgTSO *       threads;             // threads in this gen
                                         // linked via global_link
+    StgWeak *      weak_ptr_list;       // weak pointers in this gen
+
     struct generation_ *to;		// destination gen for live objects
 
     // stats information
-    unsigned int collections;
-    unsigned int par_collections;
-    unsigned int failed_promotions;
+    nat collections;
+    nat par_collections;
+    nat failed_promotions;
 
     // ------------------------------------
     // Fields below are used during GC only
@@ -98,15 +109,16 @@ typedef struct generation_ {
     // are copied into the following two fields.  After GC, these blocks
     // are freed.
     bdescr *     old_blocks;	        // bdescr of first from-space block
-    unsigned int n_old_blocks;		// number of blocks in from-space
-    unsigned int live_estimate;         // for sweeping: estimate of live data
+    memcount     n_old_blocks;         // number of blocks in from-space
+    memcount     live_estimate;         // for sweeping: estimate of live data
     
     bdescr *     scavenged_large_objects;  // live large objs after GC (d-link)
-    unsigned int n_scavenged_large_blocks; // size (not count) of above
+    memcount     n_scavenged_large_blocks; // size (not count) of above
 
     bdescr *     bitmap;  		// bitmap for compacting collection
 
     StgTSO *     old_threads;
+    StgWeak *    old_weak_ptr_list;
 } generation;
 
 extern generation * generations;
@@ -116,13 +128,13 @@ extern generation * oldest_gen;
 /* -----------------------------------------------------------------------------
    Generic allocation
 
-   StgPtr allocate(Capability *cap, nat n)
+   StgPtr allocate(Capability *cap, W_ n)
                                 Allocates memory from the nursery in
 				the current Capability.  This can be
 				done without taking a global lock,
                                 unlike allocate().
 
-   StgPtr allocatePinned(Capability *cap, nat n) 
+   StgPtr allocatePinned(Capability *cap, W_ n)
                                 Allocates a chunk of contiguous store
    				n words long, which is at a fixed
 				address (won't be moved by GC).  
@@ -141,15 +153,22 @@ extern generation * oldest_gen;
 
    -------------------------------------------------------------------------- */
 
-StgPtr  allocate        ( Capability *cap, lnat n );
-StgPtr  allocatePinned  ( Capability *cap, lnat n );
+StgPtr  allocate        ( Capability *cap, W_ n );
+StgPtr  allocatePinned  ( Capability *cap, W_ n );
 
 /* memory allocator for executable memory */
-void * allocateExec(unsigned int len, void **exec_addr);
-void   freeExec (void *p);
+typedef void* AdjustorWritable;
+typedef void* AdjustorExecutable;
+
+AdjustorWritable allocateExec(W_ len, AdjustorExecutable *exec_addr);
+void flushExec(W_ len, AdjustorExecutable exec_addr);
+#if defined(ios_HOST_OS)
+AdjustorWritable execToWritable(AdjustorExecutable exec);
+#endif
+void             freeExec (AdjustorExecutable p);
 
 // Used by GC checks in external .cmm code:
-extern nat large_alloc_lim;
+extern W_ large_alloc_lim;
 
 /* -----------------------------------------------------------------------------
    Performing Garbage Collection
@@ -162,8 +181,8 @@ void performMajorGC(void);
    The CAF table - used to let us revert CAFs in GHCi
    -------------------------------------------------------------------------- */
 
-void newCAF     (StgRegTable *reg, StgClosure *);
-void newDynCAF  (StgRegTable *reg, StgClosure *);
+StgInd *newCAF    (StgRegTable *reg, StgIndStatic *caf);
+StgInd *newDynCAF (StgRegTable *reg, StgIndStatic *caf);
 void revertCAFs (void);
 
 // Request that all CAFs are retained indefinitely.
@@ -172,6 +191,53 @@ void setKeepCAFs (void);
 /* -----------------------------------------------------------------------------
    Stats
    -------------------------------------------------------------------------- */
+
+typedef struct _GCStats {
+  StgWord64 bytes_allocated;
+  StgWord64 num_gcs;
+  StgWord64 num_byte_usage_samples;
+  StgWord64 max_bytes_used;
+  StgWord64 cumulative_bytes_used;
+  StgWord64 bytes_copied;
+  StgWord64 current_bytes_used;
+  StgWord64 current_bytes_slop;
+  StgWord64 max_bytes_slop;
+  StgWord64 peak_megabytes_allocated;
+  StgWord64 par_tot_bytes_copied;
+  StgWord64 par_max_bytes_copied;
+  StgDouble mutator_cpu_seconds;
+  StgDouble mutator_wall_seconds;
+  StgDouble gc_cpu_seconds;
+  StgDouble gc_wall_seconds;
+  StgDouble cpu_seconds;
+  StgDouble wall_seconds;
+} GCStats;
+void getGCStats (GCStats *s);
+rtsBool getGCStatsEnabled (void);
+
+// These don't change over execution, so do them elsewhere
+//  StgDouble init_cpu_seconds;
+//  StgDouble init_wall_seconds;
+
+typedef struct _ParGCStats {
+  StgWord64 tot_copied;
+  StgWord64 max_copied;
+} ParGCStats;
+void getParGCStats (ParGCStats *s);
+
+/*
+typedef struct _TaskStats {
+  StgWord64 mut_time;
+  StgWord64 mut_etime;
+  StgWord64 gc_time;
+  StgWord64 gc_etime;
+} TaskStats;
+// would need to allocate arbitrarily large amount of memory
+// because it's a linked list of results
+void getTaskStats (TaskStats **s);
+// Need to stuff SparkCounters in a public header file...
+void getSparkStats (SparkCounters *s);
+*/
 
 // Returns the total number of bytes allocated since the start of the program.
 HsInt64 getAllocations (void);

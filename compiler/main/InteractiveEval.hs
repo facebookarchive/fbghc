@@ -9,7 +9,7 @@
 module InteractiveEval (
 #ifdef GHCI
         RunResult(..), Status(..), Resume(..), History(..),
-	runStmt, runStmtWithLocation,
+        runStmt, runStmtWithLocation, runDecls, runDeclsWithLocation,
         parseImportDecl, SingleStep(..),
         resume,
         abandon, abandonAll,
@@ -18,18 +18,18 @@ module InteractiveEval (
         getModBreaks,
         getHistoryModule,
         back, forward,
-	setContext, getContext,	
+        setContext, getContext,
         availsToGlobalRdrEnv,
-	getNamesInScope,
-	getRdrNamesInScope,
-	moduleIsInterpreted,
-	getInfo,
-	exprType,
-	typeKind,
-	parseName,
-	showModule,
+        getNamesInScope,
+        getRdrNamesInScope,
+        moduleIsInterpreted,
+        getInfo,
+        exprType,
+        typeKind,
+        parseName,
+        showModule,
         isModuleInterpreted,
-	compileExpr, dynCompileExpr,
+        compileExpr, dynCompileExpr,
         Term(..), obtainTermFromId, obtainTermFromVal, reconstructType
 #endif
         ) where
@@ -38,21 +38,24 @@ module InteractiveEval (
 
 #include "HsVersions.h"
 
+import InteractiveEvalTypes
+
 import GhcMonad
 import HscMain
-import HsSyn (ImportDecl)
+import HsSyn
 import HscTypes
-import TcRnDriver
-import RnNames		(gresFromAvails)
+import BasicTypes ( HValue )
 import InstEnv
-import Type
-import TcType		hiding( typeKind )
+import FamInstEnv ( FamInst, orphNamesOfFamInst )
+import TyCon
+import Type     hiding( typeKind )
+import TcType           hiding( typeKind )
 import Var
 import Id
 import Name             hiding ( varName )
 import NameSet
+import Avail
 import RdrName
-import PrelNames (pRELUDE)
 import VarSet
 import VarEnv
 import ByteCodeInstr
@@ -68,59 +71,26 @@ import ErrUtils
 import SrcLoc
 import BreakArray
 import RtClosureInspect
-import BasicTypes
 import Outputable
 import FastString
 import MonadUtils
 
+import System.Mem.Weak
 import System.Directory
 import Data.Dynamic
-import Data.List (find, partition)
+import Data.Either
+import Data.List (find)
 import Control.Monad
-import Foreign hiding (unsafePerformIO)
+import Foreign.Safe
 import Foreign.C
 import GHC.Exts
 import Data.Array
 import Exception
 import Control.Concurrent
--- import Foreign.StablePtr
-import System.IO
 import System.IO.Unsafe
 
 -- -----------------------------------------------------------------------------
 -- running a statement interactively
-
-data RunResult
-  = RunOk [Name] 		-- ^ names bound by this evaluation
-  | RunFailed	 		-- ^ statement failed compilation
-  | RunException SomeException	-- ^ statement raised an exception
-  | RunBreak ThreadId [Name] (Maybe BreakInfo)
-
-data Status
-   = Break Bool HValue BreakInfo ThreadId
-          -- ^ the computation hit a breakpoint (Bool <=> was an exception)
-   | Complete (Either SomeException [HValue])
-          -- ^ the computation completed with either an exception or a value
-
-data Resume
-   = Resume {
-       resumeStmt      :: String,       -- the original statement
-       resumeThreadId  :: ThreadId,     -- thread running the computation
-       resumeBreakMVar :: MVar (),   
-       resumeStatMVar  :: MVar Status,
-       resumeBindings  :: [Id],
-       resumeFinalIds  :: [Id],         -- [Id] to bind on completion
-       resumeApStack   :: HValue,       -- The object from which we can get
-                                        -- value of the free variables.
-       resumeBreakInfo :: Maybe BreakInfo,    
-                                        -- the breakpoint we stopped at
-                                        -- (Nothing <=> exception)
-       resumeSpan      :: SrcSpan,      -- just a cache, otherwise it's a pain
-                                        -- to fetch the ModDetails & ModBreaks
-                                        -- to get this.
-       resumeHistory   :: [History],
-       resumeHistoryIx :: Int           -- 0 <==> at the top of the history
-   }
 
 getResumeContext :: GhcMonad m => m [Resume]
 getResumeContext = withSession (return . ic_resume . hsc_IC)
@@ -133,13 +103,6 @@ data SingleStep
 isStep :: SingleStep -> Bool
 isStep RunToCompletion = False
 isStep _ = True
-
-data History
-   = History {
-        historyApStack   :: HValue,
-        historyBreakInfo :: BreakInfo,
-        historyEnclosingDecls :: [String]  -- declarations enclosing the breakpoint
-   }
 
 mkHistory :: HscEnv -> HValue -> BreakInfo -> History
 mkHistory hsc_env hval bi = let
@@ -177,6 +140,12 @@ findEnclosingDecls hsc_env inf =
        mb = getModBreaks hmi
    in modBreaks_decls mb ! breakInfo_number inf
 
+-- | Update fixity environment in the current interactive context.
+updateFixityEnv :: GhcMonad m => FixityEnv -> m ()
+updateFixityEnv fix_env = do
+  hsc_env <- getSession
+  let ic = hsc_IC hsc_env
+  setSession $ hsc_env { hsc_IC = ic { ic_fix_env = fix_env } }
 
 -- | Run a statement in the current interactive context.  Statement
 -- may bind multple values.
@@ -185,8 +154,8 @@ runStmt = runStmtWithLocation "<interactive>" 1
 
 -- | Run a statement in the current interactive context.  Passing debug information
 --   Statement may bind multple values.
-runStmtWithLocation :: GhcMonad m => String -> Int -> 
-                       String -> SingleStep -> m RunResult 
+runStmtWithLocation :: GhcMonad m => String -> Int ->
+                       String -> SingleStep -> m RunResult
 runStmtWithLocation source linenumber expr step =
   do
     hsc_env <- getSession
@@ -196,31 +165,48 @@ runStmtWithLocation source linenumber expr step =
 
     -- Turn off -fwarn-unused-bindings when running a statement, to hide
     -- warnings about the implicit bindings we introduce.
-    let dflags'  = dopt_unset (hsc_dflags hsc_env) Opt_WarnUnusedBinds
-        hsc_env' = hsc_env{ hsc_dflags = dflags' }
+    let ic       = hsc_IC hsc_env -- use the interactive dflags
+        idflags' = ic_dflags ic `wopt_unset` Opt_WarnUnusedBinds
+        hsc_env' = hsc_env{ hsc_IC = ic{ ic_dflags = idflags' } }
 
+    -- compile to value (IO [HValue]), don't run
     r <- liftIO $ hscStmtWithLocation hsc_env' expr source linenumber
 
     case r of
-      Nothing -> return RunFailed -- empty statement / comment
+      -- empty statement / comment
+      Nothing -> return (RunOk [])
 
-      Just (ids, hval) -> do
+      Just (tyThings, hval, fix_env) -> do
+        updateFixityEnv fix_env
+
         status <-
           withVirtualCWD $
-            withBreakAction (isStep step) dflags' breakMVar statusMVar $ do
-                let thing_to_run = unsafeCoerce# hval :: IO [HValue]
-                liftIO $ sandboxIO dflags' statusMVar thing_to_run
-              
-        let ic = hsc_IC hsc_env
-            bindings = ic_tmp_ids ic
+            withBreakAction (isStep step) idflags' breakMVar statusMVar $ do
+                liftIO $ sandboxIO idflags' statusMVar hval
 
-        case step of
-          RunAndLogSteps ->
-              traceRunStatus expr bindings ids
-                             breakMVar statusMVar status emptyHistory
-          _other ->
-              handleRunStatus expr bindings ids
-                               breakMVar statusMVar status emptyHistory
+        let ic = hsc_IC hsc_env
+            bindings = (ic_tythings ic, ic_rn_gbl_env ic)
+
+            size = ghciHistSize idflags'
+
+        handleRunStatus step expr bindings tyThings
+                        breakMVar statusMVar status (emptyHistory size)
+
+runDecls :: GhcMonad m => String -> m [Name]
+runDecls = runDeclsWithLocation "<interactive>" 1
+
+runDeclsWithLocation :: GhcMonad m => String -> Int -> String -> m [Name]
+runDeclsWithLocation source linenumber expr =
+  do
+    hsc_env <- getSession
+    (tyThings, ic) <- liftIO $ hscDeclsWithLocation hsc_env expr source linenumber
+
+    setSession $ hsc_env { hsc_IC = ic }
+    hsc_env <- getSession
+    hsc_env' <- liftIO $ rttiEnvironment hsc_env
+    modifySession (\_ -> hsc_env')
+    return (map getName tyThings)
+
 
 withVirtualCWD :: GhcMonad m => m a -> m a
 withVirtualCWD m = do
@@ -229,7 +215,7 @@ withVirtualCWD m = do
 
   let set_cwd = do
         dir <- liftIO $ getCurrentDirectory
-        case ic_cwd ic of 
+        case ic_cwd ic of
            Just dir -> liftIO $ setCurrentDirectory dir
            Nothing  -> return ()
         return dir
@@ -246,85 +232,91 @@ withVirtualCWD m = do
 parseImportDecl :: GhcMonad m => String -> m (ImportDecl RdrName)
 parseImportDecl expr = withSession $ \hsc_env -> liftIO $ hscImport hsc_env expr
 
-emptyHistory :: BoundedList History
-emptyHistory = nilBL 50 -- keep a log of length 50
+emptyHistory :: Int -> BoundedList History
+emptyHistory size = nilBL size
 
-handleRunStatus :: GhcMonad m =>
-                   String-> [Id] -> [Id]
+handleRunStatus :: GhcMonad m
+                => SingleStep -> String-> ([TyThing],GlobalRdrEnv) -> [Id]
                 -> MVar () -> MVar Status -> Status -> BoundedList History
                 -> m RunResult
-handleRunStatus expr bindings final_ids breakMVar statusMVar status
-                history =
-   case status of  
-      -- did we hit a breakpoint or did we complete?
-      (Break is_exception apStack info tid) -> do
-        hsc_env <- getSession
-        let mb_info | is_exception = Nothing
-                    | otherwise    = Just info
-        (hsc_env1, names, span) <- liftIO $ bindLocalsAtBreakpoint hsc_env apStack
-                                                               mb_info
-        let
-            resume = Resume { resumeStmt = expr, resumeThreadId = tid
-                            , resumeBreakMVar = breakMVar, resumeStatMVar = statusMVar 
-                            , resumeBindings = bindings, resumeFinalIds = final_ids
-                            , resumeApStack = apStack, resumeBreakInfo = mb_info 
-                            , resumeSpan = span, resumeHistory = toListBL history
-                            , resumeHistoryIx = 0 }
-            hsc_env2 = pushResume hsc_env1 resume
-        --
-        modifySession (\_ -> hsc_env2)
-        return (RunBreak tid names mb_info)
-      (Complete either_hvals) ->
-	case either_hvals of
-	    Left e -> return (RunException e)
-	    Right hvals -> do
-                hsc_env <- getSession
-                let final_ic = extendInteractiveContext (hsc_IC hsc_env) final_ids 
-                    final_names = map idName final_ids
-                liftIO $ Linker.extendLinkEnv (zip final_names hvals)
-                hsc_env' <- liftIO $ rttiEnvironment hsc_env{hsc_IC=final_ic}
-                modifySession (\_ -> hsc_env')
-                return (RunOk final_names)
 
-traceRunStatus :: GhcMonad m =>
-                  String -> [Id] -> [Id]
-               -> MVar () -> MVar Status -> Status -> BoundedList History
-               -> m RunResult
-traceRunStatus expr bindings final_ids
-               breakMVar statusMVar status history = do
-  hsc_env <- getSession
-  case status of
-     -- when tracing, if we hit a breakpoint that is not explicitly
-     -- enabled, then we just log the event in the history and continue.
-     (Break is_exception apStack info tid) | not is_exception -> do
-        b <- liftIO $ isBreakEnabled hsc_env info
-        if b
-           then handle_normally
-           else do
-             let history' = mkHistory hsc_env apStack info `consBL` history
-                -- probably better make history strict here, otherwise
-                -- our BoundedList will be pointless.
-             _ <- liftIO $ evaluate history'
-             status <-
-                 withBreakAction True (hsc_dflags hsc_env)
-                                      breakMVar statusMVar $ do
-                   liftIO $ withInterruptsSentTo tid $ do
-                       putMVar breakMVar ()  -- awaken the stopped thread
-                       takeMVar statusMVar   -- and wait for the result
-             traceRunStatus expr bindings final_ids
-                            breakMVar statusMVar status history'
-     _other ->
-        handle_normally
-  where
-        handle_normally = handleRunStatus expr bindings final_ids
-                                          breakMVar statusMVar status history
+handleRunStatus step expr bindings final_ids
+               breakMVar statusMVar status history
+  | RunAndLogSteps <- step = tracing
+  | otherwise              = not_tracing
+ where
+  tracing
+    | Break is_exception apStack info tid <- status
+    , not is_exception
+    = do
+       hsc_env <- getSession
+       b <- liftIO $ isBreakEnabled hsc_env info
+       if b
+         then not_tracing
+           -- This breakpoint is explicitly enabled; we want to stop
+           -- instead of just logging it.
+         else do
+           let history' = mkHistory hsc_env apStack info `consBL` history
+                 -- probably better make history strict here, otherwise
+                 -- our BoundedList will be pointless.
+           _ <- liftIO $ evaluate history'
+           status <- withBreakAction True (hsc_dflags hsc_env)
+                                     breakMVar statusMVar $ do
+                     liftIO $ mask_ $ do
+                        putMVar breakMVar ()  -- awaken the stopped thread
+                        redirectInterrupts tid $
+                          takeMVar statusMVar   -- and wait for the result
+           handleRunStatus RunAndLogSteps expr bindings final_ids
+                           breakMVar statusMVar status history'
+    | otherwise
+    = not_tracing
 
+  not_tracing
+    -- Hit a breakpoint
+    | Break is_exception apStack info tid <- status
+    = do
+         hsc_env <- getSession
+         let mb_info | is_exception = Nothing
+                     | otherwise    = Just info
+         (hsc_env1, names, span) <- liftIO $
+           bindLocalsAtBreakpoint hsc_env apStack mb_info
+         let
+           resume = Resume
+             { resumeStmt = expr, resumeThreadId = tid
+             , resumeBreakMVar = breakMVar, resumeStatMVar = statusMVar
+             , resumeBindings = bindings, resumeFinalIds = final_ids
+             , resumeApStack = apStack, resumeBreakInfo = mb_info
+             , resumeSpan = span, resumeHistory = toListBL history
+             , resumeHistoryIx = 0 }
+           hsc_env2 = pushResume hsc_env1 resume
+  
+         modifySession (\_ -> hsc_env2)
+         return (RunBreak tid names mb_info)
+  
+    -- Completed with an exception
+    | Complete (Left e) <- status
+    = return (RunException e)
+  
+    -- Completed successfully
+    | Complete (Right hvals) <- status
+    = do hsc_env <- getSession
+         let final_ic = extendInteractiveContext (hsc_IC hsc_env)
+                                                 (map AnId final_ids)
+             final_names = map getName final_ids
+         liftIO $ Linker.extendLinkEnv (zip final_names hvals)
+         hsc_env' <- liftIO $ rttiEnvironment hsc_env{hsc_IC=final_ic}
+         modifySession (\_ -> hsc_env')
+         return (RunOk final_names)
+  
+    | otherwise
+    = panic "handleRunStatus"  -- The above cases are in fact exhaustive
 
 isBreakEnabled :: HscEnv -> BreakInfo -> IO Bool
 isBreakEnabled hsc_env inf =
    case lookupUFM (hsc_HPT hsc_env) (moduleName (breakInfo_module inf)) of
        Just hmi -> do
-         w <- getBreak (modBreaks_flags (getModBreaks hmi))
+         w <- getBreak (hsc_dflags hsc_env)
+                       (modBreaks_flags (getModBreaks hmi))
                        (breakInfo_number inf)
          case w of Just n -> return (n /= 0); _other -> return False
        _ ->
@@ -340,8 +332,8 @@ resetStepFlag :: IO ()
 resetStepFlag = poke stepFlag 0
 
 -- this points to the IO action that is executed when a breakpoint is hit
-foreign import ccall "&rts_breakpoint_io_action" 
-   breakPointIOAction :: Ptr (StablePtr (Bool -> BreakInfo -> HValue -> IO ())) 
+foreign import ccall "&rts_breakpoint_io_action"
+   breakPointIOAction :: Ptr (StablePtr (Bool -> BreakInfo -> HValue -> IO ()))
 
 -- When running a computation, we redirect ^C exceptions to the running
 -- thread.  ToDo: we might want a way to continue even if the target
@@ -356,16 +348,51 @@ sandboxIO :: DynFlags -> MVar Status -> IO [HValue] -> IO Status
 sandboxIO dflags statusMVar thing =
    mask $ \restore -> -- fork starts blocked
      let runIt = liftM Complete $ try (restore $ rethrow dflags thing)
-     in if dopt Opt_GhciSandbox dflags
+     in if gopt Opt_GhciSandbox dflags
         then do tid <- forkIO $ do res <- runIt
                                    putMVar statusMVar res -- empty: can't block
-                withInterruptsSentTo tid $ takeMVar statusMVar
+                redirectInterrupts tid $
+                  takeMVar statusMVar
+
         else -- GLUT on OS X needs to run on the main thread. If you
              -- try to use it from another thread then you just get a
              -- white rectangle rendered. For this, or anything else
              -- with such restrictions, you can turn the GHCi sandbox off
              -- and things will be run in the main thread.
+             --
+             -- BUT, note that the debugging features (breakpoints,
+             -- tracing, etc.) need the expression to be running in a
+             -- separate thread, so debugging is only enabled when
+             -- using the sandbox.
              runIt
+
+--
+-- While we're waiting for the sandbox thread to return a result, if
+-- the current thread receives an asynchronous exception we re-throw
+-- it at the sandbox thread and continue to wait.
+--
+-- This is for two reasons:
+--
+--  * So that ^C interrupts runStmt (e.g. in GHCi), allowing the
+--    computation to run its exception handlers before returning the
+--    exception result to the caller of runStmt.
+--
+--  * clients of the GHC API can terminate a runStmt in progress
+--    without knowing the ThreadId of the sandbox thread (#1381)
+--
+-- NB. use a weak pointer to the thread, so that the thread can still
+-- be considered deadlocked by the RTS and sent a BlockedIndefinitely
+-- exception.  A symptom of getting this wrong is that conc033(ghci)
+-- will hang.
+--
+redirectInterrupts :: ThreadId -> IO a -> IO a
+redirectInterrupts target wait
+  = do wtid <- mkWeakThreadId target
+       wait `catch` \e -> do
+          m <- deRefWeak wtid
+          case m of
+            Nothing -> wait
+            Just target -> do throwTo target (e :: SomeException); wait
 
 -- We want to turn ^C into a break when -fbreak-on-exception is on,
 -- but it's an async exception and we only break for sync exceptions.
@@ -378,9 +405,9 @@ sandboxIO dflags statusMVar thing =
 rethrow :: DynFlags -> IO a -> IO a
 rethrow dflags io = Exception.catch io $ \se -> do
                    -- If -fbreak-on-error, we break unconditionally,
-                   --  but with care of not breaking twice 
-                if dopt Opt_BreakOnError dflags &&
-                   not (dopt Opt_BreakOnException dflags)
+                   --  but with care of not breaking twice
+                if gopt Opt_BreakOnError dflags &&
+                   not (gopt Opt_BreakOnException dflags)
                     then poke exceptionFlag 1
                     else case fromException se of
                          -- If it is a "UserInterrupt" exception, we allow
@@ -390,12 +417,6 @@ rethrow dflags io = Exception.catch io $ \se -> do
                          _ -> poke exceptionFlag 0
 
                 Exception.throwIO se
-
-withInterruptsSentTo :: ThreadId -> IO r -> IO r
-withInterruptsSentTo thread get_result = do
-  bracket (modifyMVar_ interruptTargetThread (return . (thread:)))
-          (\_ -> modifyMVar_ interruptTargetThread (\tl -> return $! tail tl))
-          (\_ -> get_result)
 
 -- This function sets up the interpreter for catching breakpoints, and
 -- resets everything when the computation has stopped running.  This
@@ -409,7 +430,7 @@ withBreakAction step dflags breakMVar statusMVar act
    setBreakAction = do
      stablePtr <- newStablePtr onBreak
      poke breakPointIOAction stablePtr
-     when (dopt Opt_BreakOnException dflags) $ poke exceptionFlag 1
+     when (gopt Opt_BreakOnException dflags) $ poke exceptionFlag 1
      when step $ setStepFlag
      return stablePtr
         -- Breaking on exceptions is not enabled by default, since it
@@ -442,37 +463,40 @@ resume canLogSpan step
        resume = ic_resume ic
 
    case resume of
-     [] -> ghcError (ProgramError "not stopped at a breakpoint")
+     [] -> liftIO $
+           throwGhcExceptionIO (ProgramError "not stopped at a breakpoint")
      (r:rs) -> do
         -- unbind the temporary locals by restoring the TypeEnv from
         -- before the breakpoint, and drop this Resume from the
         -- InteractiveContext.
-        let resume_tmp_ids = resumeBindings r
-            ic' = ic { ic_tmp_ids  = resume_tmp_ids,
+        let (resume_tmp_te,resume_rdr_env) = resumeBindings r
+            ic' = ic { ic_tythings = resume_tmp_te,
+                       ic_rn_gbl_env = resume_rdr_env,
                        ic_resume   = rs }
         modifySession (\_ -> hsc_env{ hsc_IC = ic' })
-        
-        -- remove any bindings created since the breakpoint from the 
+
+        -- remove any bindings created since the breakpoint from the
         -- linker's environment
-        let new_names = map idName (filter (`notElem` resume_tmp_ids)
-                                           (ic_tmp_ids ic))
+        let new_names = map getName (filter (`notElem` resume_tmp_te)
+                                           (ic_tythings ic))
         liftIO $ Linker.deleteFromLinkEnv new_names
-        
+
         when (isStep step) $ liftIO setStepFlag
-        case r of 
+        case r of
           Resume { resumeStmt = expr, resumeThreadId = tid
                  , resumeBreakMVar = breakMVar, resumeStatMVar = statusMVar
                  , resumeBindings = bindings, resumeFinalIds = final_ids
                  , resumeApStack = apStack, resumeBreakInfo = info, resumeSpan = span
                  , resumeHistory = hist } -> do
                withVirtualCWD $ do
-                withBreakAction (isStep step) (hsc_dflags hsc_env) 
+                withBreakAction (isStep step) (hsc_dflags hsc_env)
                                         breakMVar statusMVar $ do
-                status <- liftIO $ withInterruptsSentTo tid $ do
+                status <- liftIO $ mask_ $ do
                              putMVar breakMVar ()
                                       -- this awakens the stopped thread...
-                             takeMVar statusMVar
-                                      -- and wait for the result 
+                             redirectInterrupts tid $
+                               takeMVar statusMVar
+                                      -- and wait for the result
                 let prevHistoryLst = fromListBL 50 hist
                     hist' = case info of
                        Nothing -> prevHistoryLst
@@ -480,13 +504,8 @@ resume canLogSpan step
                          | not $canLogSpan span -> prevHistoryLst
                          | otherwise -> mkHistory hsc_env apStack i `consBL`
                                                         fromListBL 50 hist
-                case step of
-                  RunAndLogSteps -> 
-                        traceRunStatus expr bindings final_ids
-                                       breakMVar statusMVar status hist'
-                  _other ->
-                        handleRunStatus expr bindings final_ids
-                                        breakMVar statusMVar status hist'
+                handleRunStatus step expr bindings final_ids
+                                breakMVar statusMVar status hist'
 
 back :: GhcMonad m => m ([Name], Int, SrcSpan)
 back  = moveHist (+1)
@@ -498,38 +517,39 @@ moveHist :: GhcMonad m => (Int -> Int) -> m ([Name], Int, SrcSpan)
 moveHist fn = do
   hsc_env <- getSession
   case ic_resume (hsc_IC hsc_env) of
-     [] -> ghcError (ProgramError "not stopped at a breakpoint")
+     [] -> liftIO $
+           throwGhcExceptionIO (ProgramError "not stopped at a breakpoint")
      (r:rs) -> do
         let ix = resumeHistoryIx r
             history = resumeHistory r
             new_ix = fn ix
         --
-        when (new_ix > length history) $
-           ghcError (ProgramError "no more logged breakpoints")
-        when (new_ix < 0) $
-           ghcError (ProgramError "already at the beginning of the history")
+        when (new_ix > length history) $ liftIO $
+           throwGhcExceptionIO (ProgramError "no more logged breakpoints")
+        when (new_ix < 0) $ liftIO $
+           throwGhcExceptionIO (ProgramError "already at the beginning of the history")
 
         let
           update_ic apStack mb_info = do
             (hsc_env1, names, span) <- liftIO $ bindLocalsAtBreakpoint hsc_env
                                                 apStack mb_info
-            let ic = hsc_IC hsc_env1           
+            let ic = hsc_IC hsc_env1
                 r' = r { resumeHistoryIx = new_ix }
                 ic' = ic { ic_resume = r':rs }
-            
+
             modifySession (\_ -> hsc_env1{ hsc_IC = ic' })
-            
+
             return (names, new_ix, span)
 
         -- careful: we want apStack to be the AP_STACK itself, not a thunk
         -- around it, hence the cases are carefully constructed below to
         -- make this the case.  ToDo: this is v. fragile, do something better.
         if new_ix == 0
-           then case r of 
-                   Resume { resumeApStack = apStack, 
+           then case r of
+                   Resume { resumeApStack = apStack,
                             resumeBreakInfo = mb_info } ->
                           update_ic apStack mb_info
-           else case history !! (new_ix - 1) of 
+           else case history !! (new_ix - 1) of
                    History apStack info _ ->
                           update_ic apStack (Just info)
 
@@ -554,7 +574,7 @@ bindLocalsAtBreakpoint hsc_env apStack Nothing = do
        e_fs      = fsLit "e"
        e_name    = mkInternalName (getUnique e_fs) (mkTyVarOccFS e_fs) span
        e_tyvar   = mkRuntimeUnkTyVar e_name liftedTypeKind
-       exn_id    = Id.mkVanillaGlobal exn_name (mkTyVarTy e_tyvar)
+       exn_id    = AnId $ Id.mkVanillaGlobal exn_name (mkTyVarTy e_tyvar)
 
        ictxt0 = hsc_IC hsc_env
        ictxt1 = extendInteractiveContext ictxt0 [exn_id]
@@ -568,9 +588,9 @@ bindLocalsAtBreakpoint hsc_env apStack Nothing = do
 -- of the breakpoint and the free variables of the expression.
 bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
 
-   let 
+   let
        mod_name  = moduleName (breakInfo_module info)
-       hmi       = expectJust "bindLocalsAtBreakpoint" $ 
+       hmi       = expectJust "bindLocalsAtBreakpoint" $
                         lookupUFM (hsc_HPT hsc_env) mod_name
        breaks    = getModBreaks hmi
        index     = breakInfo_number info
@@ -582,8 +602,9 @@ bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
            -- Filter out any unboxed ids;
            -- we can't bind these at the prompt
        pointers = filter (\(id,_) -> isPointer id) vars
-       isPointer id | PtrRep <- idPrimRep id = True
-                    | otherwise              = False
+       isPointer id | UnaryRep ty <- repType (idType id)
+                    , PtrRep <- typePrimRep ty = True
+                    | otherwise                = False
 
        (ids, offsets) = unzip pointers
 
@@ -598,7 +619,7 @@ bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
    let filtered_ids = [ id | (id, Just _hv) <- zip ids mb_hValues ]
    when (any isNothing mb_hValues) $
       debugTraceMsg (hsc_dflags hsc_env) 1 $
-	  text "Warning: _result has been evaluated, some bindings have been lost"
+          text "Warning: _result has been evaluated, some bindings have been lost"
 
    us <- mkSplitUniqSupply 'I'
    let (us1, us2) = splitUniqSupply us
@@ -618,7 +639,6 @@ bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
    --    - globalise the Id (Ids are supposed to be Global, apparently).
    --
    let result_ok = isPointer result_id
-                    && not (isUnboxedTupleType (idType result_id))
 
        all_ids | result_ok = result_id : new_ids
                | otherwise = new_ids
@@ -626,7 +646,7 @@ bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
        (_,tidy_tys) = tidyOpenTypes emptyTidyEnv id_tys
        final_ids = zipWith setIdType all_ids tidy_tys
        ictxt0 = hsc_IC hsc_env
-       ictxt1 = extendInteractiveContext ictxt0 final_ids
+       ictxt1 = extendInteractiveContext ictxt0 (map AnId final_ids)
 
    Linker.extendLinkEnv [ (name,hval) | (name, Just hval) <- zip names mb_hValues ]
    when result_ok $ Linker.extendLinkEnv [(result_name, unsafeCoerce# apStack)]
@@ -653,10 +673,10 @@ bindLocalsAtBreakpoint hsc_env apStack (Just info) = do
                     | (tv, uniq) <- varSetElems tvs `zip` uniqsFromSupply us
                     , let name = setNameUnique (tyVarName tv) uniq ]
 
-rttiEnvironment :: HscEnv -> IO HscEnv 
+rttiEnvironment :: HscEnv -> IO HscEnv
 rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
-   let InteractiveContext{ic_tmp_ids=tmp_ids} = ic
-       incompletelyTypedIds = 
+   let tmp_ids = [id | AnId id <- ic_tythings ic]
+       incompletelyTypedIds =
            [id | id <- tmp_ids
                , not $ noSkolems id
                , (occNameFS.nameOccName.idName) id /= result_fs]
@@ -665,7 +685,7 @@ rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
     where
      noSkolems = isEmptyVarSet . tyVarsOfType . idType
      improveTypes hsc_env@HscEnv{hsc_IC=ic} name = do
-      let InteractiveContext{ic_tmp_ids=tmp_ids} = ic
+      let tmp_ids = [id | AnId id <- ic_tythings ic]
           Just id = find (\i -> idName i == name) tmp_ids
       if noSkolems id
          then return hsc_env
@@ -680,8 +700,9 @@ rttiEnvironment hsc_env@HscEnv{hsc_IC=ic} = do
                         WARN(True, text (":print failed to calculate the "
                                            ++ "improvement for a type")) hsc_env
                Just subst -> do
-                 when (dopt Opt_D_dump_rtti (hsc_dflags hsc_env)) $
-                      printForUser stderr alwaysQualify $
+                 let dflags = hsc_dflags hsc_env
+                 when (dopt Opt_D_dump_rtti dflags) $
+                      printInfoForUser dflags alwaysQualify $
                       fsep [text "RTTI Improvement for", ppr id, equals, ppr subst]
 
                  let ic' = extendInteractiveContext
@@ -714,7 +735,7 @@ abandon = do
        resume = ic_resume ic
    case resume of
       []    -> return False
-      r:rs  -> do 
+      r:rs  -> do
          modifySession $ \_ -> hsc_env{ hsc_IC = ic { ic_resume = rs } }
          liftIO $ abandon_ r
          return True
@@ -726,24 +747,29 @@ abandonAll = do
        resume = ic_resume ic
    case resume of
       []  -> return False
-      rs  -> do 
+      rs  -> do
          modifySession $ \_ -> hsc_env{ hsc_IC = ic { ic_resume = [] } }
          liftIO $ mapM_ abandon_ rs
          return True
 
--- when abandoning a computation we have to 
---      (a) kill the thread with an async exception, so that the 
+-- when abandoning a computation we have to
+--      (a) kill the thread with an async exception, so that the
 --          computation itself is stopped, and
 --      (b) fill in the MVar.  This step is necessary because any
 --          thunks that were under evaluation will now be updated
 --          with the partial computation, which still ends in takeMVar,
 --          so any attempt to evaluate one of these thunks will block
 --          unless we fill in the MVar.
+--      (c) wait for the thread to terminate by taking its status MVar.  This
+--          step is necessary to prevent race conditions with
+--          -fbreak-on-exception (see #5975).
 --  See test break010.
 abandon_ :: Resume -> IO ()
 abandon_ r = do
   killThread (resumeThreadId r)
-  putMVar (resumeBreakMVar r) () 
+  putMVar (resumeBreakMVar r) ()
+  _ <- takeMVar (resumeStatMVar r)
+  return ()
 
 -- -----------------------------------------------------------------------------
 -- Bounded list, optimised for repeated cons
@@ -774,42 +800,51 @@ fromListBL bound l = BL (length l) bound l []
 -- -----------------------------------------------------------------------------
 -- | Set the interactive evaluation context.
 --
--- Setting the context doesn't throw away any bindings; the bindings
--- we've built up in the InteractiveContext simply move to the new
--- module.  They always shadow anything in scope in the current context.
-setContext :: GhcMonad m =>
-        [Module]	-- ^ entire top level scope of these modules
-        -> [(Module, Maybe (ImportDecl RdrName))]	-- ^ exports of these modules
-        -> m ()
-setContext toplev_mods other_mods = do
-    hsc_env <- getSession
-    let old_ic  = hsc_IC     hsc_env
-        hpt     = hsc_HPT    hsc_env
-        (decls,mods)   = partition (isJust . snd) other_mods -- time for tracing
-        export_mods = map fst mods
-        imprt_decls = map noLoc (catMaybes (map snd decls))
-    --
-    export_env  <- liftIO $ mkExportEnv hsc_env export_mods
-    import_env  <-
-        if null imprt_decls then return emptyGlobalRdrEnv else do
-            let this_mod | null toplev_mods = pRELUDE
-                         | otherwise        = head toplev_mods
-            liftIO $ hscRnImportDecls hsc_env this_mod imprt_decls
-    toplev_envs <- liftIO $ mapM (mkTopLevEnv hpt) toplev_mods
-    let all_env = foldr plusGlobalRdrEnv (plusGlobalRdrEnv export_env import_env) toplev_envs
-    modifySession $ \_ ->
-        hsc_env{ hsc_IC = old_ic { ic_toplev_scope = toplev_mods,
-      			 ic_exports      = other_mods,
-      			 ic_rn_gbl_env   = all_env }}
+-- (setContext imports) sets the ic_imports field (which in turn
+-- determines what is in scope at the prompt) to 'imports', and
+-- constructs the ic_rn_glb_env environment to reflect it.
+--
+-- We retain in scope all the things defined at the prompt, and kept
+-- in ic_tythings.  (Indeed, they shadow stuff from ic_imports.)
 
--- Make a GlobalRdrEnv based on the exports of the modules only.
-mkExportEnv :: HscEnv -> [Module] -> IO GlobalRdrEnv
-mkExportEnv hsc_env mods
-  = do { stuff <- mapM (getModuleExports hsc_env) mods
-       ; let (_msgs, mb_name_sets) = unzip stuff
-	     envs = [ availsToGlobalRdrEnv (moduleName mod) avails
-                    | (Just avails, mod) <- zip mb_name_sets mods ]
-       ; return $! foldr plusGlobalRdrEnv emptyGlobalRdrEnv envs }
+setContext :: GhcMonad m => [InteractiveImport] -> m ()
+setContext imports
+  = do { hsc_env <- getSession
+       ; let dflags = hsc_dflags hsc_env
+       ; all_env_err <- liftIO $ findGlobalRdrEnv hsc_env imports
+       ; case all_env_err of
+           Left (mod, err) ->
+               liftIO $ throwGhcExceptionIO (formatError dflags mod err)
+           Right all_env -> do {
+       ; let old_ic        = hsc_IC hsc_env
+             final_rdr_env = all_env `icExtendGblRdrEnv` ic_tythings old_ic
+       ; modifySession $ \_ ->
+         hsc_env{ hsc_IC = old_ic { ic_imports    = imports
+                                  , ic_rn_gbl_env = final_rdr_env }}}}
+  where
+    formatError dflags mod err = ProgramError . showSDoc dflags $
+      text "Cannot add module" <+> ppr mod <+>
+      text "to context:" <+> text err
+
+findGlobalRdrEnv :: HscEnv -> [InteractiveImport]
+                 -> IO (Either (ModuleName, String) GlobalRdrEnv)
+-- Compute the GlobalRdrEnv for the interactive context
+findGlobalRdrEnv hsc_env imports
+  = do { idecls_env <- hscRnImportDecls hsc_env idecls
+                    -- This call also loads any orphan modules
+       ; return $ case partitionEithers (map mkEnv imods) of
+           ([], imods_env) -> Right (foldr plusGlobalRdrEnv idecls_env imods_env)
+           (err : _, _)    -> Left err }
+  where
+    idecls :: [LImportDecl RdrName]
+    idecls = [noLoc d | IIDecl d <- imports]
+
+    imods :: [ModuleName]
+    imods = [m | IIModule m <- imports]
+
+    mkEnv mod = case mkTopLevEnv (hsc_HPT hsc_env) mod of
+      Left err -> Left (mod, err)
+      Right env -> Right env
 
 availsToGlobalRdrEnv :: ModuleName -> [AvailInfo] -> GlobalRdrEnv
 availsToGlobalRdrEnv mod_name avails
@@ -818,28 +853,25 @@ availsToGlobalRdrEnv mod_name avails
       -- We're building a GlobalRdrEnv as if the user imported
       -- all the specified modules into the global interactive module
     imp_prov = Imported [ImpSpec { is_decl = decl, is_item = ImpAll}]
-    decl = ImpDeclSpec { is_mod = mod_name, is_as = mod_name, 
-			 is_qual = False, 
-			 is_dloc = srcLocSpan interactiveSrcLoc }
+    decl = ImpDeclSpec { is_mod = mod_name, is_as = mod_name,
+                         is_qual = False,
+                         is_dloc = srcLocSpan interactiveSrcLoc }
 
-mkTopLevEnv :: HomePackageTable -> Module -> IO GlobalRdrEnv
+mkTopLevEnv :: HomePackageTable -> ModuleName -> Either String GlobalRdrEnv
 mkTopLevEnv hpt modl
-  = case lookupUFM hpt (moduleName modl) of
-      Nothing -> ghcError (ProgramError ("mkTopLevEnv: not a home module " ++ 
-                                                showSDoc (ppr modl)))
+  = case lookupUFM hpt modl of
+      Nothing -> Left "not a home module"
       Just details ->
-	 case mi_globals (hm_iface details) of
-		Nothing  -> 
-		   ghcError (ProgramError ("mkTopLevEnv: not interpreted " 
-						++ showSDoc (ppr modl)))
-		Just env -> return env
+         case mi_globals (hm_iface details) of
+                Nothing  -> Left "not interpreted"
+                Just env -> Right env
 
 -- | Get the interactive evaluation context, consisting of a pair of the
 -- set of modules from which we take the full top-level scope, and the set
 -- of modules from which we take just the exports respectively.
-getContext :: GhcMonad m => m ([Module],[(Module, Maybe (ImportDecl RdrName))])
+getContext :: GhcMonad m => m [InteractiveImport]
 getContext = withSession $ \HscEnv{ hsc_IC=ic } ->
-	       return (ic_toplev_scope ic, ic_exports ic)
+             return (ic_imports ic)
 
 -- | Returns @True@ if the specified module is interpreted, and hence has
 -- its full top-level scope available.
@@ -852,29 +884,36 @@ moduleIsInterpreted modl = withSession $ \h ->
                 _not_a_home_module -> return False
 
 -- | Looks up an identifier in the current interactive context (for :info)
--- Filter the instances by the ones whose tycons (or clases resp) 
+-- Filter the instances by the ones whose tycons (or clases resp)
 -- are in scope (qualified or otherwise).  Otherwise we list a whole lot too many!
 -- The exact choice of which ones to show, and which to hide, is a judgement call.
--- 	(see Trac #1581)
-getInfo :: GhcMonad m => Name -> m (Maybe (TyThing,Fixity,[Instance]))
-getInfo name
+--      (see Trac #1581)
+getInfo :: GhcMonad m => Bool -> Name -> m (Maybe (TyThing,Fixity,[ClsInst],[FamInst]))
+getInfo allInfo name
   = withSession $ \hsc_env ->
     do mb_stuff <- liftIO $ hscTcRnGetInfo hsc_env name
        case mb_stuff of
          Nothing -> return Nothing
-         Just (thing, fixity, ispecs) -> do
+         Just (thing, fixity, cls_insts, fam_insts) -> do
            let rdr_env = ic_rn_gbl_env (hsc_IC hsc_env)
-           return (Just (thing, fixity, filter (plausible rdr_env) ispecs))
+
+           -- Filter the instances based on whether the constituent names of their
+           -- instance heads are all in scope.
+           let cls_insts' = filter (plausible rdr_env . orphNamesOfClsInst) cls_insts
+               fam_insts' = filter (plausible rdr_env . orphNamesOfFamInst) fam_insts
+           return (Just (thing, fixity, cls_insts', fam_insts'))
   where
-    plausible rdr_env ispec	-- Dfun involving only names that are in ic_rn_glb_env
-	= all ok $ nameSetToList $ orphNamesOfType $ idType $ instanceDFunId ispec
-	where	-- A name is ok if it's in the rdr_env, 
-		-- whether qualified or not
-	  ok n | n == name	   = True	-- The one we looked for in the first place!
-	       | isBuiltInSyntax n = True
-	       | isExternalName n  = any ((== n) . gre_name)
-					 (lookupGRE_Name rdr_env n)
-	       | otherwise	   = True
+    plausible rdr_env names
+          -- Dfun involving only names that are in ic_rn_glb_env
+        = allInfo
+       || all ok (nameSetToList names)
+        where   -- A name is ok if it's in the rdr_env,
+                -- whether qualified or not
+          ok n | n == name         = True       -- The one we looked for in the first place!
+               | isBuiltInSyntax n = True
+               | isExternalName n  = any ((== n) . gre_name)
+                                         (lookupGRE_Name rdr_env n)
+               | otherwise         = True
 
 -- | Returns all names in scope in the current interactive context
 getNamesInScope :: GhcMonad m => m [Name]
@@ -883,14 +922,11 @@ getNamesInScope = withSession $ \hsc_env -> do
 
 getRdrNamesInScope :: GhcMonad m => m [RdrName]
 getRdrNamesInScope = withSession $ \hsc_env -> do
-  let 
+  let
       ic = hsc_IC hsc_env
       gbl_rdrenv = ic_rn_gbl_env ic
-      ids = ic_tmp_ids ic
-      gbl_names = concat (map greToRdrNames (globalRdrEnvElts gbl_rdrenv))
-      lcl_names = map (mkRdrUnqual.nameOccName.idName) ids
-  --
-  return (gbl_names ++ lcl_names)
+      gbl_names = concatMap greToRdrNames $ globalRdrEnvElts gbl_rdrenv
+  return gbl_names
 
 
 -- ToDo: move to RdrName
@@ -903,9 +939,9 @@ greToRdrNames GRE{ gre_name = name, gre_prov = prov }
     occ = nameOccName name
     unqual = Unqual occ
     do_spec decl_spec
-	| is_qual decl_spec = [qual]
-	| otherwise         = [unqual,qual]
-	where qual = Qual (is_as decl_spec) occ
+        | is_qual decl_spec = [qual]
+        | otherwise         = [unqual,qual]
+        where qual = Qual (is_as decl_spec) occ
 
 -- | Parses a string as an identifier, and returns the list of 'Name's that
 -- the identifier can refer to in the current interactive context.
@@ -918,6 +954,7 @@ parseName str = withSession $ \hsc_env -> do
 -- Getting the type of an expression
 
 -- | Get the type of an expression
+-- Returns its most general type
 exprType :: GhcMonad m => String -> m Type
 exprType expr = withSession $ \hsc_env -> do
    ty <- liftIO $ hscTcExpr hsc_env expr
@@ -927,41 +964,49 @@ exprType expr = withSession $ \hsc_env -> do
 -- Getting the kind of a type
 
 -- | Get the kind of a  type
-typeKind  :: GhcMonad m => String -> m Kind
-typeKind str = withSession $ \hsc_env -> do
-   liftIO $ hscKcType hsc_env str
+typeKind  :: GhcMonad m => Bool -> String -> m (Type, Kind)
+typeKind normalise str = withSession $ \hsc_env -> do
+   liftIO $ hscKcType hsc_env normalise str
 
 -----------------------------------------------------------------------------
--- cmCompileExpr: compile an expression and deliver an HValue
+-- Compile an expression, run it and deliver the resulting HValue
 
 compileExpr :: GhcMonad m => String -> m HValue
 compileExpr expr = withSession $ \hsc_env -> do
-  Just (ids, hval) <- liftIO $ hscStmt hsc_env ("let __cmCompileExpr = "++expr)
- 		 -- Run it!
-  hvals <- liftIO (unsafeCoerce# hval :: IO [HValue])
-
+  Just (ids, hval, fix_env) <- liftIO $ hscStmt hsc_env ("let __cmCompileExpr = "++expr)
+  updateFixityEnv fix_env
+  hvals <- liftIO hval
   case (ids,hvals) of
     ([_],[hv]) -> return hv
-    _ 	     -> panic "compileExpr"
+    _          -> panic "compileExpr"
 
 -- -----------------------------------------------------------------------------
--- Compile an expression into a dynamic
+-- Compile an expression, run it and return the result as a dynamic
 
 dynCompileExpr :: GhcMonad m => String -> m Dynamic
 dynCompileExpr expr = do
-    (full,exports) <- getContext
-    setContext full $
-        (mkModule
-            (stringToPackageId "base") (mkModuleName "Data.Dynamic")
-        ,Nothing):exports
+    iis <- getContext
+    let importDecl = ImportDecl {
+                         ideclName = noLoc (mkModuleName "Data.Dynamic"),
+                         ideclPkgQual = Nothing,
+                         ideclSource = False,
+                         ideclSafe = False,
+                         ideclQualified = True,
+                         ideclImplicit = False,
+                         ideclAs = Nothing,
+                         ideclHiding = Nothing
+                     }
+    setContext (IIDecl importDecl : iis)
     let stmt = "let __dynCompileExpr = Data.Dynamic.toDyn (" ++ expr ++ ")"
-    Just (ids, hvals) <- withSession $ \hsc_env -> 
+    Just (ids, hvals, fix_env) <- withSession $ \hsc_env ->
                            liftIO $ hscStmt hsc_env stmt
-    setContext full exports
+    setContext iis
+    updateFixityEnv fix_env
+
     vals <- liftIO (unsafeCoerce# hvals :: IO [Dynamic])
     case (ids,vals) of
-        (_:[], v:[])    -> return v
-        _               -> panic "dynCompileExpr"
+        (_:[], v:[]) -> return v
+        _            -> panic "dynCompileExpr"
 
 -----------------------------------------------------------------------------
 -- show a module and it's source/object filenames
@@ -970,15 +1015,16 @@ showModule :: GhcMonad m => ModSummary -> m String
 showModule mod_summary =
     withSession $ \hsc_env -> do
         interpreted <- isModuleInterpreted mod_summary
-        return (showModMsg (hscTarget(hsc_dflags hsc_env)) interpreted mod_summary)
+        let dflags = hsc_dflags hsc_env
+        return (showModMsg dflags (hscTarget dflags) interpreted mod_summary)
 
 isModuleInterpreted :: GhcMonad m => ModSummary -> m Bool
 isModuleInterpreted mod_summary = withSession $ \hsc_env ->
   case lookupUFM (hsc_HPT hsc_env) (ms_mod_name mod_summary) of
-	Nothing	      -> panic "missing linkable"
-	Just mod_info -> return (not obj_linkable)
-		      where
-			 obj_linkable = isObjectLinkable (expectJust "showModule" (hm_linkable mod_info))
+        Nothing       -> panic "missing linkable"
+        Just mod_info -> return (not obj_linkable)
+                      where
+                         obj_linkable = isObjectLinkable (expectJust "showModule" (hm_linkable mod_info))
 
 ----------------------------------------------------------------------------
 -- RTTI primitives
@@ -995,7 +1041,7 @@ obtainTermFromId hsc_env bound force id =  do
 -- Uses RTTI to reconstruct the type of an Id, making it less polymorphic
 reconstructType :: HscEnv -> Int -> Id -> IO (Maybe Type)
 reconstructType hsc_env bound id = do
-              hv <- Linker.getHValue hsc_env (varName id) 
+              hv <- Linker.getHValue hsc_env (varName id)
               cvReconstructType hsc_env bound (idType id) hv
 
 mkRuntimeUnkTyVar :: Name -> Kind -> TyVar

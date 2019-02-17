@@ -37,8 +37,7 @@ Disaster(const char *fmt, ...)
 }
 
 void
-Usage(str)
-  const char *str;
+Usage(const char *str)
 {
    if (str) printf("error: %s\n", str);
    printf("usage: %s -b -d -ef -g -i -p -mn -p -s -tf -y [file[.hp]]\n", programname);
@@ -54,7 +53,7 @@ Usage(str)
    printf("      -s  use small title box\n");
    printf("      -tf ignore trace bands which sum below f%% (default 1%%, max 5%%)\n");
    printf("      -y  traditional\n");
-   printf("      -c  colour ouput\n");
+   printf("      -c  colour output\n");
    exit(0);
 }
 

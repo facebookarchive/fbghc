@@ -20,24 +20,8 @@ Category: Development
 Build-Type: Simple
 Cabal-Version: >= 1.2.3
 
-Flag base4
-    Description: Choose the even newer, even smaller, split-up base package.
-
-Flag base3
-    Description: Choose the new smaller, split-up base package.
-
-Flag dynlibs
-    Description: Dynamic library support
-    Default: False
-    Manual: True
-
 Flag ghci
     Description: Build GHCi support.
-    Default: False
-    Manual: True
-
-Flag ncg
-    Description: Build the NCG.
     Default: False
     Manual: True
 
@@ -59,50 +43,41 @@ Flag stage3
 Library
     Exposed: False
 
-    if flag(base4)
-        Build-Depends: base       >= 4   && < 5
-    if flag(base3)
-        Build-Depends: base       >= 3   && < 4
-    if !flag(base3) && !flag(base4)
-        Build-Depends: base       < 3
+    Build-Depends: base       >= 4   && < 5,
+                   directory  >= 1   && < 1.3,
+                   process    >= 1   && < 1.3,
+                   bytestring >= 0.9 && < 0.11,
+                   time                 < 1.5,
+                   containers >= 0.1 && < 0.6,
+                   array      >= 0.1 && < 0.6,
+                   filepath   >= 1   && < 1.4,
+                   Cabal,
+                   hpc,
+                   transformers
 
-    if flag(base3) || flag(base4)
-        Build-Depends: directory  >= 1   && < 1.2,
-                       process    >= 1   && < 1.1,
-                       bytestring >= 0.9 && < 0.10,
-                       old-time   >= 1   && < 1.1,
-                       containers >= 0.1 && < 0.5,
-                       array      >= 0.1 && < 0.4
+    if flag(stage1) && impl(ghc < 7.5)
+        Build-Depends: old-time   >= 1   && < 1.2
 
-    Build-Depends: filepath >= 1 && < 1.3
-    Build-Depends: Cabal, hpc
     if os(windows)
         Build-Depends: Win32
     else
         Build-Depends: unix
 
-    GHC-Options: -Wall -fno-warn-name-shadowing -fno-warn-orphans
+    GHC-Options: -Wall -fno-warn-name-shadowing
 
     if flag(ghci)
         Build-Depends: template-haskell
         CPP-Options: -DGHCI
-        Include-Dirs: ../libffi/build/include
-
-    if !flag(ncg)
-        CPP-Options: -DOMIT_NATIVE_CODEGEN
+        Include-Dirs: ../rts/dist/build @FFIIncludeDir@
 
     Build-Depends: bin-package-db
     Build-Depends: hoopl
 
-    -- GHC 6.4.2 needs to be able to find WCsubst.c, which needs to be
-    -- able to find WCsubst.h
-    Include-Dirs: ../libraries/base/cbits, ../libraries/base/include
-
     Extensions: CPP, MagicHash, UnboxedTuples, PatternGuards,
                 ForeignFunctionInterface, EmptyDataDecls,
                 TypeSynonymInstances, MultiParamTypeClasses,
-                FlexibleInstances, Rank2Types, ScopedTypeVariables,
-                DeriveDataTypeable
+                FlexibleInstances, RankNTypes, ScopedTypeVariables,
+                DeriveDataTypeable, BangPatterns
     if impl(ghc >= 7.1)
         Extensions: NondecreasingIndentation
 
@@ -121,11 +96,10 @@ Library
 
     c-sources:
         parser/cutils.c
-        utils/md5.c
 
-    if flag(dynlibs)
-        c-sources:
-            ghci/keepCAFsForGHCi.c
+    c-sources:
+        ghci/keepCAFsForGHCi.c
+        cbits/genSym.c
 
     hs-source-dirs:
         basicTypes
@@ -154,16 +128,21 @@ Library
         vectorise
 
     Exposed-Modules:
+        Avail
         BasicTypes
+        ConLike
         DataCon
+        PatSyn
         Demand
         Exception
         GhcMonad
+        Hooks
         Id
         IdInfo
         Literal
         Llvm
         Llvm.AbsSyn
+        Llvm.MetaData
         Llvm.PpLlvm
         Llvm.Types
         LlvmCodeGen
@@ -186,16 +165,15 @@ Library
         Var
         VarEnv
         VarSet
+        UnVarGraph
         BlockId
         CLabel
         Cmm
         CmmBuildInfoTables
-        CmmCPS
+        CmmPipeline
         CmmCallConv
         CmmCommonBlockElim
         CmmContFlowOpt
-        CmmCvt
-        CmmDecl
         CmmExpr
         CmmInfo
         CmmLex
@@ -206,40 +184,25 @@ Library
         CmmOpt
         CmmParse
         CmmProcPoint
-        CmmSpillReload
-        CmmStackLayout
+        CmmSink
         CmmType
         CmmUtils
+        CmmLayoutStack
         MkGraph
-        OldCmm
-        OldCmmUtils
-        OldPprCmm
-        OptimizationFuel
         PprBase
         PprC
         PprCmm
         PprCmmDecl
         PprCmmExpr
         Bitmap
-        CgBindery
-        CgCallConv
-        CgCase
-        CgClosure
-        CgCon
-        CgExpr
-        CgExtCode
-        CgForeignCall
-        CgHeapery
-        CgHpc
-        CgInfoTbls
-        CgLetNoEscape
-        CgMonad
-        CgParallel
-        CgPrimOp
-        CgProf
-        CgStackery
-        CgTailCall
-        CgTicky
+        CodeGen.Platform
+        CodeGen.Platform.ARM
+        CodeGen.Platform.NoRegs
+        CodeGen.Platform.PPC
+        CodeGen.Platform.PPC_Darwin
+        CodeGen.Platform.SPARC
+        CodeGen.Platform.X86
+        CodeGen.Platform.X86_64
         CgUtils
         StgCmm
         StgCmmBind
@@ -248,17 +211,16 @@ Library
         StgCmmEnv
         StgCmmExpr
         StgCmmForeign
-        StgCmmGran
         StgCmmHeap
         StgCmmHpc
+        StgCmmArgRep
         StgCmmLayout
         StgCmmMonad
         StgCmmPrim
         StgCmmProf
         StgCmmTicky
         StgCmmUtils
-        ClosureInfo
-        CodeGen
+        StgCmmExtCode
         SMRep
         CoreArity
         CoreFVs
@@ -266,6 +228,7 @@ Library
         CorePrep
         CoreSubst
         CoreSyn
+        TrieMap
         CoreTidy
         CoreUnfold
         CoreUtils
@@ -307,6 +270,7 @@ Library
         LoadIface
         MkIface
         TcIface
+        FlagChecker
         Annotations
         BreakArray
         CmdLineParser
@@ -315,22 +279,26 @@ Library
         Constants
         DriverMkDepend
         DriverPhases
+        PipelineMonad
         DriverPipeline
         DynFlags
         ErrUtils
         Finder
         GHC
         GhcMake
+        GhcPlugins
+        DynamicLoading
         HeaderInfo
         HscMain
         HscStats
         HscTypes
         InteractiveEval
+        InteractiveEvalTypes
         PackageConfig
         Packages
+        PlatformConstants
         PprTyThing
         StaticFlags
-        StaticFlagParser
         SysTools
         TidyPgm
         Ctype
@@ -356,10 +324,10 @@ Library
         RnEnv
         RnExpr
         RnHsDoc
-        RnHsSyn
         RnNames
         RnPat
         RnSource
+        RnSplice
         RnTypes
         CoreMonad
         CSE
@@ -374,15 +342,16 @@ Library
         SimplMonad
         SimplUtils
         Simplify
-        SRT
         SimplStg
         StgStats
+        UnariseStg
         Rules
         SpecConstr
         Specialise
         CoreToStg
         StgLint
         StgSyn
+        CallArity
         DmdAnal
         WorkWrap
         WwLib
@@ -398,12 +367,15 @@ Library
         TcExpr
         TcForeign
         TcGenDeriv
+        TcGenGenerics
         TcHsSyn
         TcHsType
         TcInstDcls
         TcMType
+        TcValidity
         TcMatches
         TcPat
+        TcPatSyn
         TcRnDriver
         TcRnMonad
         TcRnTypes
@@ -413,22 +385,27 @@ Library
         TcTyClsDecls
         TcTyDecls
         TcType
+        TcEvidence
         TcUnify
         TcInteract
         TcCanonical
         TcSMonad
+        TcTypeNats
+        TcSplice
         Class
         Coercion
         FamInstEnv
         FunDeps
-        Generics
         InstEnv
         TyCon
+        CoAxiom
+        Kind
         Type
         TypeRep
         Unify
         Bag
         Binary
+        BooleanFormula
         BufWrite
         Digraph
         Encoding
@@ -444,24 +421,25 @@ Library
         GraphOps
         GraphPpr
         IOEnv
-        Interval
         ListSetOps
         Maybes
         MonadUtils
         OrdList
         Outputable
+        Pair
         Panic
         Pretty
         Serialized
         State
+        Stream
         StringBuffer
         UniqFM
         UniqSet
         Util
+        ExtsCompat46
+--      ^^^  a temporary module necessary to bootstrap with GHC <= 7.6
         Vectorise.Builtins.Base
         Vectorise.Builtins.Initialise
-        Vectorise.Builtins.Modules
-        Vectorise.Builtins.Prelude
         Vectorise.Builtins
         Vectorise.Monad.Base
         Vectorise.Monad.Naming
@@ -475,11 +453,11 @@ Library
         Vectorise.Utils.PADict
         Vectorise.Utils.Poly
         Vectorise.Utils
+        Vectorise.Generic.Description
+        Vectorise.Generic.PAMethods
+        Vectorise.Generic.PADict
+        Vectorise.Generic.PData
         Vectorise.Type.Env
-        Vectorise.Type.Repr
-        Vectorise.Type.PData
-        Vectorise.Type.PRepr
-        Vectorise.Type.PADict
         Vectorise.Type.Type
         Vectorise.Type.TyConDecl
         Vectorise.Type.Classify
@@ -489,11 +467,12 @@ Library
         Vectorise.Env
         Vectorise.Exp
         Vectorise
+        Hoopl.Dataflow
+        Hoopl
+--        CgInfoTbls used in ghci/DebuggerUtils
+--        CgHeapery  mkVirtHeapOffsets used in ghci
 
-    -- We only need to expose more modules as some of the ncg code is used
-    -- by the LLVM backend so its always included
-    if flag(ncg)
-        Exposed-Modules:
+    Exposed-Modules:
             AsmCodeGen
             TargetReg
             NCGMonad
@@ -503,10 +482,7 @@ Library
             RegClass
             PIC
             Platform
-            Alpha.Regs
-            Alpha.RegInfo
-            Alpha.Instr
-            Alpha.CodeGen
+            CPrim
             X86.Regs
             X86.RegInfo
             X86.Instr
@@ -521,7 +497,6 @@ Library
             PPC.CodeGen
             SPARC.Base
             SPARC.Regs
-            SPARC.RegPlate
             SPARC.Imm
             SPARC.AddrMode
             SPARC.Cond
@@ -532,7 +507,6 @@ Library
             SPARC.CodeGen
             SPARC.CodeGen.Amode
             SPARC.CodeGen.Base
-            SPARC.CodeGen.CCall
             SPARC.CodeGen.CondCode
             SPARC.CodeGen.Gen32
             SPARC.CodeGen.Gen64
@@ -556,16 +530,15 @@ Library
             RegAlloc.Linear.StackMap
             RegAlloc.Linear.Base
             RegAlloc.Linear.X86.FreeRegs
+            RegAlloc.Linear.X86_64.FreeRegs
             RegAlloc.Linear.PPC.FreeRegs
             RegAlloc.Linear.SPARC.FreeRegs
 
     if flag(ghci)
         Exposed-Modules:
             DsMeta
-            TcSplice
             Convert
             ByteCodeAsm
-            ByteCodeFFI
             ByteCodeGen
             ByteCodeInstr
             ByteCodeItbls
@@ -575,4 +548,4 @@ Library
             Linker
             ObjLink
             RtClosureInspect
-
+            DebuggerUtils

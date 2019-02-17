@@ -5,7 +5,7 @@
  * Tasks
  *
  * For details on the high-level design, see
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Scheduler
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Scheduler
  *
  * -------------------------------------------------------------------------*/
 
@@ -37,12 +37,20 @@
    Ownership of Task
    -----------------
 
-   The OS thread named in the Task structure has exclusive access to
-   the structure, as long as it is the running_task of its Capability.
-   That is, if (task->cap->running_task == task), then task->id owns
-   the Task.  Otherwise the Task is owned by the owner of the parent
-   data structure on which it is sleeping; for example, if the task is
-   sleeping on spare_workers field of a Capability, then the owner of the
+   Task ownership is a little tricky.  The default situation is that
+   the Task is an OS-thread-local structure that is owned by the OS
+   thread named in task->id.  An OS thread not currently executing
+   Haskell code might call newBoundTask() at any time, which assumes
+   that it has access to the Task for the current OS thread.
+
+   The all_next and all_prev fields of a Task are owned by
+   all_tasks_mutex, which must also be taken if we want to create or
+   free a Task.
+
+   For an OS thread in Haskell, if (task->cap->running_task != task),
+   then the Task is owned by the owner of the parent data structure on
+   which it is sleeping; for example, if the task is sleeping on
+   spare_workers field of a Capability, then the owner of the
    Capability has access to the Task.
 
    When a task is migrated from sleeping on one Capability to another,
@@ -143,25 +151,13 @@ typedef struct Task_ {
     // So that we can detect when a finalizer illegally calls back into Haskell
     rtsBool running_finalizers;
 
-    // Stats that we collect about this task
-    // ToDo: we probably want to put this in a separate TaskStats
-    // structure, so we can share it between multiple Tasks.  We don't
-    // really want separate stats for each call in a nested chain of
-    // foreign->haskell->foreign->haskell calls, but we'll get a
-    // separate Task for each of the haskell calls.
-    Ticks       elapsedtimestart;
-    Ticks       muttimestart;
-    Ticks       mut_time;
-    Ticks       mut_etime;
-    Ticks       gc_time;
-    Ticks       gc_etime;
-
     // Links tasks on the returning_tasks queue of a Capability, and
     // on spare_workers.
     struct Task_ *next;
 
-    // Links tasks on the all_tasks list
-    struct Task_ *all_link;
+    // Links tasks on the all_tasks list; need ACQUIRE_LOCK(&all_tasks_mutex)
+    struct Task_ *all_next;
+    struct Task_ *all_prev;
 
 } Task;
 
@@ -170,7 +166,6 @@ isBoundTask (Task *task)
 {
     return (task->incall->tso != NULL);
 }
-
 
 // Linked list of all tasks.
 //
@@ -182,15 +177,23 @@ extern Task *all_tasks;
 void initTaskManager (void);
 nat  freeTaskManager (void);
 
-// Create a new Task for a bound thread
-// Requires: sched_mutex.
+// Create a new Task for a bound thread.  This Task must be released
+// by calling boundTaskExiting.  The Task is cached in
+// thread-local storage and will remain even after boundTaskExiting()
+// has been called; to free the memory, see freeMyTask().
 //
 Task *newBoundTask (void);
 
 // The current task is a bound task that is exiting.
-// Requires: sched_mutex.
 //
 void boundTaskExiting (Task *task);
+
+// Free a Task if one was previously allocated by newBoundTask().
+// This is not necessary unless the thread that called newBoundTask()
+// will be exiting, or if this thread has finished calling Haskell
+// functions.
+//
+void freeMyTask(void);
 
 // Notify the task manager that a task has stopped.  This is used
 // mainly for stats-gathering purposes.
@@ -200,15 +203,6 @@ void boundTaskExiting (Task *task);
 // In the non-threaded RTS, tasks never stop.
 void workerTaskStop (Task *task);
 #endif
-
-// Record the time spent in this Task.
-// This is called by workerTaskStop() but not by boundTaskExiting(),
-// because it would impose an extra overhead on call-in.
-//
-void taskTimeStamp (Task *task);
-
-// The current Task has finished a GC, record the amount of time spent.
-void taskDoneGC (Task *task, Ticks cpu_time, Ticks elapsed_time);
 
 // Put the task back on the free list, mark it stopped.  Used by
 // forkProcess().
@@ -235,15 +229,21 @@ void interruptWorkerTask (Task *task);
 
 #endif /* THREADED_RTS */
 
+// For stats
+extern nat taskCount;
+extern nat workerCount;
+extern nat peakWorkerCount;
+
 // -----------------------------------------------------------------------------
 // INLINE functions... private from here on down:
 
 // A thread-local-storage key that we can use to get access to the
 // current thread's Task structure.
 #if defined(THREADED_RTS)
-#if (defined(linux_HOST_OS) && \
+#if ((defined(linux_HOST_OS) && \
      (defined(i386_HOST_ARCH) || defined(x86_64_HOST_ARCH))) || \
-    (defined(mingw32_HOST_OS) && __GNUC__ >= 4 && __GNUC_MINOR__ >= 4)
+    (defined(mingw32_HOST_OS) && __GNUC__ >= 4 && __GNUC_MINOR__ >= 4)) && \
+    (!defined(llvm_CC_FLAVOR))
 #define MYTASK_USE_TLV
 extern __thread Task *my_task;
 #else
@@ -276,6 +276,48 @@ setMyTask (Task *task)
     setThreadLocalVar(&currentTaskKey,task);
 #else
     my_task = task;
+#endif
+}
+
+// Tasks are identified by their OS thread ID, which can be serialised
+// to StgWord64, as defined below.
+typedef StgWord64 TaskId;
+
+// Get a unique serialisable representation for a task id.
+//
+// It's only unique within the process. For example if they are emitted in a
+// log file then it is suitable to work out which log entries are releated.
+//
+// This is needed because OSThreadId is an opaque type
+// and in practice on some platforms it is a pointer type.
+//
+#if defined(THREADED_RTS)
+INLINE_HEADER TaskId serialiseTaskId (OSThreadId taskID) {
+#if defined(freebsd_HOST_OS) || defined(darwin_HOST_OS)
+    // Here OSThreadId is a pthread_t and pthread_t is a pointer, but within
+    // the process we can still use that pointer value as a unique id.
+    return (TaskId) (size_t) taskID;
+#else
+    // On Windows, Linux and others it's an integral type to start with.
+    return (TaskId) taskID;
+#endif
+}
+#endif
+
+//
+// Get a serialisable Id for the Task's OS thread
+// Needed mainly for logging since the OSThreadId is an opaque type
+INLINE_HEADER TaskId
+serialisableTaskId (Task *task
+#if !defined(THREADED_RTS)
+                               STG_UNUSED
+#endif
+                                         )
+{
+#if defined(THREADED_RTS)
+    return serialiseTaskId(task->id);
+#else
+    return (TaskId) (size_t) task;
 #endif
 }
 

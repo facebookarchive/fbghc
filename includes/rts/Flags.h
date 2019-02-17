@@ -7,7 +7,7 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * ---------------------------------------------------------------------------*/
 
@@ -52,7 +52,8 @@ struct GC_FLAGS {
     rtsBool ringBell;
     rtsBool frontpanel;
 
-    int idleGCDelayTime;	/* in milliseconds */
+    Time    idleGCDelayTime;    /* units: TIME_RESOLUTION */
+    rtsBool doIdleGC;
 
     StgWord heapBase;           /* address to ask the OS for memory */
 };
@@ -77,7 +78,7 @@ struct DEBUG_FLAGS {
 };
 
 struct COST_CENTRE_FLAGS {
-    unsigned int	    doCostCentres;
+    nat	    doCostCentres;
 # define COST_CENTRES_SUMMARY	1
 # define COST_CENTRES_VERBOSE	2 /* incl. serial time profile */
 # define COST_CENTRES_ALL	3
@@ -88,7 +89,7 @@ struct COST_CENTRE_FLAGS {
 };
 
 struct PROFILING_FLAGS {
-    unsigned int	doHeapProfile;
+    nat	doHeapProfile;
 # define NO_HEAP_PROFILING	0	/* N.B. Used as indexes into arrays */
 # define HEAP_BY_CCS		1
 # define HEAP_BY_MOD		2
@@ -99,8 +100,8 @@ struct PROFILING_FLAGS {
 
 # define HEAP_BY_CLOSURE_TYPE   8
 
-    nat                 profileInterval;      /* delta between samples (in ms) */
-    nat                 profileIntervalTicks; /* delta between samples (in 'ticks') */
+    Time                heapProfileInterval; /* time between samples */
+    nat                 heapProfileIntervalTicks; /* ticks between samples (derived) */
     rtsBool             includeTSOs;
 
 
@@ -127,17 +128,29 @@ struct PROFILING_FLAGS {
 struct TRACE_FLAGS {
     int tracing;
     rtsBool timestamp;      /* show timestamp in stderr output */
-
     rtsBool scheduler;      /* trace scheduler events */
+    rtsBool gc;             /* trace GC events */
+    rtsBool sparks_sampled; /* trace spark events by a sampled method */
+    rtsBool sparks_full;    /* trace spark events 100% accurately */
+    rtsBool user;           /* trace user events (emitted from Haskell code) */
 };
 
 struct CONCURRENT_FLAGS {
-    int ctxtSwitchTime;		/* in milliseconds */
-    int ctxtSwitchTicks;	/* derived */
+    Time ctxtSwitchTime;         /* units: TIME_RESOLUTION */
+    int ctxtSwitchTicks;         /* derived */
 };
 
+/*
+ * The tickInterval is the time interval between "ticks", ie.
+ * timer signals (see Timer.{c,h}).  It is the frequency at
+ * which we sample CCCS for profiling.
+ *
+ * It is changed by the +RTS -V<secs> flag.
+ */
+#define DEFAULT_TICK_INTERVAL USToTime(10000)
+
 struct MISC_FLAGS {
-    int tickInterval;     /* in milliseconds */
+    Time    tickInterval;        /* units: TIME_RESOLUTION */
     rtsBool install_signal_handlers;
     rtsBool machineReadable;
     StgWord linkerMemBase;       /* address to ask the OS for memory
@@ -148,16 +161,24 @@ struct MISC_FLAGS {
 struct PAR_FLAGS {
   nat            nNodes;         /* number of threads to run simultaneously */
   rtsBool        migrate;        /* migrate threads between capabilities */
-  unsigned int   maxLocalSparks;
+  nat            maxLocalSparks;
   rtsBool        parGcEnabled;   /* enable parallel GC */
-  unsigned int   parGcGen;       /* do parallel GC in this generation
+  nat            parGcGen;       /* do parallel GC in this generation
                                   * and higher only */
   rtsBool        parGcLoadBalancingEnabled; 
                                  /* enable load-balancing in the
                                   * parallel GC */
-  unsigned int   parGcLoadBalancingGen;
+  nat            parGcLoadBalancingGen;
                                  /* do load-balancing in this
                                   * generation and higher only */
+
+  nat            parGcNoSyncWithIdle;
+                                 /* if a Capability has been idle for
+                                  * this many GCs, do not try to wake
+                                  * it up when doing a
+                                  * non-load-balancing parallel GC.
+                                  * (zero disables) */
+
   rtsBool        setAffinity;    /* force thread affinity with CPUs */
 };
 #endif /* THREADED_RTS */
@@ -244,7 +265,7 @@ extern RTS_FLAGS RtsFlags;
 extern int     prog_argc;
 extern char  **prog_argv;
 */
-extern int     rts_argc;  /* ditto */
-extern char   *rts_argv[];
+extern int      rts_argc;  /* ditto */
+extern char   **rts_argv;
 
 #endif	/* RTS_FLAGS_H */

@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  * 
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
 
@@ -35,7 +35,7 @@
 REGPARM1 void evacuate  (StgClosure **p);
 REGPARM1 void evacuate1 (StgClosure **p);
 
-extern lnat thunk_selector_depth;
+extern W_ thunk_selector_depth;
 
 #include "EndPrivate.h"
 

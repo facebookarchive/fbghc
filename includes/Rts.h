@@ -6,7 +6,7 @@
  * exposes externally.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * ---------------------------------------------------------------------------*/
 
@@ -15,6 +15,13 @@
 
 #ifdef __cplusplus
 extern "C" {
+#endif
+
+/* We include windows.h very early, as on Win64 the CONTEXT type has
+   fields "R8", "R9" and "R10", which goes bad if we've already
+   #define'd those names for our own purposes (in stg/Regs.h) */
+#if defined(HAVE_WINDOWS_H)
+#include <windows.h>
 #endif
 
 #ifndef IN_STG_CODE
@@ -136,29 +143,46 @@ void _assertFail(const char *filename, unsigned int linenum)
 #define USED_IF_NOT_THREADS
 #endif
 
-/*
- * Getting printf formats right for platform-dependent typedefs
- */
-#if SIZEOF_LONG == 8
-#define FMT_Word64 "lu"
-#define FMT_Int64  "ld"
+#define FMT_SizeT    "zu"
+#define FMT_HexSizeT "zx"
+
+/* -----------------------------------------------------------------------------
+   Time values in the RTS
+   -------------------------------------------------------------------------- */
+
+// For most time values in the RTS we use a fixed resolution of nanoseconds,
+// normalising the time we get from platform-dependent APIs to this
+// resolution.
+#define TIME_RESOLUTION 1000000000
+typedef StgInt64 Time;
+
+#define TIME_MAX HS_INT64_MAX
+
+#if TIME_RESOLUTION == 1000000000
+// I'm being lazy, but it's awkward to define fully general versions of these
+#define TimeToUS(t)      ((t) / 1000)
+#define TimeToNS(t)      (t)
+#define USToTime(t)      ((Time)(t) * 1000)
+#define NSToTime(t)      ((Time)(t))
 #else
-#if defined(mingw32_HOST_OS)
-/* mingw doesn't understand %llu/%lld - it treats them as 32-bit
-   rather than 64-bit */
-#define FMT_Word64 "I64u"
-#define FMT_Int64  "I64d"
-#else
-#define FMT_Word64 "llu"
-#define FMT_Int64  "lld"
+#error Fix TimeToNS(), TimeToUS() etc.
 #endif
-#endif
+
+#define SecondsToTime(t) ((Time)(t) * TIME_RESOLUTION)
+#define TimeToSeconds(t) ((t) / TIME_RESOLUTION)
+
+// Use instead of SecondsToTime() when we have a floating-point
+// seconds value, to avoid truncating it.
+INLINE_HEADER Time fsecondsToTime (double t)
+{
+    return (Time)(t * TIME_RESOLUTION);
+}
 
 /* -----------------------------------------------------------------------------
    Include everything STG-ish
    -------------------------------------------------------------------------- */
 
-/* System headers: stdlib.h is eeded so that we can use NULL.  It must
+/* System headers: stdlib.h is needed so that we can use NULL.  It must
  * come after MachRegs.h, because stdlib.h might define some inline
  * functions which may only be defined after register variables have
  * been declared.
@@ -179,12 +203,12 @@ void _assertFail(const char *filename, unsigned int linenum)
 #include "rts/SpinLock.h"
 
 #include "rts/Messages.h"
+#include "rts/Threads.h"
 
 /* Storage format definitions */
 #include "rts/storage/FunTypes.h"
 #include "rts/storage/InfoTables.h"
 #include "rts/storage/Closures.h"
-#include "rts/storage/Liveness.h"
 #include "rts/storage/ClosureTypes.h"
 #include "rts/storage/TSO.h"
 #include "stg/MiscClosures.h" /* InfoTables, closures etc. defined in the RTS */
@@ -203,29 +227,46 @@ void _assertFail(const char *filename, unsigned int linenum)
 #include "rts/Flags.h"
 #include "rts/Adjustor.h"
 #include "rts/FileLock.h"
+#include "rts/GetTime.h"
 #include "rts/Globals.h"
 #include "rts/IOManager.h"
 #include "rts/Linker.h"
-#include "rts/Threads.h"
 #include "rts/Ticky.h"
 #include "rts/Timer.h"
 #include "rts/Stable.h"
 #include "rts/TTY.h"
 #include "rts/Utils.h"
 #include "rts/PrimFloat.h"
+#include "rts/Main.h"
 
 /* Misc stuff without a home */
 DLL_IMPORT_RTS extern char **prog_argv;	/* so we can get at these from Haskell */
 DLL_IMPORT_RTS extern int    prog_argc;
 DLL_IMPORT_RTS extern char  *prog_name;
 
-void stackOverflow(void);
+#ifdef mingw32_HOST_OS
+// We need these two from Haskell too
+void getWin32ProgArgv(int *argc, wchar_t **argv[]);
+void setWin32ProgArgv(int argc, wchar_t *argv[]);
+#endif
+
+void stackOverflow(StgTSO* tso);
 
 void stg_exit(int n) GNU_ATTRIBUTE(__noreturn__);
 
 #ifndef mingw32_HOST_OS
 int stg_sig_install (int, int, void *);
 #endif
+
+/* -----------------------------------------------------------------------------
+   Ways
+   -------------------------------------------------------------------------- */
+
+// Returns non-zero if the RTS is a profiling version
+int rts_isProfiled(void);
+
+// Returns non-zero if the RTS is a dynamically-linked version
+int rts_isDynamic(void);
 
 /* -----------------------------------------------------------------------------
    RTS Exit codes
@@ -241,9 +282,6 @@ int stg_sig_install (int, int, void *);
 /* -----------------------------------------------------------------------------
    Miscellaneous garbage
    -------------------------------------------------------------------------- */
-
-/* declarations for runtime flags/values */
-#define MAX_RTS_ARGS 32
 
 #ifdef DEBUG
 #define TICK_VAR(arity) \
@@ -277,6 +315,12 @@ TICK_VAR(2)
 #define DEBUG_ONLY(s) s
 #else
 #define DEBUG_ONLY(s) doNothing()
+#endif
+
+#ifdef DEBUG
+#define DEBUG_IS_ON   1
+#else
+#define DEBUG_IS_ON   0
 #endif
 
 /* -----------------------------------------------------------------------------

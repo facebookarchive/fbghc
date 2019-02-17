@@ -21,6 +21,10 @@ void initStorage(void);
 void exitStorage(void);
 void freeStorage(rtsBool free_heap);
 
+// Adding more Capabilities later: this function allocates nurseries
+// and initialises other storage-related things.
+void storageAddCapabilities (nat from, nat to);
+
 /* -----------------------------------------------------------------------------
    Storage manager state
    -------------------------------------------------------------------------- */
@@ -33,7 +37,7 @@ doYouWantToGC( Capability *cap )
 }
 
 /* for splitting blocks groups in two */
-bdescr * splitLargeBlock (bdescr *bd, nat blocks);
+bdescr * splitLargeBlock (bdescr *bd, W_ blocks);
 
 /* -----------------------------------------------------------------------------
    Generational garbage collection support
@@ -65,10 +69,11 @@ extern Mutex sm_mutex;
 #endif
 
 /* -----------------------------------------------------------------------------
-   The write barrier for MVARs
+   The write barrier for MVARs and TVARs
    -------------------------------------------------------------------------- */
 
 void dirty_MVAR(StgRegTable *reg, StgClosure *p);
+void dirty_TVAR(Capability *cap, StgTVar *p);
 
 /* -----------------------------------------------------------------------------
    Nursery manipulation
@@ -77,27 +82,28 @@ void dirty_MVAR(StgRegTable *reg, StgClosure *p);
 extern nursery *nurseries;
 
 void     resetNurseries       ( void );
-lnat     clearNurseries       ( void );
-void     resizeNurseries      ( nat blocks );
-void     resizeNurseriesFixed ( nat blocks );
-lnat     countNurseryBlocks   ( void );
+void     clearNursery         ( Capability *cap );
+void     resizeNurseries      ( W_ blocks );
+void     resizeNurseriesFixed ( W_ blocks );
+W_       countNurseryBlocks   ( void );
 
 /* -----------------------------------------------------------------------------
    Stats 'n' DEBUG stuff
    -------------------------------------------------------------------------- */
 
-lnat    calcAllocated  (rtsBool count_nurseries);
-lnat    countOccupied  (bdescr *bd);
-lnat    calcNeeded     (void);
+void  updateNurseriesStats (void);
+W_    countLargeAllocated  (void);
+W_    countOccupied        (bdescr *bd);
+W_    calcNeeded           (rtsBool force_major, W_ *blocks_needed);
 
-lnat    gcThreadLiveWords  (nat i, nat g);
-lnat    gcThreadLiveBlocks (nat i, nat g);
+W_    gcThreadLiveWords  (nat i, nat g);
+W_    gcThreadLiveBlocks (nat i, nat g);
 
-lnat    genLiveWords  (generation *gen);
-lnat    genLiveBlocks (generation *gen);
+W_    genLiveWords  (generation *gen);
+W_    genLiveBlocks (generation *gen);
 
-lnat    calcLiveBlocks (void);
-lnat    calcLiveWords  (void);
+W_    calcLiveBlocks (void);
+W_    calcLiveWords  (void);
 
 /* ----------------------------------------------------------------------------
    Storage manager internal APIs and globals
@@ -109,8 +115,28 @@ extern bdescr *exec_block;
 
 void move_STACK  (StgStack *src, StgStack *dest);
 
-extern StgClosure * caf_list;
-extern StgClosure * revertible_caf_list;
+/* -----------------------------------------------------------------------------
+   CAF lists
+   
+   dyn_caf_list  (CAFs chained through static_link)
+      This is a chain of all CAFs in the program, used for
+      dynamically-linked GHCi.
+      See Note [dyn_caf_list].
+
+   debug_caf_list  (CAFs chained through saved_info)
+      A chain of all *live* CAFs in the program, that does not keep
+      the CAFs alive.  Used for detecting when we enter a GC'd CAF,
+      and to give diagnostics with +RTS -DG.
+
+   revertible_caf_list  (CAFs chained through static_link)
+      A chain of CAFs in object code loaded with the RTS linker.
+      These CAFs can be reverted to their unevaluated state using
+      revertCAFs.
+ --------------------------------------------------------------------------- */
+
+extern StgIndStatic * dyn_caf_list;
+extern StgIndStatic * debug_caf_list;
+extern StgIndStatic * revertible_caf_list;
 
 #include "EndPrivate.h"
 

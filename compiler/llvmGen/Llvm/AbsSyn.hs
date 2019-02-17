@@ -4,6 +4,7 @@
 
 module Llvm.AbsSyn where
 
+import Llvm.MetaData
 import Llvm.Types
 
 import Unique
@@ -30,6 +31,9 @@ data LlvmModule = LlvmModule  {
 
     -- | LLVM Alias type definitions.
     modAliases   :: [LlvmAlias],
+
+    -- | LLVM meta data.
+    modMeta      :: [MetaDecl],
 
     -- | Global variables to include in the module.
     modGlobals   :: [LMGlobal],
@@ -59,8 +63,24 @@ data LlvmFunction = LlvmFunction {
     funcBody  :: LlvmBlocks
   }
 
-type LlvmFunctions  = [LlvmFunction]
+type LlvmFunctions = [LlvmFunction]
 
+-- | LLVM ordering types for synchronization purposes. (Introduced in LLVM
+-- 3.0). Please see the LLVM documentation for a better description.
+data LlvmSyncOrdering
+  -- | Some partial order of operations exists.
+  = SyncUnord
+  -- | A single total order for operations at a single address exists.
+  | SyncMonotonic
+  -- | Acquire synchronization operation.
+  | SyncAcquire
+  -- | Release synchronization operation.
+  | SyncRelease
+  -- | Acquire + Release synchronization operation.
+  | SyncAcqRel
+  -- | Full sequential Consistency operation.
+  | SyncSeqCst
+  deriving (Show, Eq)
 
 -- | Llvm Statements
 data LlvmStatement
@@ -70,6 +90,11 @@ data LlvmStatement
       * source: Source expression
   -}
   = Assignment LlvmVar LlvmExpression
+
+  {- |
+    Memory fence operation
+  -}
+  | Fence Bool LlvmSyncOrdering
 
   {- |
     Always branch to the target label
@@ -132,7 +157,18 @@ data LlvmStatement
   -}
   | Expr LlvmExpression
 
-  deriving (Show, Eq)
+  {- |
+    A nop LLVM statement. Useful as its often more efficient to use this
+    then to wrap LLvmStatement in a Just or [].
+  -}
+  | Nop
+
+  {- |
+    A LLVM statement with metadata attached to it.
+  -}
+  | MetaStmt [MetaAnnot] LlvmStatement
+
+  deriving (Eq)
 
 
 -- | Llvm Expressions
@@ -159,6 +195,21 @@ data LlvmExpression
       * right: right operand
   -}
   | Compare LlvmCmpOp LlvmVar LlvmVar
+
+  {- |
+    Extract a scalar element from a vector
+      * val: The vector
+      * idx: The index of the scalar within the vector
+  -}
+  | Extract LlvmVar LlvmVar
+
+  {- |
+    Insert a scalar element into a vector
+      * val:   The source vector
+      * elt:   The scalar to insert
+      * index: The index at which to insert the scalar
+  -}
+  | Insert LlvmVar LlvmVar LlvmVar
 
   {- |
     Allocate amount * sizeof(tp) bytes on the heap
@@ -201,6 +252,17 @@ data LlvmExpression
   | Call LlvmCallType LlvmVar [LlvmVar] [LlvmFuncAttr]
 
   {- |
+    Call a function as above but potentially taking metadata as arguments.
+      * tailJumps: CallType to signal if the function should be tail called
+      * fnptrval:  An LLVM value containing a pointer to a function to be
+                   invoked. Can be indirect. Should be LMFunction type.
+      * args:      Arguments that may include metadata.
+      * attrs:     A list of function attributes for the call. Only NoReturn,
+                   NoUnwind, ReadOnly and ReadNone are valid here.
+  -}
+  | CallM LlvmCallType LlvmVar [MetaExpr] [LlvmFuncAttr]
+
+  {- |
     Merge variables from different basic blocks which are predecessors of this
     basic block in a new variable of type tp.
       * tp:         type of the merged variable, must match the types of the
@@ -212,16 +274,21 @@ data LlvmExpression
 
   {- |
     Inline assembly expression. Syntax is very similar to the style used by GCC.
-      * assembly:   Actual inline assembly code.
-      * contraints: Operand constraints.
-      * return ty:  Return type of function.
-      * vars:       Any variables involved in the assembly code.
-      * sideeffect: Does the expression have side effects not visible from the
-                    constraints list.
-      * alignstack: Should the stack be conservatively aligned before this
-                    expression is executed.
+      * assembly:    Actual inline assembly code.
+      * constraints: Operand constraints.
+      * return ty:   Return type of function.
+      * vars:        Any variables involved in the assembly code.
+      * sideeffect:  Does the expression have side effects not visible from the
+                     constraints list.
+      * alignstack:  Should the stack be conservatively aligned before this
+                     expression is executed.
   -}
   | Asm LMString LMString LlvmType [LlvmVar] Bool Bool
 
-  deriving (Show, Eq)
+  {- |
+    A LLVM expression with metadata attached to it.
+  -}
+  | MExpr [MetaAnnot] LlvmExpression
+
+  deriving (Eq)
 

@@ -1,7 +1,7 @@
 
 module CmmType
     ( CmmType   -- Abstract
-    , b8, b16, b32, b64, f32, f64, bWord, bHalfWord, gcWord
+    , b8, b16, b32, b64, b128, b256, b512, f32, f64, bWord, bHalfWord, gcWord
     , cInt, cLong
     , cmmBits, cmmFloat
     , typeWidth, cmmEqType, cmmEqType_ignoring_ptrhood
@@ -10,13 +10,27 @@ module CmmType
     , Width(..)
     , widthInBits, widthInBytes, widthInLog, widthFromBytes
     , wordWidth, halfWordWidth, cIntWidth, cLongWidth
+    , halfWordMask
     , narrowU, narrowS
+    , rEP_CostCentreStack_mem_alloc
+    , rEP_CostCentreStack_scc_count
+    , rEP_StgEntCounter_allocs
+    , rEP_StgEntCounter_allocd
+
+    , ForeignHint(..)
+
+    , Length
+    , vec, vec2, vec4, vec8, vec16
+    , vec2f64, vec2b64, vec4f32, vec4b32, vec8b16, vec16b8
+    , cmmVec
+    , vecLength, vecElemType
+    , isVecType
    )
 where
 
 #include "HsVersions.h"
 
-import Constants
+import DynFlags
 import FastString
 import Outputable
 
@@ -36,10 +50,11 @@ import Data.Int
 data CmmType    -- The important one!
   = CmmType CmmCat Width
 
-data CmmCat     -- "Category" (not exported)
-   = GcPtrCat   -- GC pointer
-   | BitsCat    -- Non-pointer
-   | FloatCat   -- Float
+data CmmCat                -- "Category" (not exported)
+   = GcPtrCat              -- GC pointer
+   | BitsCat               -- Non-pointer
+   | FloatCat              -- Float
+   | VecCat Length CmmCat  -- Vector
    deriving( Eq )
         -- See Note [Signed vs unsigned] at the end
 
@@ -47,12 +62,10 @@ instance Outputable CmmType where
   ppr (CmmType cat wid) = ppr cat <> ppr (widthInBits wid)
 
 instance Outputable CmmCat where
-  ppr FloatCat  = ptext $ sLit("F")
-  ppr _         = ptext $ sLit("I")
--- Temp Jan 08
---  ppr FloatCat        = ptext $ sLit("float")
---  ppr BitsCat   = ptext $ sLit("bits")
---  ppr GcPtrCat  = ptext $ sLit("gcptr")
+  ppr FloatCat       = ptext $ sLit("F")
+  ppr GcPtrCat       = ptext $ sLit("P")
+  ppr BitsCat        = ptext $ sLit("I")
+  ppr (VecCat n cat) = ppr cat <> text "x" <> ppr n <> text "V"
 
 -- Why is CmmType stratified?  For native code generation,
 -- most of the time you just want to know what sort of register
@@ -74,10 +87,15 @@ cmmEqType_ignoring_ptrhood :: CmmType -> CmmType -> Bool
 cmmEqType_ignoring_ptrhood (CmmType c1 w1) (CmmType c2 w2)
    = c1 `weak_eq` c2 && w1==w2
    where
-      FloatCat `weak_eq` FloatCat = True
-      FloatCat `weak_eq` _other   = False
-      _other   `weak_eq` FloatCat = False
-      _word1   `weak_eq` _word2   = True        -- Ignores GcPtr
+     weak_eq :: CmmCat -> CmmCat -> Bool
+     FloatCat         `weak_eq` FloatCat         = True
+     FloatCat         `weak_eq` _other           = False
+     _other           `weak_eq` FloatCat         = False
+     (VecCat l1 cat1) `weak_eq` (VecCat l2 cat2) = l1 == l2
+                                                   && cat1 `weak_eq` cat2
+     (VecCat {})      `weak_eq` _other           = False
+     _other           `weak_eq` (VecCat {})      = False
+     _word1           `weak_eq` _word2           = True        -- Ignores GcPtr
 
 --- Simple operations on CmmType -----
 typeWidth :: CmmType -> Width
@@ -89,23 +107,30 @@ cmmFloat = CmmType FloatCat
 
 -------- Common CmmTypes ------------
 -- Floats and words of specific widths
-b8, b16, b32, b64, f32, f64 :: CmmType
+b8, b16, b32, b64, b128, b256, b512, f32, f64 :: CmmType
 b8     = cmmBits W8
 b16    = cmmBits W16
 b32    = cmmBits W32
 b64    = cmmBits W64
+b128   = cmmBits W128
+b256   = cmmBits W256
+b512   = cmmBits W512
 f32    = cmmFloat W32
 f64    = cmmFloat W64
 
 -- CmmTypes of native word widths
-bWord, bHalfWord, gcWord :: CmmType
-bWord     = cmmBits wordWidth
-bHalfWord = cmmBits halfWordWidth
-gcWord    = CmmType GcPtrCat wordWidth
+bWord :: DynFlags -> CmmType
+bWord dflags = cmmBits (wordWidth dflags)
 
-cInt, cLong :: CmmType
-cInt  = cmmBits cIntWidth
-cLong = cmmBits cLongWidth
+bHalfWord :: DynFlags -> CmmType
+bHalfWord dflags = cmmBits (halfWordWidth dflags)
+
+gcWord :: DynFlags -> CmmType
+gcWord dflags = CmmType GcPtrCat (wordWidth dflags)
+
+cInt, cLong :: DynFlags -> CmmType
+cInt  dflags = cmmBits (cIntWidth  dflags)
+cLong dflags = cmmBits (cLongWidth dflags)
 
 
 ------------ Predicates ----------------
@@ -143,6 +168,8 @@ data Width   = W8 | W16 | W32 | W64
                         -- used in x86 native codegen only.
                         -- (we use Ord, so it'd better be in this order)
              | W128
+             | W256
+             | W512
              deriving (Eq, Ord, Show)
 
 instance Outputable Width where
@@ -154,32 +181,40 @@ mrStr W16  = sLit("W16")
 mrStr W32  = sLit("W32")
 mrStr W64  = sLit("W64")
 mrStr W128 = sLit("W128")
+mrStr W256 = sLit("W256")
+mrStr W512 = sLit("W512")
 mrStr W80  = sLit("W80")
 
 
 -------- Common Widths  ------------
-wordWidth, halfWordWidth :: Width
-wordWidth | wORD_SIZE == 4 = W32
-          | wORD_SIZE == 8 = W64
-          | otherwise      = panic "MachOp.wordRep: Unknown word size"
+wordWidth :: DynFlags -> Width
+wordWidth dflags
+ | wORD_SIZE dflags == 4 = W32
+ | wORD_SIZE dflags == 8 = W64
+ | otherwise             = panic "MachOp.wordRep: Unknown word size"
 
-halfWordWidth | wORD_SIZE == 4 = W16
-              | wORD_SIZE == 8 = W32
-              | otherwise      = panic "MachOp.halfWordRep: Unknown word size"
+halfWordWidth :: DynFlags -> Width
+halfWordWidth dflags
+ | wORD_SIZE dflags == 4 = W16
+ | wORD_SIZE dflags == 8 = W32
+ | otherwise             = panic "MachOp.halfWordRep: Unknown word size"
+
+halfWordMask :: DynFlags -> Integer
+halfWordMask dflags
+ | wORD_SIZE dflags == 4 = 0xFFFF
+ | wORD_SIZE dflags == 8 = 0xFFFFFFFF
+ | otherwise             = panic "MachOp.halfWordMask: Unknown word size"
 
 -- cIntRep is the Width for a C-language 'int'
-cIntWidth, cLongWidth :: Width
-#if SIZEOF_INT == 4
-cIntWidth = W32
-#elif  SIZEOF_INT == 8
-cIntWidth = W64
-#endif
-
-#if SIZEOF_LONG == 4
-cLongWidth = W32
-#elif  SIZEOF_LONG == 8
-cLongWidth = W64
-#endif
+cIntWidth, cLongWidth :: DynFlags -> Width
+cIntWidth dflags = case cINT_SIZE dflags of
+                   4 -> W32
+                   8 -> W64
+                   s -> panic ("cIntWidth: Unknown cINT_SIZE: " ++ show s)
+cLongWidth dflags = case cLONG_SIZE dflags of
+                    4 -> W32
+                    8 -> W64
+                    s -> panic ("cIntWidth: Unknown cLONG_SIZE: " ++ show s)
 
 widthInBits :: Width -> Int
 widthInBits W8   = 8
@@ -187,6 +222,8 @@ widthInBits W16  = 16
 widthInBits W32  = 32
 widthInBits W64  = 64
 widthInBits W128 = 128
+widthInBits W256 = 256
+widthInBits W512 = 512
 widthInBits W80  = 80
 
 widthInBytes :: Width -> Int
@@ -195,6 +232,8 @@ widthInBytes W16  = 2
 widthInBytes W32  = 4
 widthInBytes W64  = 8
 widthInBytes W128 = 16
+widthInBytes W256 = 32
+widthInBytes W512 = 64
 widthInBytes W80  = 10
 
 widthFromBytes :: Int -> Width
@@ -203,6 +242,8 @@ widthFromBytes 2  = W16
 widthFromBytes 4  = W32
 widthFromBytes 8  = W64
 widthFromBytes 16 = W128
+widthFromBytes 32 = W256
+widthFromBytes 64 = W512
 widthFromBytes 10 = W80
 widthFromBytes n  = pprPanic "no width for given number of bytes" (ppr n)
 
@@ -213,6 +254,8 @@ widthInLog W16  = 1
 widthInLog W32  = 2
 widthInLog W64  = 3
 widthInLog W128 = 4
+widthInLog W256 = 5
+widthInLog W512 = 6
 widthInLog W80  = panic "widthInLog: F80"
 
 -- widening / narrowing
@@ -231,6 +274,89 @@ narrowS W32 x = fromIntegral (fromIntegral x :: Int32)
 narrowS W64 x = fromIntegral (fromIntegral x :: Int64)
 narrowS _ _ = panic "narrowTo"
 
+-----------------------------------------------------------------------------
+--              SIMD
+-----------------------------------------------------------------------------
+
+type Length = Int
+
+vec :: Length -> CmmType -> CmmType
+vec l (CmmType cat w) = CmmType (VecCat l cat) vecw
+  where
+    vecw :: Width
+    vecw = widthFromBytes (l*widthInBytes w)
+
+vec2, vec4, vec8, vec16 :: CmmType -> CmmType
+vec2  = vec 2
+vec4  = vec 4
+vec8  = vec 8
+vec16 = vec 16
+
+vec2f64, vec2b64, vec4f32, vec4b32, vec8b16, vec16b8 :: CmmType
+vec2f64 = vec 2 f64
+vec2b64 = vec 2 b64
+vec4f32 = vec 4 f32
+vec4b32 = vec 4 b32
+vec8b16 = vec 8 b16
+vec16b8 = vec 16 b8
+
+cmmVec :: Int -> CmmType -> CmmType
+cmmVec n (CmmType cat w) =
+    CmmType (VecCat n cat) (widthFromBytes (n*widthInBytes w))
+
+vecLength :: CmmType -> Length
+vecLength (CmmType (VecCat l _) _) = l
+vecLength _                        = panic "vecLength: not a vector"
+
+vecElemType :: CmmType -> CmmType
+vecElemType (CmmType (VecCat l cat) w) = CmmType cat scalw
+  where
+    scalw :: Width
+    scalw = widthFromBytes (widthInBytes w `div` l)
+vecElemType _ = panic "vecElemType: not a vector"
+
+isVecType :: CmmType -> Bool
+isVecType (CmmType (VecCat {}) _) = True
+isVecType _                       = False
+
+-------------------------------------------------------------------------
+-- Hints
+
+-- Hints are extra type information we attach to the arguments and
+-- results of a foreign call, where more type information is sometimes
+-- needed by the ABI to make the correct kind of call.
+
+data ForeignHint
+  = NoHint | AddrHint | SignedHint
+  deriving( Eq )
+        -- Used to give extra per-argument or per-result
+        -- information needed by foreign calling conventions
+
+-------------------------------------------------------------------------
+
+-- These don't really belong here, but I don't know where is best to
+-- put them.
+
+rEP_CostCentreStack_mem_alloc :: DynFlags -> CmmType
+rEP_CostCentreStack_mem_alloc dflags
+    = cmmBits (widthFromBytes (pc_REP_CostCentreStack_mem_alloc pc))
+    where pc = sPlatformConstants (settings dflags)
+
+rEP_CostCentreStack_scc_count :: DynFlags -> CmmType
+rEP_CostCentreStack_scc_count dflags
+    = cmmBits (widthFromBytes (pc_REP_CostCentreStack_scc_count pc))
+    where pc = sPlatformConstants (settings dflags)
+
+rEP_StgEntCounter_allocs :: DynFlags -> CmmType
+rEP_StgEntCounter_allocs dflags
+    = cmmBits (widthFromBytes (pc_REP_StgEntCounter_allocs pc))
+    where pc = sPlatformConstants (settings dflags)
+
+rEP_StgEntCounter_allocd :: DynFlags -> CmmType
+rEP_StgEntCounter_allocd dflags
+    = cmmBits (widthFromBytes (pc_REP_StgEntCounter_allocd pc))
+    where pc = sPlatformConstants (settings dflags)
+
 -------------------------------------------------------------------------
 {-      Note [Signed vs unsigned]
         ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -244,7 +370,7 @@ definition of a function is not visible at all of its call sites, so
 the compiler cannot infer the hints.
 
 Here in Cmm, we're taking a slightly different approach.  We include
-the int vs. float hint in the MachRep, because (a) the majority of
+the int vs. float hint in the CmmType, because (a) the majority of
 platforms have a strong distinction between float and int registers,
 and (b) we don't want to do any heavyweight hint-inference in the
 native code backend in order to get good code.  We're treating the
@@ -272,7 +398,7 @@ of analysis that propagates hints around.  In Cmm we don't want to
 have to do this, so we plump for having richer types and keeping the
 type information consistent.
 
-If signed/unsigned hints are missing from MachRep, then the only
+If signed/unsigned hints are missing from CmmType, then the only
 choice we have is (a), because we don't know whether the result of an
 operation should be sign- or zero-extended.
 
@@ -287,7 +413,7 @@ convention can specify that signed 8-bit quantities are passed as
 sign-extended 32 bit quantities, for example (this is the case on the
 PowerPC).  So we *do* need sign information on foreign call arguments.
 
-Pros for adding signed vs. unsigned to MachRep:
+Pros for adding signed vs. unsigned to CmmType:
 
   - It would let us use convention (b) above, and get easier
     code generation for extending loads.
@@ -300,10 +426,10 @@ Cons:
 
   - More complexity
 
-  - What is the MachRep for a VanillaReg?  Currently it is
+  - What is the CmmType for a VanillaReg?  Currently it is
     always wordRep, but now we have to decide whether it is
     signed or unsigned.  The same VanillaReg can thus have
-    different MachReps in different parts of the program.
+    different CmmType in different parts of the program.
 
   - Extra coercions cluttering up expressions.
 

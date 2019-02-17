@@ -5,7 +5,7 @@
   <sect2 id="replacing-phases">
     <title>Replacing the program for one or more phases</title>
     <indexterm><primary>phases, changing</primary></indexterm>
-    
+
     <para>You may specify that a different program be used for one
     of the phases of the compilation system, in place of whatever
     the <command>ghc</command> has wired into it.  For example, you
@@ -135,6 +135,17 @@
             is the program <literal>windres</literal>, which is supplied with a
             GHC installation. See <option>-fno-embed-manifest</option> in <xref
               linkend="options-linker" />.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>-pgmlibtool</option> <replaceable>cmd</replaceable>
+          <indexterm><primary><option>-pgmlibtool</option></primary></indexterm>
+        </term>
+        <listitem>
+          <para>Use <replaceable>cmd</replaceable> as the libtool command 
+          (when using <option>-staticlib</option> only).</para>
         </listitem>
       </varlistentry>
     </variablelist>
@@ -387,6 +398,21 @@ $ cat foo.hspp</screen>
 
       <varlistentry>
         <term>
+          <constant>&lowbar;&lowbar;GLASGOW&lowbar;HASKELL&lowbar;LLVM&lowbar;&lowbar;</constant>
+          <indexterm><primary><constant>&lowbar;&lowbar;GLASGOW&lowbar;HASKELL&lowbar;LLVM&lowbar;&lowbar;</constant></primary></indexterm>
+        </term>
+        <listitem>
+          <para>Only defined when <option>-fllvm</option> is specified. When GHC
+          is using version
+          <literal><replaceable>x</replaceable>.<replaceable>y</replaceable>.<replaceable>z</replaceable></literal>
+          of LLVM, the value of
+          <constant>&lowbar;&lowbar;GLASGOW&lowbar;HASKELL&lowbar;LLVM&lowbar;&lowbar;</constant>
+          is the integer <replaceable>xy</replaceable>.</para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
           <constant>&lowbar;&lowbar;PARALLEL&lowbar;HASKELL&lowbar;&lowbar;</constant>
           <indexterm><primary><constant>&lowbar;&lowbar;PARALLEL&lowbar;HASKELL&lowbar;&lowbar;</constant></primary></indexterm>
         </term>
@@ -409,7 +435,7 @@ $ cat foo.hspp</screen>
           for Windows, <literal>solaris</literal>, etc.).</para>
         </listitem>
       </varlistentry>
-        
+
       <varlistentry>
         <term>
           <constant><replaceable>arch</replaceable>_HOST_ARCH=1</constant>
@@ -437,7 +463,7 @@ $ cat foo.hspp</screen>
 <programlisting>strmod = "\
 \ p \
 \ "</programlisting>
-      
+
       <para>don't work with <option>-cpp</option>;
       <filename>/usr/bin/cpp</filename> elides the backslash-newline
       pairs.</para>
@@ -452,7 +478,7 @@ $ cat foo.hspp</screen>
 
   <sect2 id="pre-processor">
     <title>Options affecting a Haskell pre-processor</title>
-    
+
     <indexterm><primary>pre-processing: custom</primary></indexterm>
     <indexterm><primary>Pre-processor options</primary></indexterm>
 
@@ -531,8 +557,8 @@ $ cat foo.hspp</screen>
           <indexterm><primary><option>-fasm</option></primary></indexterm>
         </term>
         <listitem>
-          <para>Use GHC's native code generator rather than
-          compiling via LLVM.
+          <para>Use GHC's <link linkend="native-code-gen">native code generator
+            </link>rather than compiling via LLVM.
           <option>-fasm</option> is the default.</para>
         </listitem>
       </varlistentry>
@@ -543,12 +569,12 @@ $ cat foo.hspp</screen>
           <indexterm><primary><option>-fllvm</option></primary></indexterm>
         </term>
         <listitem>
-          <para>Compile via LLVM instead of using the native code
-          generator. This will generally take slightly longer than the
-          native code generator to compile.
-          Produced code is generally the same speed or faster
-          than the other two code generators. Compiling via LLVM
-          requires LLVM version 2.7 or later to be on the path.</para>
+          <para>Compile via <link linkend="llvm-code-gen">LLVM</link>instead
+          of using the native code generator. This will generally take slightly
+          longer than the native code generator to compile. Produced code is
+          generally the same speed or faster than the other two code
+          generators. Compiling via LLVM requires LLVM to be on the
+          path.</para>
         </listitem>
       </varlistentry>
 
@@ -597,10 +623,9 @@ $ cat foo.hspp</screen>
         </term>
         <listitem>
           <para>Generate position-independent code (code that can be put into
-          shared libraries). This currently works on Linux x86 and x86-64 when
-          using the native code generator (-fasm).
-          On Windows, position-independent code is never used
-          so the flag is a no-op on that platform.</para>
+          shared libraries). This currently works on Linux x86 and x86-64. On
+          Windows, position-independent code is never used so the flag is a
+          no-op on that platform.</para>
         </listitem>
       </varlistentry>
 
@@ -679,7 +704,7 @@ $ cat foo.hspp</screen>
         </term>
         <listitem>
           <para>Omits the link step.  This option can be used with
-            <option>&ndash;&ndash;make</option> to avoid the automatic linking
+            <option>--make</option> to avoid the automatic linking
             that takes place if the program contains a <literal>Main</literal>
             module.</para>
         </listitem>
@@ -707,12 +732,27 @@ $ cat foo.hspp</screen>
           <indexterm><primary><option>-framework</option></primary></indexterm>
         </term>
         <listitem>
-          <para>On Darwin/MacOS X only, link in the framework <replaceable>name</replaceable>.
+          <para>On Darwin/OS X/iOS only, link in the framework <replaceable>name</replaceable>.
           This option corresponds to the <option>-framework</option> option for Apple's Linker.
           Please note that frameworks and packages are two different things - frameworks don't
           contain any haskell code. Rather, they are Apple's way of packaging shared libraries.
           To link to Apple's &ldquo;Carbon&rdquo; API, for example, you'd use
           <option>-framework Carbon</option>.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>
+          <option>-staticlib</option>
+          <indexterm><primary><option>-staticlib</option></primary></indexterm>
+        </term>
+        <listitem>
+          <para>On Darwin/OS X/iOS only, link all passed files into a static library suitable
+          for linking into an iOS (when using a cross-compiler) or Mac Xcode project. To control
+          the name, use the <option>-o</option> <replaceable>name</replaceable> option as usual.
+          The default name is <literal>liba.a</literal>.
+          This should nearly always be passed when compiling for iOS with a cross-compiler.
           </para>
         </listitem>
       </varlistentry>
@@ -735,7 +775,7 @@ $ cat foo.hspp</screen>
           <indexterm><primary><option>-framework-path</option></primary></indexterm>
         </term>
         <listitem>
-          <para>On Darwin/MacOS X only, prepend the directory <replaceable>dir</replaceable> to
+          <para>On Darwin/OS X/iOS only, prepend the directory <replaceable>dir</replaceable> to
           the framework directories path. This option corresponds to the <option>-F</option>
           option for Apple's Linker (<option>-F</option> already means something else for GHC).</para>
         </listitem>
@@ -845,8 +885,8 @@ $ cat foo.hspp</screen>
             allows you to do so.  The  <replaceable>thing</replaceable> can be one of:
             <itemizedlist>
         <listitem><para>A lower-case identifier <literal>foo</literal>.  GHC assumes that the main function is <literal>Main.foo</literal>.</para></listitem>
-        <listitem><para>An module name <literal>A</literal>.  GHC assumes that the main function is <literal>A.main</literal>.</para></listitem>
-        <listitem><para>An qualified name <literal>A.foo</literal>.  GHC assumes that the main function is <literal>A.foo</literal>.</para></listitem>
+        <listitem><para>A module name <literal>A</literal>.  GHC assumes that the main function is <literal>A.main</literal>.</para></listitem>
+        <listitem><para>A qualified name <literal>A.foo</literal>.  GHC assumes that the main function is <literal>A.foo</literal>.</para></listitem>
         </itemizedlist>
             Strictly speaking, <option>-main-is</option> is not a link-phase flag at all; it has no effect on the link step.
             The flag must be specified when compiling the module containing the specified main function (e.g. module <literal>A</literal>
@@ -855,11 +895,11 @@ $ cat foo.hspp</screen>
             However, if all the modules are otherwise up to date, you may need to force
             recompilation both of the module where the new "main" is, and of the
             module where the "main" function used to be;
-            <literal>ghc</literal> is not clever 
+            <literal>ghc</literal> is not clever
             enough to figure out that they both need recompiling.  You can
             force recompilation by removing the object file, or by using the
             <option>-fforce-recomp</option> flag.
-            </para> 
+            </para>
         </listitem>
       </varlistentry>
 
@@ -891,6 +931,18 @@ $ cat foo.hspp</screen>
           <literal>Main</literal> module present (normally the
           compiler will not attempt linking when there is no
           <literal>Main</literal>).</para>
+
+          <para>The flags <option>-rtsopts</option>
+            and <option>-with-rtsopts</option> have no effect when
+            used with <option>-no-hs-main</option>, because they are
+            implemented by changing the definition
+            of <literal>main</literal> that GHC generates.  See
+            <xref linkend="using-own-main" /> for how to get the
+            effect of <option>-rtsopts</option>
+            and <option>-with-rtsopts</option> when using your
+            own <literal>main</literal>.
+          </para>
+
         </listitem>
       </varlistentry>
 
@@ -928,15 +980,26 @@ $ cat foo.hspp</screen>
           <para>The threaded runtime system provides the following
           benefits:</para>
 
-          <itemizedlist> 
+          <itemizedlist>
             <listitem>
-              <para>Parallelism<indexterm><primary>parallelism</primary></indexterm> on a multiprocessor<indexterm><primary>multiprocessor</primary></indexterm><indexterm><primary>SMP</primary></indexterm> or multicore<indexterm><primary>multicore</primary></indexterm>
-              machine.  See <xref linkend="using-smp" />.</para>
-
-              <para>The ability to make a foreign call that does not
-              block all other Haskell threads, and to invoke
-              foreign-exported Haskell functions from multiple OS
-              threads. See <xref linkend="ffi-threads" />.</para>
+              <para>It enables the <option>-N</option><indexterm><primary><option>-N<replaceable>x</replaceable></option></primary><secondary>RTS option</secondary></indexterm> RTS option to be
+                used, which allows threads to run in
+                parallel<indexterm><primary>parallelism</primary></indexterm>
+                on a
+                multiprocessor<indexterm><primary>multiprocessor</primary></indexterm><indexterm><primary>SMP</primary></indexterm>
+                or
+                multicore<indexterm><primary>multicore</primary></indexterm>
+                machine.  See <xref linkend="using-smp" />.</para>
+            </listitem>
+            <listitem>
+              <para>If a thread makes a foreign call (and the call is
+                not marked <literal>unsafe</literal>), then other
+                Haskell threads in the program will continue to run
+                while the foreign call is in progress.
+                Additionally, <literal>foreign export</literal>ed
+                Haskell functions may be called from multiple OS
+                threads simultaneously.  See
+                <xref linkend="ffi-threads" />.</para>
             </listitem>
           </itemizedlist>
         </listitem>
@@ -1024,6 +1087,12 @@ $ cat foo.hspp</screen>
             security problem.  For this reason, GHC 7.0.1 and later
             default to <option>-rtsops=some</option>.
           </para>
+
+          <para>
+            Note that <option>-rtsopts</option> has no effect when
+            used with <option>-no-hs-main</option>; see
+            <xref linkend="using-own-main" /> for details.
+          </para>
         </listitem>
       </varlistentry>
 
@@ -1038,9 +1107,15 @@ $ cat foo.hspp</screen>
             <option>-with-rtsopts="-H128m"</option> sets the default heap size to 128MB.
             This will always be the default heap size for this program, unless the user overrides it.
             (Depending on the setting of the <option>-rtsopts</option> option, the user might
-            not have the ability to change RTS options at run-time, in which case 
+            not have the ability to change RTS options at run-time, in which case
             <option>-with-rtsopts</option> would be the <emphasis>only</emphasis> way to set
             them.)
+          </para>
+
+          <para>
+            Note that <option>-with-rtsopts</option> has no effect when
+            used with <option>-no-hs-main</option>; see
+            <xref linkend="using-own-main" /> for details.
           </para>
         </listitem>
       </varlistentry>
@@ -1054,7 +1129,7 @@ $ cat foo.hspp</screen>
         <listitem>
           <para>On Windows, GHC normally generates a
             <firstterm>manifest</firstterm><indexterm><primary>manifest</primary>
-            </indexterm>file when linking a binary.  The
+            </indexterm> file when linking a binary.  The
             manifest is placed in the file
             <literal><replaceable>prog</replaceable>.exe.manifest</literal>
             where <replaceable>prog.exe</replaceable> is the name of the
@@ -1074,7 +1149,7 @@ $ cat foo.hspp</screen>
             system using the security control panel, but GHC by default
             generates binaries that don't depend on the user having disabled
             installer detection.</para>
-          
+
           <para>The <option>-fno-gen-manifest</option> disables generation of
             the manifest file.  One reason to do this would be if you had
             a manifest file of your own, for example.</para>
@@ -1086,7 +1161,7 @@ $ cat foo.hspp</screen>
             <option>-fno-embed-manifest</option>, see below.</para>
         </listitem>
       </varlistentry>
-          
+
       <varlistentry>
         <term>
           <option>-fno-embed-manifest</option>
@@ -1102,15 +1177,15 @@ $ cat foo.hspp</screen>
             </indexterm>; to see exactly what GHC does to embed the manifest,
             use the <option>-v</option> flag.  A GHC installation comes with
             its own copy of <literal>windres</literal> for this reason.</para>
-          
+
           <para>See also <option>-pgmwindres</option> (<xref
-              linkend="replacing-phases" />) and 
+              linkend="replacing-phases" />) and
             <option>-optwindres</option> (<xref
                                             linkend="forcing-options-through"
               />).</para>
         </listitem>
       </varlistentry>
-          
+
       <varlistentry>
         <term>
           <option>-fno-shared-implib</option>
@@ -1125,7 +1200,7 @@ $ cat foo.hspp</screen>
             disk-space cost of creating this import library, which can be substantial - it
             might require as much space as the code itself, as Haskell DLLs tend to export
             lots of symbols.</para>
-            
+
           <para>As long as you are happy to only be able to link to the DLL using
             <literal>GetProcAddress</literal> and friends, you can supply the
             <option>-fno-shared-implib</option> flag to disable the creation of the import
@@ -1140,7 +1215,7 @@ $ cat foo.hspp</screen>
           </indexterm>
         </term>
         <listitem>
-          <para>On Darwin/MacOS X, dynamic libraries are stamped at build time with an
+          <para>On Darwin/OS X, dynamic libraries are stamped at build time with an
               "install name", which is the ultimate install path of the library file.
               Any libraries or executables that subsequently link against it will pick
               up that path as their runtime search location for it. By default, ghc sets

@@ -32,19 +32,19 @@
 -- A useful example pass over Cmm is in nativeGen/MachCodeGen.hs
 --
 
+{-# OPTIONS_GHC -fno-warn-orphans #-}
 module PprCmmExpr
     ( pprExpr, pprLit
-    , pprExpr9 {-only to import in OldPprCmm. When it dies, remove the export -}
     )
 where
 
 import CmmExpr
-import CLabel
 
 import Outputable
 import FastString
 
 import Data.Maybe
+import Numeric ( fromRat )
 
 -----------------------------------------------------------------------------
 
@@ -71,14 +71,15 @@ instance Outputable GlobalReg where
 --
 
 pprExpr :: CmmExpr -> SDoc
-pprExpr e 
-    = case e of
-        CmmRegOff reg i -> 
-		pprExpr (CmmMachOp (MO_Add rep)
-			   [CmmReg reg, CmmLit (CmmInt (fromIntegral i) rep)])
-		where rep = typeWidth (cmmRegType reg)
-	CmmLit lit -> pprLit lit
-	_other     -> pprExpr1 e
+pprExpr e
+    = sdocWithDynFlags $ \dflags ->
+      case e of
+        CmmRegOff reg i ->
+                pprExpr (CmmMachOp (MO_Add rep)
+                           [CmmReg reg, CmmLit (CmmInt (fromIntegral i) rep)])
+                where rep = typeWidth (cmmRegType dflags reg)
+        CmmLit lit -> pprLit lit
+        _other     -> pprExpr1 e
 
 -- Here's the precedence table from CmmParse.y:
 -- %nonassoc '>=' '>' '<=' '<' '!=' '=='
@@ -133,14 +134,14 @@ infixMachOp8 (MO_U_Rem _)  = Just (char '%')
 infixMachOp8 _             = Nothing
 
 pprExpr9 :: CmmExpr -> SDoc
-pprExpr9 e = 
+pprExpr9 e =
    case e of
         CmmLit    lit       -> pprLit1 lit
-        CmmLoad   expr rep  -> ppr rep <> brackets( ppr expr )
+        CmmLoad   expr rep  -> ppr rep <> brackets (ppr expr)
         CmmReg    reg       -> ppr reg
         CmmRegOff  reg off  -> parens (ppr reg <+> char '+' <+> int off)
         CmmStackSlot a off  -> parens (ppr a   <+> char '+' <+> int off)
-	CmmMachOp mop args  -> genMachOp mop args
+        CmmMachOp mop args  -> genMachOp mop args
 
 genMachOp :: MachOp -> [CmmExpr] -> SDoc
 genMachOp mop args
@@ -158,7 +159,7 @@ genMachOp mop args
 
    | isJust (infixMachOp1 mop)
    || isJust (infixMachOp7 mop)
-   || isJust (infixMachOp8 mop)	 = parens (pprExpr (CmmMachOp mop args))
+   || isJust (infixMachOp8 mop)  = parens (pprExpr (CmmMachOp mop args))
 
    | otherwise = char '%' <> ppr_op <> parens (commafy (map pprExpr args))
         where ppr_op = text (map (\c -> if c == ' ' then '_' else c)
@@ -171,7 +172,7 @@ genMachOp mop args
 --
 infixMachOp :: MachOp -> Maybe SDoc
 infixMachOp mop
-	= case mop of
+        = case mop of
             MO_And    _ -> Just $ char '&'
             MO_Or     _ -> Just $ char '|'
             MO_Xor    _ -> Just $ char '^'
@@ -185,17 +186,19 @@ infixMachOp mop
 --  has the natural machine word size, we do not append the type
 --
 pprLit :: CmmLit -> SDoc
-pprLit lit = case lit of
+pprLit lit = sdocWithDynFlags $ \dflags ->
+             case lit of
     CmmInt i rep ->
         hcat [ (if i < 0 then parens else id)(integer i)
-             , ppUnless (rep == wordWidth) $
+             , ppUnless (rep == wordWidth dflags) $
                space <> dcolon <+> ppr rep ]
 
-    CmmFloat f rep     -> hsep [ rational f, dcolon, ppr rep ]
-    CmmLabel clbl      -> pprCLabel clbl
-    CmmLabelOff clbl i -> pprCLabel clbl <> ppr_offset i
-    CmmLabelDiffOff clbl1 clbl2 i -> pprCLabel clbl1 <> char '-'  
-                                  <> pprCLabel clbl2 <> ppr_offset i
+    CmmFloat f rep     -> hsep [ double (fromRat f), dcolon, ppr rep ]
+    CmmVec lits        -> char '<' <> commafy (map pprLit lits) <> char '>'
+    CmmLabel clbl      -> ppr clbl
+    CmmLabelOff clbl i -> ppr clbl <> ppr_offset i
+    CmmLabelDiffOff clbl1 clbl2 i -> ppr clbl1 <> char '-'
+                                  <> ppr clbl2 <> ppr_offset i
     CmmBlock id        -> ppr id
     CmmHighStackMark -> text "<highSp>"
 
@@ -213,7 +216,7 @@ ppr_offset i
 -- Registers, whether local (temps) or global
 --
 pprReg :: CmmReg -> SDoc
-pprReg r 
+pprReg r
     = case r of
         CmmLocal  local  -> pprLocalReg  local
         CmmGlobal global -> pprGlobalReg global
@@ -222,32 +225,28 @@ pprReg r
 -- We only print the type of the local reg if it isn't wordRep
 --
 pprLocalReg :: LocalReg -> SDoc
-pprLocalReg (LocalReg uniq rep) 
+pprLocalReg (LocalReg uniq rep)
 --   = ppr rep <> char '_' <> ppr uniq
 -- Temp Jan08
-   = char '_' <> ppr uniq <> 
-       (if isWord32 rep -- && not (isGcPtrType rep) -- Temp Jan08		-- sigh
+   = char '_' <> ppr uniq <>
+       (if isWord32 rep -- && not (isGcPtrType rep) -- Temp Jan08               -- sigh
                     then dcolon <> ptr <> ppr rep
                     else dcolon <> ptr <> ppr rep)
    where
      ptr = empty
-	 --if isGcPtrType rep
-	 --      then doubleQuotes (text "ptr")
+         --if isGcPtrType rep
+         --      then doubleQuotes (text "ptr")
          --      else empty
 
 -- Stack areas
 pprArea :: Area -> SDoc
-pprArea (RegSlot r)   = hcat [ text "slot<", ppr r, text ">" ]
-pprArea (CallArea id) = pprAreaId id
-
-pprAreaId :: AreaId -> SDoc
-pprAreaId Old        = text "old"
-pprAreaId (Young id) = hcat [ text "young<", ppr id, text ">" ]
+pprArea Old        = text "old"
+pprArea (Young id) = hcat [ text "young<", ppr id, text ">" ]
 
 -- needs to be kept in syn with CmmExpr.hs.GlobalReg
 --
 pprGlobalReg :: GlobalReg -> SDoc
-pprGlobalReg gr 
+pprGlobalReg gr
     = case gr of
         VanillaReg n _ -> char 'R' <> int n
 -- Temp Jan08
@@ -256,10 +255,14 @@ pprGlobalReg gr
         FloatReg   n   -> char 'F' <> int n
         DoubleReg  n   -> char 'D' <> int n
         LongReg    n   -> char 'L' <> int n
+        XmmReg     n   -> ptext (sLit "XMM") <> int n
+        YmmReg     n   -> ptext (sLit "YMM") <> int n
+        ZmmReg     n   -> ptext (sLit "ZMM") <> int n
         Sp             -> ptext (sLit "Sp")
         SpLim          -> ptext (sLit "SpLim")
         Hp             -> ptext (sLit "Hp")
         HpLim          -> ptext (sLit "HpLim")
+        CCCS           -> ptext (sLit "CCCS")
         CurrentTSO     -> ptext (sLit "CurrentTSO")
         CurrentNursery -> ptext (sLit "CurrentNursery")
         HpAlloc        -> ptext (sLit "HpAlloc")

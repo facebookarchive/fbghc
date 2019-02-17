@@ -35,7 +35,7 @@
   possible while not making too much effort to optimise the generated
   code (although GHC probably isn't what you'd describe as a fast
   compiler :-).</para>
-  
+
   <para>GHC's profiling system supports &ldquo;cost centre
   stacks&rdquo;: a way of seeing the profile of a Haskell program in a
   call-graph like structure.  See <xref linkend="profiling"/> for more
@@ -53,7 +53,7 @@
 
     <para>Alternatively, if you want to build GHC yourself, head on
       over to the
-      <ulink url="http://hackage.haskell.org/trac/ghc/wiki/Building">GHC
+      <ulink url="http://ghc.haskell.org/trac/ghc/wiki/Building">GHC
         Building Guide</ulink> to find out how to get the sources, and
         build it on your system.  Note that GHC itself is written in
         Haskell, so you will still need to install GHC in order to
@@ -76,7 +76,7 @@
       </listitem>
 
       <listitem>
-	<para><ulink url="http://hackage.haskell.org/trac/ghc/">GHC
+	<para><ulink url="http://ghc.haskell.org/trac/ghc/">GHC
 	Developers Home</ulink> (developer documentation, wiki, and
 	bug tracker)</para>
       </listitem>
@@ -104,7 +104,7 @@
 	    </varlistentry>
 
 	    <varlistentry>
-	      <term>subscribe at:</term> 
+	      <term>subscribe at:</term>
 	      <listitem>
 		<para><ulink
 	      url="http://www.haskell.org/mailman/listinfo/glasgow-haskell-users"><literal>http://www.haskell.org/mailman/listinfo/glasgow-haskell-users</literal></ulink>.</para>
@@ -130,32 +130,30 @@
       </varlistentry>
 
       <varlistentry>
-	<term>glasgow-haskell-bugs:</term>
+	<term>ghc-devs:</term>
 	<listitem>
-	  <para>This list is for reporting and discussing GHC bugs.
-	    However, please see <xref linkend="bug-reporting" /> before
-	    posting here.</para>
+	  <para>The hardcore GHC developers hang out here.</para>
 
 	  <variablelist>
 	    <varlistentry>
 	      <term>list email address:</term>
 	      <listitem>
-		<para><email>glasgow-haskell-bugs@haskell.org</email></para>
+		<para><email>ghc-devs@haskell.org</email></para>
 	      </listitem>
 	    </varlistentry>
 
 	    <varlistentry>
-	      <term>subscribe at:</term> 
+	      <term>subscribe at:</term>
 	      <listitem>
 		<para><ulink
-	      url="http://www.haskell.org/mailman/listinfo/glasgow-haskell-bugs"><literal>http://www.haskell.org/mailman/listinfo/glasgow-haskell-bugs</literal></ulink>.</para>
+	      url="http://www.haskell.org/mailman/listinfo/ghc-devs"><literal>http://www.haskell.org/mailman/listinfo/ghc-devs</literal></ulink>.</para>
 	      </listitem>
 	    </varlistentry>
 
 	    <varlistentry>
 	      <term>admin email address:</term>
 	      <listitem>
-		<para><email>glasgow-haskell-bugs-admin@haskell.org</email></para>
+		<para><email>ghc-devs-admin@haskell.org</email></para>
 	      </listitem>
 	    </varlistentry>
 
@@ -163,50 +161,7 @@
 	      <term>list archives:</term>
 	      <listitem>
 		<para><ulink
-                         url="http://www.haskell.org/pipermail/glasgow-haskell-bugs/"><literal>http://www.haskell.org/pipermail/glasgow-haskell-bugs/</literal></ulink></para>
-	      </listitem>
-	    </varlistentry>
-	  </variablelist>
-	</listitem>
-      </varlistentry>
-      
-      <varlistentry>
-	<term>cvs-ghc:</term>
-	<listitem>
-	  <para>The hardcore GHC developers hang out here.  This list
-	  also gets commit message from the GHC darcs repository.  There are
-	  other lists for other darcs
-	  repositories (most notably <literal>cvs-libraries</literal>).
-	  </para>
-	  
-	  <variablelist>
-	    <varlistentry>
-	      <term>list email address:</term>
-	      <listitem>
-		<para><email>cvs-ghc@haskell.org</email></para>
-	      </listitem>
-	    </varlistentry>
-
-	    <varlistentry>
-	      <term>subscribe at:</term> 
-	      <listitem>
-		<para><ulink
-	      url="http://www.haskell.org/mailman/listinfo/cvs-ghc"><literal>http://www.haskell.org/mailman/listinfo/cvs-ghc</literal></ulink>.</para>
-	      </listitem>
-	    </varlistentry>
-
-	    <varlistentry>
-	      <term>admin email address:</term>
-	      <listitem>
-		<para><email>cvs-ghc-admin@haskell.org</email></para>
-	      </listitem>
-	    </varlistentry>
-
-	    <varlistentry>
-	      <term>list archives:</term>
-	      <listitem>
-		<para><ulink
-          url="http://www.haskell.org/pipermail/cvs-ghc/"><literal>http://www.haskell.org/pipermail/cvs-ghc/</literal></ulink></para>
+          url="http://www.haskell.org/pipermail/ghc-devs/"><literal>http://www.haskell.org/pipermail/ghc-devs/</literal></ulink></para>
 	      </listitem>
 	    </varlistentry>
 	  </variablelist>
@@ -234,7 +189,7 @@
     <para>
         Glasgow Haskell is a changing system so there are sure to be
         bugs in it. If you find one, please see
-        <ulink url="http://hackage.haskell.org/trac/ghc/wiki/ReportABug">this wiki page</ulink>
+        <ulink url="http://ghc.haskell.org/trac/ghc/wiki/ReportABug">this wiki page</ulink>
         for information on how to report it.
     </para>
 
@@ -273,13 +228,16 @@
 	  </indexterm>
 	</listitem>
       </varlistentry>
-      
+
       <varlistentry>
 	<term>Stable snapshots</term>
 	<listitem>
 	  <para>
-      We may make snapshot releases of the current
-      stable branch <ulink url="http://www.haskell.org/ghc/dist/stable/dist/">available for download</ulink>, and the latest sources are available from <ulink url="http://hackage.haskell.org/trac/ghc/wiki/DarcsRepositories">the darcs repositories</ulink>.
+            We may make snapshot releases of the current stable branch <ulink
+            url="http://www.haskell.org/ghc/dist/stable/dist/">available for
+            download</ulink>, and the latest sources are available from <ulink
+            url="http://ghc.haskell.org/trac/ghc/wiki/Repositories">the git
+            repositories</ulink>.
 	  </para>
 
 	  <para>Stable snapshot releases are named
@@ -310,8 +268,11 @@
 	<term>Unstable snapshots</term>
 	<listitem>
 	  <para>
-      We may make snapshot releases of the
-      HEAD <ulink url="http://www.haskell.org/ghc/dist/current/dist/">available for download</ulink>, and the latest sources are available from <ulink url="http://hackage.haskell.org/trac/ghc/wiki/DarcsRepositories">the darcs repositories</ulink>.
+            We may make snapshot releases of the HEAD <ulink
+            url="http://www.haskell.org/ghc/dist/current/dist/">available for
+            download</ulink>, and the latest sources are available from <ulink
+            url="http://ghc.haskell.org/trac/ghc/wiki/Repositories">the git
+            repositories</ulink>.
 	  </para>
 
 	  <para>Unstable snapshot releases are named
@@ -338,10 +299,10 @@
 	</listitem>
       </varlistentry>
     </variablelist>
-    
+
     <para>The version number of your copy of GHC can be found by
     invoking <literal>ghc</literal> with the
-    <literal>&ndash;&ndash;version</literal> flag (see <xref
+    <literal>--version</literal> flag (see <xref
     linkend="options-help"/>).</para>
   </sect1>
 

@@ -1,180 +1,215 @@
 -- Cmm representations using Hoopl's Graph CmmNode e x.
 {-# LANGUAGE GADTs #-}
-{-# OPTIONS_GHC -fno-warn-warnings-deprecations #-}
 
-{-# OPTIONS_GHC -fno-warn-incomplete-patterns #-}
-#if __GLASGOW_HASKELL__ >= 701
--- GHC 7.0.1 improved incomplete pattern warnings with GADTs
-{-# OPTIONS_GHC -fwarn-incomplete-patterns #-}
-#endif
+module Cmm (
+     -- * Cmm top-level datatypes
+     CmmProgram, CmmGroup, GenCmmGroup,
+     CmmDecl, GenCmmDecl(..),
+     CmmGraph, GenCmmGraph(..),
+     CmmBlock,
+     RawCmmDecl, RawCmmGroup,
+     Section(..), CmmStatics(..), CmmStatic(..),
 
-module Cmm
-  ( CmmGraph, GenCmmGraph(..), CmmBlock
-  , CmmStackInfo(..), CmmTopInfo(..), Cmm, CmmTop
-  , CmmReplGraph, CmmFwdRewrite, CmmBwdRewrite
+     -- ** Blocks containing lists
+     GenBasicBlock(..), blockId,
+     ListGraph(..), pprBBlock,
 
-  , modifyGraph
-  , lastNode, replaceLastNode, insertBetween
-  , ofBlockMap, toBlockMap, insertBlock
-  , ofBlockList, toBlockList, bodyToBlockList
-  , foldGraphBlocks, mapGraphNodes, postorderDfs
+     -- * Cmm graphs
+     CmmReplGraph, GenCmmReplGraph, CmmFwdRewrite, CmmBwdRewrite,
+   
+     -- * Info Tables
+     CmmTopInfo(..), CmmStackInfo(..), CmmInfoTable(..), topInfoTable,
+     ClosureTypeInfo(..), 
+     C_SRT(..), needsSRT,
+     ProfilingInfo(..), ConstrDescription, 
 
-  , analFwd, analBwd, analRewFwd, analRewBwd
-  , dataflowPassFwd, dataflowPassBwd
-  , module CmmNode
-  )
-where
+     -- * Statements, expressions and types
+     module CmmNode,
+     module CmmExpr,
+  ) where
 
+import CLabel
 import BlockId
-import CmmDecl
 import CmmNode
-import OptimizationFuel as F
 import SMRep
+import CmmExpr
 import UniqSupply
-
 import Compiler.Hoopl
-import Control.Monad
-import Data.Maybe
-import Panic
+import Outputable
+
+import Data.Word        ( Word8 )
 
 #include "HsVersions.h"
 
--------------------------------------------------
--- CmmBlock, CmmGraph and Cmm
+-----------------------------------------------------------------------------
+--  Cmm, GenCmm
+-----------------------------------------------------------------------------
+
+-- A CmmProgram is a list of CmmGroups  
+-- A CmmGroup is a list of top-level declarations  
+
+-- When object-splitting is on,each group is compiled into a separate
+-- .o file. So typically we put closely related stuff in a CmmGroup.
+
+type CmmProgram = [CmmGroup]
+
+type GenCmmGroup d h g = [GenCmmDecl d h g]
+type CmmGroup = GenCmmGroup CmmStatics CmmTopInfo CmmGraph
+type RawCmmGroup = GenCmmGroup CmmStatics (BlockEnv CmmStatics) CmmGraph
+
+-----------------------------------------------------------------------------
+--  CmmDecl, GenCmmDecl
+-----------------------------------------------------------------------------
+
+-- GenCmmDecl is abstracted over
+--   d, the type of static data elements in CmmData
+--   h, the static info preceding the code of a CmmProc
+--   g, the control-flow graph of a CmmProc
+--
+-- We expect there to be two main instances of this type:
+--   (a) C--, i.e. populated with various C-- constructs
+--   (b) Native code, populated with data/instructions
+
+-- | A top-level chunk, abstracted over the type of the contents of
+-- the basic blocks (Cmm or instructions are the likely instantiations).
+data GenCmmDecl d h g
+  = CmmProc     -- A procedure
+     h                 -- Extra header such as the info table
+     CLabel            -- Entry label
+     [GlobalReg]       -- Registers live on entry. Note that the set of live
+                       -- registers will be correct in generated C-- code, but
+                       -- not in hand-written C-- code. However,
+                       -- splitAtProcPoints calculates correct liveness
+                       -- information for CmmProc's. Right now only the LLVM
+                       -- back-end relies on correct liveness information and
+                       -- for that back-end we always call splitAtProcPoints, so
+                       -- all is good.
+     g                 -- Control-flow graph for the procedure's code
+
+  | CmmData     -- Static data
+        Section
+        d
+
+type CmmDecl = GenCmmDecl CmmStatics CmmTopInfo CmmGraph
+
+type RawCmmDecl
+   = GenCmmDecl
+        CmmStatics
+        (BlockEnv CmmStatics)
+        CmmGraph
+
+-----------------------------------------------------------------------------
+--     Graphs
+-----------------------------------------------------------------------------
 
 type CmmGraph = GenCmmGraph CmmNode
 data GenCmmGraph n = CmmGraph { g_entry :: BlockId, g_graph :: Graph n C C }
 type CmmBlock = Block CmmNode C C
 
-type CmmReplGraph e x = FuelUniqSM (Maybe (Graph CmmNode e x))
-type CmmFwdRewrite f = FwdRewrite FuelUniqSM CmmNode f
-type CmmBwdRewrite f = BwdRewrite FuelUniqSM CmmNode f
+type CmmReplGraph e x = GenCmmReplGraph CmmNode e x
+type GenCmmReplGraph n e x = UniqSM (Maybe (Graph n e x))
+type CmmFwdRewrite f = FwdRewrite UniqSM CmmNode f
+type CmmBwdRewrite f = BwdRewrite UniqSM CmmNode f
 
-data CmmStackInfo = StackInfo {arg_space :: ByteOff, updfr_space :: Maybe ByteOff}
-data CmmTopInfo   = TopInfo {info_tbl :: CmmInfoTable, stack_info :: CmmStackInfo}
-type Cmm          = GenCmm    CmmStatic CmmTopInfo CmmGraph
-type CmmTop       = GenCmmTop CmmStatic CmmTopInfo CmmGraph
+-----------------------------------------------------------------------------
+--     Info Tables
+-----------------------------------------------------------------------------
 
--------------------------------------------------
--- Manipulating CmmGraphs
+data CmmTopInfo   = TopInfo { info_tbls  :: BlockEnv CmmInfoTable
+                            , stack_info :: CmmStackInfo }
 
-modifyGraph :: (Graph n C C -> Graph n' C C) -> GenCmmGraph n -> GenCmmGraph n'
-modifyGraph f g = CmmGraph {g_entry=g_entry g, g_graph=f (g_graph g)}
+topInfoTable :: GenCmmDecl a CmmTopInfo (GenCmmGraph n) -> Maybe CmmInfoTable
+topInfoTable (CmmProc infos _ _ g) = mapLookup (g_entry g) (info_tbls infos)
+topInfoTable _                     = Nothing
 
-toBlockMap :: CmmGraph -> LabelMap CmmBlock
-toBlockMap (CmmGraph {g_graph=GMany NothingO body NothingO}) = body
+data CmmStackInfo
+   = StackInfo {
+       arg_space :: ByteOff,
+               -- number of bytes of arguments on the stack on entry to the
+               -- the proc.  This is filled in by StgCmm.codeGen, and used
+               -- by the stack allocator later.
+       updfr_space :: Maybe ByteOff,
+               -- XXX: this never contains anything useful, but it should.
+               -- See comment in CmmLayoutStack.
+       do_layout :: Bool
+               -- Do automatic stack layout for this proc.  This is
+               -- True for all code generated by the code generator,
+               -- but is occasionally False for hand-written Cmm where
+               -- we want to do the stack manipulation manually.
+  }
 
-ofBlockMap :: BlockId -> LabelMap CmmBlock -> CmmGraph
-ofBlockMap entry bodyMap = CmmGraph {g_entry=entry, g_graph=GMany NothingO bodyMap NothingO}
+-- | Info table as a haskell data type
+data CmmInfoTable
+  = CmmInfoTable {
+      cit_lbl  :: CLabel, -- Info table label
+      cit_rep  :: SMRep,
+      cit_prof :: ProfilingInfo,
+      cit_srt  :: C_SRT
+    }
 
-insertBlock :: CmmBlock -> LabelMap CmmBlock -> LabelMap CmmBlock
-insertBlock block map =
-  ASSERT (isNothing $ mapLookup id map)
-  mapInsert id block map
-  where id = entryLabel block
+data ProfilingInfo
+  = NoProfilingInfo
+  | ProfilingInfo [Word8] [Word8] -- closure_type, closure_desc
 
-toBlockList :: CmmGraph -> [CmmBlock]
-toBlockList g = mapElems $ toBlockMap g
+-- C_SRT is what StgSyn.SRT gets translated to... 
+-- we add a label for the table, and expect only the 'offset/length' form
 
-ofBlockList :: BlockId -> [CmmBlock] -> CmmGraph
-ofBlockList entry blocks = CmmGraph {g_entry=entry, g_graph=GMany NothingO body NothingO}
-  where body = foldr addBlock emptyBody blocks
+data C_SRT = NoC_SRT
+           | C_SRT !CLabel !WordOff !StgHalfWord {-bitmap or escape-}
+           deriving (Eq)
 
-bodyToBlockList :: Body CmmNode -> [CmmBlock]
-bodyToBlockList body = mapElems body
+needsSRT :: C_SRT -> Bool
+needsSRT NoC_SRT       = False
+needsSRT (C_SRT _ _ _) = True
 
-mapGraphNodes :: ( CmmNode C O -> CmmNode C O
-                 , CmmNode O O -> CmmNode O O
-                 , CmmNode O C -> CmmNode O C)
-              -> CmmGraph -> CmmGraph
-mapGraphNodes funs@(mf,_,_) g =
-  ofBlockMap (entryLabel $ mf $ CmmEntry $ g_entry g) $ mapMap (blockMapNodes3 funs) $ toBlockMap g
+-----------------------------------------------------------------------------
+--              Static Data
+-----------------------------------------------------------------------------
 
-foldGraphBlocks :: (CmmBlock -> a -> a) -> a -> CmmGraph -> a
-foldGraphBlocks k z g = mapFold k z $ toBlockMap g
+data Section
+  = Text
+  | Data
+  | ReadOnlyData
+  | RelocatableReadOnlyData
+  | UninitialisedData
+  | ReadOnlyData16      -- .rodata.cst16 on x86_64, 16-byte aligned
+  | OtherSection String
 
-postorderDfs :: CmmGraph -> [CmmBlock]
-postorderDfs g = postorder_dfs_from (toBlockMap g) (g_entry g)
+data CmmStatic
+  = CmmStaticLit CmmLit
+        -- a literal value, size given by cmmLitRep of the literal.
+  | CmmUninitialised Int
+        -- uninitialised data, N bytes long
+  | CmmString [Word8]
+        -- string of 8-bit values only, not zero terminated.
 
--------------------------------------------------
--- Manipulating CmmBlocks
+data CmmStatics
+   = Statics
+       CLabel      -- Label of statics
+       [CmmStatic] -- The static data itself
 
-lastNode :: CmmBlock -> CmmNode O C
-lastNode block = foldBlockNodesF3 (nothing, nothing, const) block ()
-  where nothing :: a -> b -> ()
-        nothing _ _ = ()
+-- -----------------------------------------------------------------------------
+-- Basic blocks consisting of lists
 
-replaceLastNode :: Block CmmNode e C -> CmmNode O C -> Block CmmNode e C
-replaceLastNode block last = blockOfNodeList (first, middle, JustC last)
-  where (first, middle, _) = blockToNodeList block
+-- These are used by the LLVM and NCG backends, when populating Cmm
+-- with lists of instructions.
 
-----------------------------------------------------------------------
------ Splicing between blocks
--- Given a middle node, a block, and a successor BlockId,
--- we can insert the middle node between the block and the successor.
--- We return the updated block and a list of new blocks that must be added
--- to the graph.
--- The semantics is a bit tricky. We consider cases on the last node:
--- o For a branch, we can just insert before the branch,
---   but sometimes the optimizer does better if we actually insert
---   a fresh basic block, enabling some common blockification.
--- o For a conditional branch, switch statement, or call, we must insert
---   a new basic block.
--- o For a jump or return, this operation is impossible.
+data GenBasicBlock i = BasicBlock BlockId [i]
 
-insertBetween :: MonadUnique m => CmmBlock -> [CmmNode O O] -> BlockId -> m (CmmBlock, [CmmBlock])
-insertBetween b ms succId = insert $ lastNode b
-  where insert :: MonadUnique m => CmmNode O C -> m (CmmBlock, [CmmBlock])
-        insert (CmmBranch bid) =
-          if bid == succId then
-            do (bid', bs) <- newBlocks
-               return (replaceLastNode b (CmmBranch bid'), bs)
-          else panic "tried invalid block insertBetween"
-        insert (CmmCondBranch c t f) =
-          do (t', tbs) <- if t == succId then newBlocks else return $ (t, [])
-             (f', fbs) <- if f == succId then newBlocks else return $ (f, [])
-             return (replaceLastNode b (CmmCondBranch c t' f'), tbs ++ fbs)
-        insert (CmmSwitch e ks) =
-          do (ids, bs) <- mapAndUnzipM mbNewBlocks ks
-             return (replaceLastNode b (CmmSwitch e ids), join bs)
-        insert (CmmCall {}) =
-          panic "unimp: insertBetween after a call -- probably not a good idea"
-        insert (CmmForeignCall {}) =
-          panic "unimp: insertBetween after a foreign call -- probably not a good idea"
+-- | The branch block id is that of the first block in
+-- the branch, which is that branch's entry point
+blockId :: GenBasicBlock i -> BlockId
+blockId (BasicBlock blk_id _ ) = blk_id
 
-        newBlocks :: MonadUnique m => m (BlockId, [CmmBlock])
-        newBlocks = do id <- liftM mkBlockId $ getUniqueM
-                       return $ (id, [blockOfNodeList (JustC (CmmEntry id), ms, JustC (CmmBranch succId))])
-        mbNewBlocks :: MonadUnique m => Maybe BlockId -> m (Maybe BlockId, [CmmBlock])
-        mbNewBlocks (Just k) = if k == succId then liftM fstJust newBlocks
-                               else return (Just k, [])
-        mbNewBlocks Nothing  = return (Nothing, [])
-        fstJust (id, bs) = (Just id, bs)
+newtype ListGraph i = ListGraph [GenBasicBlock i]
 
--------------------------------------------------
--- Running dataflow analysis and/or rewrites
+instance Outputable instr => Outputable (ListGraph instr) where
+    ppr (ListGraph blocks) = vcat (map ppr blocks)
 
--- Constructing forward and backward analysis-only pass
-analFwd    :: Monad m => DataflowLattice f -> FwdTransfer n f -> FwdPass m n f
-analBwd    :: Monad m => DataflowLattice f -> BwdTransfer n f -> BwdPass m n f
+instance Outputable instr => Outputable (GenBasicBlock instr) where
+    ppr = pprBBlock
 
-analFwd lat xfer = analRewFwd lat xfer noFwdRewrite
-analBwd lat xfer = analRewBwd lat xfer noBwdRewrite
+pprBBlock :: Outputable stmt => GenBasicBlock stmt -> SDoc
+pprBBlock (BasicBlock ident stmts) =
+    hang (ppr ident <> colon) 4 (vcat (map ppr stmts))
 
--- Constructing forward and backward analysis + rewrite pass
-analRewFwd :: Monad m => DataflowLattice f -> FwdTransfer n f -> FwdRewrite m n f -> FwdPass m n f
-analRewBwd :: Monad m => DataflowLattice f -> BwdTransfer n f -> BwdRewrite m n f -> BwdPass m n f
-
-analRewFwd lat xfer rew = FwdPass {fp_lattice = lat, fp_transfer = xfer, fp_rewrite = rew}
-analRewBwd lat xfer rew = BwdPass {bp_lattice = lat, bp_transfer = xfer, bp_rewrite = rew}
-
--- Running forward and backward dataflow analysis + optional rewrite
-dataflowPassFwd :: NonLocal n => GenCmmGraph n -> [(BlockId, f)] -> FwdPass FuelUniqSM n f -> FuelUniqSM (GenCmmGraph n, BlockEnv f)
-dataflowPassFwd (CmmGraph {g_entry=entry, g_graph=graph}) facts fwd = do
-  (graph, facts, NothingO) <- analyzeAndRewriteFwd fwd (JustC [entry]) graph (mkFactBase (fp_lattice fwd) facts)
-  return (CmmGraph {g_entry=entry, g_graph=graph}, facts)
-
-dataflowPassBwd :: NonLocal n => GenCmmGraph n -> [(BlockId, f)] -> BwdPass FuelUniqSM n f -> FuelUniqSM (GenCmmGraph n, BlockEnv f)
-dataflowPassBwd (CmmGraph {g_entry=entry, g_graph=graph}) facts bwd = do
-  (graph, facts, NothingO) <- analyzeAndRewriteBwd bwd (JustC [entry]) graph (mkFactBase (bp_lattice bwd) facts)
-  return (CmmGraph {g_entry=entry, g_graph=graph}, facts)

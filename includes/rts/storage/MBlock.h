@@ -5,15 +5,15 @@
  * MegaBlock Allocator interface.
  *
  * See wiki commentary at
- *  http://hackage.haskell.org/trac/ghc/wiki/Commentary/HeapAlloced
+ *  http://ghc.haskell.org/trac/ghc/wiki/Commentary/HeapAlloced
  *
  * ---------------------------------------------------------------------------*/
 
 #ifndef RTS_STORAGE_MBLOCK_H
 #define RTS_STORAGE_MBLOCK_H
 
-extern lnat peak_mblocks_allocated;
-extern lnat mblocks_allocated;
+extern W_ peak_mblocks_allocated;
+extern W_ mblocks_allocated;
 
 extern void initMBlocks(void);
 extern void * getMBlock(void);
@@ -36,7 +36,7 @@ extern SpinLock gc_alloc_block_sync;
    It needs to be FAST.
 
    See wiki commentary at
-     http://hackage.haskell.org/trac/ghc/wiki/Commentary/HeapAlloced
+     http://ghc.haskell.org/trac/ghc/wiki/Commentary/HeapAlloced
 
    Implementation of HEAP_ALLOCED
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -156,7 +156,7 @@ typedef struct {
     MBlockMapLine lines[MBLOCK_MAP_ENTRIES];
 } MBlockMap;
 
-extern lnat mpc_misses;
+extern W_ mpc_misses;
 
 StgBool HEAP_ALLOCED_miss(StgWord mblock, void *p);
 

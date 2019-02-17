@@ -8,114 +8,106 @@ module CodeOutput( codeOutput, outputForeignStubs ) where
 
 #include "HsVersions.h"
 
-#ifndef OMIT_NATIVE_CODEGEN
-import AsmCodeGen	( nativeCodeGen )
-#endif
+import AsmCodeGen ( nativeCodeGen )
 import LlvmCodeGen ( llvmCodeGen )
 
-import UniqSupply	( mkSplitUniqSupply )
+import UniqSupply       ( mkSplitUniqSupply )
 
-#ifdef JAVA
-import JavaGen		( javaGen )
-import qualified PrintJava
-import OccurAnal	( occurAnalyseBinds )
-#endif
-
-import Finder		( mkStubPaths )
-import PprC		( writeCs )
-import CmmLint		( cmmLint )
+import Finder           ( mkStubPaths )
+import PprC             ( writeCs )
+import CmmLint          ( cmmLint )
 import Packages
-import Util
-import OldCmm		( RawCmm )
+import Cmm              ( RawCmmGroup )
 import HscTypes
 import DynFlags
 import Config
 import SysTools
+import Stream           (Stream)
+import qualified Stream
 
-import ErrUtils		( dumpIfSet_dyn, showPass, ghcExit )
+import ErrUtils
 import Outputable
 import Module
-import Maybes		( firstJusts )
+import SrcLoc
 
 import Control.Exception
-import Control.Monad
 import System.Directory
 import System.FilePath
 import System.IO
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection{Steering}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
 codeOutput :: DynFlags
-	   -> Module
-	   -> ModLocation
-	   -> ForeignStubs
-	   -> [PackageId]
-	   -> [RawCmm]			-- Compiled C--
-           -> IO (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-})
+           -> Module
+           -> FilePath
+           -> ModLocation
+           -> ForeignStubs
+           -> [PackageId]
+           -> Stream IO RawCmmGroup ()                       -- Compiled C--
+           -> IO (FilePath,
+                  (Bool{-stub_h_exists-}, Maybe FilePath{-stub_c_exists-}))
 
-codeOutput dflags this_mod location foreign_stubs pkg_deps flat_abstractC
+codeOutput dflags this_mod filenm location foreign_stubs pkg_deps cmm_stream
   = 
-    -- You can have C (c_output) or assembly-language (ncg_output),
-    -- but not both.  [Allowing for both gives a space leak on
-    -- flat_abstractC.  WDP 94/10]
+    do  {
+        -- Lint each CmmGroup as it goes past
+        ; let linted_cmm_stream =
+                 if gopt Opt_DoCmmLinting dflags
+                    then Stream.mapM do_lint cmm_stream
+                    else cmm_stream
 
-    -- Dunno if the above comment is still meaningful now.  JRS 001024.
+              do_lint cmm = do
+                { showPass dflags "CmmLint"
+                ; case cmmLint dflags cmm of
+                        Just err -> do { log_action dflags dflags SevDump noSrcSpan defaultDumpStyle err
+                                       ; ghcExit dflags 1
+                                       }
+                        Nothing  -> return ()
+                ; return cmm
+                }
 
-    do	{ when (dopt Opt_DoCmmLinting dflags) $ do
-		{ showPass dflags "CmmLint"
-		; let lints = map cmmLint flat_abstractC
-		; case firstJusts lints of
-			Just err -> do { printDump err
-				       ; ghcExit dflags 1
-				       }
-			Nothing  -> return ()
-		}
-
-	; showPass dflags "CodeOutput"
-	; let filenm = hscOutName dflags 
-	; stubs_exist <- outputForeignStubs dflags this_mod location foreign_stubs
-	; case hscTarget dflags of {
-             HscInterpreted -> return ();
-             HscAsm         -> outputAsm dflags filenm flat_abstractC;
-             HscC           -> outputC dflags filenm flat_abstractC pkg_deps;
-             HscLlvm        -> outputLlvm dflags filenm flat_abstractC;
-             HscJava        -> 
-#ifdef JAVA
-			       outputJava dflags filenm mod_name tycons core_binds;
-#else
-                               panic "Java support not compiled into this ghc";
-#endif
+        ; showPass dflags "CodeOutput"
+        ; stubs_exist <- outputForeignStubs dflags this_mod location foreign_stubs
+        ; case hscTarget dflags of {
+             HscAsm         -> outputAsm dflags this_mod filenm linted_cmm_stream;
+             HscC           -> outputC dflags filenm linted_cmm_stream pkg_deps;
+             HscLlvm        -> outputLlvm dflags filenm linted_cmm_stream;
+             HscInterpreted -> panic "codeOutput: HscInterpreted";
              HscNothing     -> panic "codeOutput: HscNothing"
-	  }
-	; return stubs_exist
-	}
+          }
+        ; return (filenm, stubs_exist)
+        }
 
-doOutput :: String -> (Handle -> IO ()) -> IO ()
+doOutput :: String -> (Handle -> IO a) -> IO a
 doOutput filenm io_action = bracket (openFile filenm WriteMode) hClose io_action
 \end{code}
 
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection{C}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
 outputC :: DynFlags
         -> FilePath
-        -> [RawCmm]
+        -> Stream IO RawCmmGroup ()
         -> [PackageId]
         -> IO ()
 
-outputC dflags filenm flat_absC packages
+outputC dflags filenm cmm_stream packages
   = do 
+       -- ToDo: make the C backend consume the C-- incrementally, by
+       -- pushing the cmm_stream inside (c.f. nativeCodeGen)
+       rawcmms <- Stream.collect cmm_stream
+
        -- figure out which header files to #include in the generated .hc file:
        --
        --   * extra_includes from packages
@@ -125,94 +117,72 @@ outputC dflags filenm flat_absC packages
        let rts = getPackageDetails (pkgState dflags) rtsPackageId
                        
        let cc_injects = unlines (map mk_include (includes rts))
-       	   mk_include h_file = 
-       	    case h_file of 
-       	       '"':_{-"-} -> "#include "++h_file
-       	       '<':_      -> "#include "++h_file
-       	       _          -> "#include \""++h_file++"\""
+           mk_include h_file = 
+            case h_file of 
+               '"':_{-"-} -> "#include "++h_file
+               '<':_      -> "#include "++h_file
+               _          -> "#include \""++h_file++"\""
 
        pkg_configs <- getPreloadPackagesAnd dflags packages
        let pkg_names = map (display.sourcePackageId) pkg_configs
 
        doOutput filenm $ \ h -> do
-	  hPutStr h ("/* GHC_PACKAGES " ++ unwords pkg_names ++ "\n*/\n")
-	  hPutStr h cc_injects
-	  writeCs dflags h flat_absC
+          hPutStr h ("/* GHC_PACKAGES " ++ unwords pkg_names ++ "\n*/\n")
+          hPutStr h cc_injects
+          writeCs dflags h rawcmms
 \end{code}
 
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection{Assembler}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
-outputAsm :: DynFlags -> FilePath -> [RawCmm] -> IO ()
-
-#ifndef OMIT_NATIVE_CODEGEN
-
-outputAsm dflags filenm flat_absC
+outputAsm :: DynFlags -> Module -> FilePath -> Stream IO RawCmmGroup () -> IO ()
+outputAsm dflags this_mod filenm cmm_stream
+ | cGhcWithNativeCodeGen == "YES"
   = do ncg_uniqs <- mkSplitUniqSupply 'n'
 
-       {-# SCC "OutputAsm" #-} doOutput filenm $
-	   \f -> {-# SCC "NativeCodeGen" #-}
-	         nativeCodeGen dflags f ncg_uniqs flat_absC
-  where
+       debugTraceMsg dflags 4 (text "Outputing asm to" <+> text filenm)
 
-#else /* OMIT_NATIVE_CODEGEN */
+       _ <- {-# SCC "OutputAsm" #-} doOutput filenm $
+           \h -> {-# SCC "NativeCodeGen" #-}
+                 nativeCodeGen dflags this_mod h ncg_uniqs cmm_stream
+       return ()
 
-outputAsm _ _ _
-  = pprPanic "This compiler was built without a native code generator"
-	     (text "Use -fvia-C instead")
-
-#endif
+ | otherwise
+  = panic "This compiler was built without a native code generator"
 \end{code}
 
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection{LLVM}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
-outputLlvm :: DynFlags -> FilePath -> [RawCmm] -> IO ()
-outputLlvm dflags filenm flat_absC
+outputLlvm :: DynFlags -> FilePath -> Stream IO RawCmmGroup () -> IO ()
+outputLlvm dflags filenm cmm_stream
   = do ncg_uniqs <- mkSplitUniqSupply 'n'
-       doOutput filenm $ \f -> llvmCodeGen dflags f ncg_uniqs flat_absC
+
+       {-# SCC "llvm_output" #-} doOutput filenm $
+           \f -> {-# SCC "llvm_CodeGen" #-}
+                 llvmCodeGen dflags f ncg_uniqs cmm_stream
 \end{code}
 
 
 %************************************************************************
-%*									*
-\subsection{Java}
-%*									*
-%************************************************************************
-
-\begin{code}
-#ifdef JAVA
-outputJava dflags filenm mod tycons core_binds
-  = doOutput filenm (\ f -> printForUser f alwaysQualify pp_java)
-	-- User style printing for now to keep indentation
-  where
-    occ_anal_binds = occurAnalyseBinds core_binds
-	-- Make sure we have up to date dead-var information
-    java_code = javaGen mod [{- Should be imports-}] tycons occ_anal_binds
-    pp_java   = PrintJava.compilationUnit java_code
-#endif
-\end{code}
-
-
-%************************************************************************
-%*									*
+%*                                                                      *
 \subsection{Foreign import/export}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
 outputForeignStubs :: DynFlags -> Module -> ModLocation -> ForeignStubs
-		   -> IO (Bool, 	-- Header file created
+                   -> IO (Bool,         -- Header file created
                           Maybe FilePath) -- C file created
 outputForeignStubs dflags mod location stubs
  = do
@@ -221,54 +191,53 @@ outputForeignStubs dflags mod location stubs
 
    case stubs of
      NoStubs -> do
-	-- When compiling External Core files, may need to use stub
-	-- files from a previous compilation
+        -- When compiling External Core files, may need to use stub
+        -- files from a previous compilation
         stub_h_exists <- doesFileExist stub_h
         return (stub_h_exists, Nothing)
 
      ForeignStubs h_code c_code -> do
         let
-	    stub_c_output_d = pprCode CStyle c_code
-	    stub_c_output_w = showSDoc stub_c_output_d
-	
-	    -- Header file protos for "foreign export"ed functions.
-	    stub_h_output_d = pprCode CStyle h_code
-	    stub_h_output_w = showSDoc stub_h_output_d
-	-- in
+            stub_c_output_d = pprCode CStyle c_code
+            stub_c_output_w = showSDoc dflags stub_c_output_d
+        
+            -- Header file protos for "foreign export"ed functions.
+            stub_h_output_d = pprCode CStyle h_code
+            stub_h_output_w = showSDoc dflags stub_h_output_d
 
-        createDirectoryHierarchy (takeDirectory stub_h)
+        createDirectoryIfMissing True (takeDirectory stub_h)
 
-	dumpIfSet_dyn dflags Opt_D_dump_foreign
+        dumpIfSet_dyn dflags Opt_D_dump_foreign
                       "Foreign export header file" stub_h_output_d
 
-	-- we need the #includes from the rts package for the stub files
-	let rts_includes = 
-	       let rts_pkg = getPackageDetails (pkgState dflags) rtsPackageId in
-	       concatMap mk_include (includes rts_pkg)
-	    mk_include i = "#include \"" ++ i ++ "\"\n"
+        -- we need the #includes from the rts package for the stub files
+        let rts_includes = 
+               let rts_pkg = getPackageDetails (pkgState dflags) rtsPackageId in
+               concatMap mk_include (includes rts_pkg)
+            mk_include i = "#include \"" ++ i ++ "\"\n"
 
             -- wrapper code mentions the ffi_arg type, which comes from ffi.h
             ffi_includes | cLibFFI   = "#include \"ffi.h\"\n"
                          | otherwise = ""
 
-	stub_h_file_exists
+        stub_h_file_exists
            <- outputForeignStubs_help stub_h stub_h_output_w
-		("#include \"HsFFI.h\"\n" ++ cplusplus_hdr) cplusplus_ftr
+                ("#include \"HsFFI.h\"\n" ++ cplusplus_hdr) cplusplus_ftr
 
-	dumpIfSet_dyn dflags Opt_D_dump_foreign
+        dumpIfSet_dyn dflags Opt_D_dump_foreign
                       "Foreign export stubs" stub_c_output_d
 
-	stub_c_file_exists
+        stub_c_file_exists
            <- outputForeignStubs_help stub_c stub_c_output_w
-		("#define IN_STG_CODE 0\n" ++ 
-		 "#include \"Rts.h\"\n" ++
-		 rts_includes ++
-		 ffi_includes ++
-		 cplusplus_hdr)
-		 cplusplus_ftr
-	   -- We're adding the default hc_header to the stub file, but this
-	   -- isn't really HC code, so we need to define IN_STG_CODE==0 to
-	   -- avoid the register variables etc. being enabled.
+                ("#define IN_STG_CODE 0\n" ++ 
+                 "#include \"Rts.h\"\n" ++
+                 rts_includes ++
+                 ffi_includes ++
+                 cplusplus_hdr)
+                 cplusplus_ftr
+           -- We're adding the default hc_header to the stub file, but this
+           -- isn't really HC code, so we need to define IN_STG_CODE==0 to
+           -- avoid the register variables etc. being enabled.
 
         return (stub_h_file_exists, if stub_c_file_exists
                                        then Just stub_c
@@ -287,4 +256,3 @@ outputForeignStubs_help fname doc_str header footer
    = do writeFile fname (header ++ doc_str ++ '\n':footer ++ "\n")
         return True
 \end{code}
-

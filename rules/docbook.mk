@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -37,7 +37,7 @@ html_$1 : $1/$2/index.html
 
 ifneq "$$(BINDIST)" "YES"
 $1/$2/index.html: $$($1_DOCBOOK_SOURCES)
-	"$$(RM)" $$(RM_OPTS_REC) $$(dir $$@)
+	$$(call removeTrees,$$(dir $$@))
 	"$$(XSLTPROC)" --stringparam base.dir $$(dir $$@) \
 	               --stringparam use.id.as.filename 1 \
 	               --stringparam html.stylesheet fptools.css \

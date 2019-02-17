@@ -45,10 +45,8 @@ static void      checkSTACK          (StgStack *stack);
 static void
 checkSmallBitmap( StgPtr payload, StgWord bitmap, nat size )
 {
-    StgPtr p;
     nat i;
 
-    p = payload;
     for(i = 0; i < size; i++, bitmap >>= 1 ) {
 	if ((bitmap & 1) == 0) {
 	    checkClosureShallow((StgClosure *)payload[i]);
@@ -107,32 +105,6 @@ checkStackFrame( StgPtr c )
 
     /* All activation records have 'bitmap' style layout info. */
     switch (info->i.type) {
-    case RET_DYN: /* Dynamic bitmap: the mask is stored on the stack */
-    {
-	StgWord dyn;
-	StgPtr p;
-	StgRetDyn* r;
-	
-	r = (StgRetDyn *)c;
-	dyn = r->liveness;
-	
-	p = (P_)(r->payload);
-	checkSmallBitmap(p,RET_DYN_LIVENESS(r->liveness),RET_DYN_BITMAP_SIZE);
-	p += RET_DYN_BITMAP_SIZE + RET_DYN_NONPTR_REGS_SIZE;
-
-	// skip over the non-pointers
-	p += RET_DYN_NONPTRS(dyn);
-	
-	// follow the ptr words
-	for (size = RET_DYN_PTRS(dyn); size > 0; size--) {
-	    checkClosureShallow((StgClosure *)*p);
-	    p++;
-	}
-	
-	return sizeofW(StgRetDyn) + RET_DYN_BITMAP_SIZE +
-	    RET_DYN_NONPTR_REGS_SIZE +
-	    RET_DYN_NONPTRS(dyn) + RET_DYN_PTRS(dyn);
-    }
 
     case UPDATE_FRAME:
       ASSERT(LOOKS_LIKE_CLOSURE_PTR(((StgUpdateFrame*)c)->updatee));
@@ -211,14 +183,12 @@ static void
 checkPAP (StgClosure *tagged_fun, StgClosure** payload, StgWord n_args)
 { 
     StgClosure *fun;
-    StgClosure *p;
     StgFunInfoTable *fun_info;
     
     fun = UNTAG_CLOSURE(tagged_fun);
     ASSERT(LOOKS_LIKE_CLOSURE_PTR(fun));
     fun_info = get_fun_itbl(fun);
     
-    p = (StgClosure *)payload;
     switch (fun_info->f.fun_type) {
     case ARG_GEN:
 	checkSmallBitmap( (StgPtr)payload, 
@@ -312,6 +282,7 @@ checkClosure( StgClosure* p )
     case MUT_PRIM:
     case MUT_VAR_CLEAN:
     case MUT_VAR_DIRTY:
+    case TVAR:
     case CONSTR_STATIC:
     case CONSTR_NOCAF_STATIC:
     case THUNK_STATIC:
@@ -332,12 +303,12 @@ checkClosure( StgClosure* p )
         // ASSERT(get_itbl(bq->bh)->type == BLACKHOLE);
         ASSERT(LOOKS_LIKE_CLOSURE_PTR(bq->bh));
 
-        ASSERT(get_itbl(bq->owner)->type == TSO);
+        ASSERT(get_itbl((StgClosure *)(bq->owner))->type == TSO);
         ASSERT(bq->queue == (MessageBlackHole*)END_TSO_QUEUE 
                || bq->queue->header.info == &stg_MSG_BLACKHOLE_info);
         ASSERT(bq->link == (StgBlockingQueue*)END_TSO_QUEUE || 
-               get_itbl(bq->link)->type == IND ||
-               get_itbl(bq->link)->type == BLOCKING_QUEUE);
+               get_itbl((StgClosure *)(bq->link))->type == IND ||
+               get_itbl((StgClosure *)(bq->link))->type == BLOCKING_QUEUE);
 
         return sizeofW(StgBlockingQueue);
     }
@@ -385,7 +356,6 @@ checkClosure( StgClosure* p )
     case RET_BCO:
     case RET_SMALL:
     case RET_BIG:
-    case RET_DYN:
     case UPDATE_FRAME:
     case UNDERFLOW_FRAME:
     case STOP_FRAME:
@@ -530,6 +500,9 @@ checkSTACK (StgStack *stack)
 void
 checkTSO(StgTSO *tso)
 {
+    StgTSO *next;
+    const StgInfoTable *info;
+
     if (tso->what_next == ThreadKilled) {
       /* The garbage collector doesn't bother following any pointers
        * from dead threads, so don't check sanity here.  
@@ -537,11 +510,16 @@ checkTSO(StgTSO *tso)
       return;
     }
 
-    ASSERT(tso->_link == END_TSO_QUEUE || 
-           tso->_link->header.info == &stg_MVAR_TSO_QUEUE_info ||
-           tso->_link->header.info == &stg_TSO_info);
+    next = tso->_link;
+    info = (const StgInfoTable*) tso->_link->header.info;
+
+    ASSERT(next == END_TSO_QUEUE ||
+           info == &stg_MVAR_TSO_QUEUE_info ||
+           info == &stg_TSO_info ||
+           info == &stg_WHITEHOLE_info); // happens due to STM doing lockTSO()
 
     if (   tso->why_blocked == BlockedOnMVar
+        || tso->why_blocked == BlockedOnMVarRead
 	|| tso->why_blocked == BlockedOnBlackHole
 	|| tso->why_blocked == BlockedOnMsgThrowTo
         || tso->why_blocked == NotBlocked
@@ -571,7 +549,7 @@ checkGlobalTSOList (rtsBool checkTSOs)
       for (tso=generations[g].threads; tso != END_TSO_QUEUE; 
            tso = tso->global_link) {
           ASSERT(LOOKS_LIKE_CLOSURE_PTR(tso));
-          ASSERT(get_itbl(tso)->type == TSO);
+          ASSERT(get_itbl((StgClosure *)tso)->type == TSO);
           if (checkTSOs)
               checkTSO(tso);
 
@@ -637,7 +615,7 @@ checkLocalMutableLists (nat cap_no)
 {
     nat g;
     for (g = 1; g < RtsFlags.GcFlags.generations; g++) {
-        checkMutableList(capabilities[cap_no].mut_lists[g], g);
+        checkMutableList(capabilities[cap_no]->mut_lists[g], g);
     }
 }
 
@@ -778,7 +756,7 @@ findMemoryLeak (void)
     nat g, i;
     for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
         for (i = 0; i < n_capabilities; i++) {
-            markBlocks(capabilities[i].mut_lists[g]);
+            markBlocks(capabilities[i]->mut_lists[g]);
             markBlocks(gc_threads[i]->gens[g].part_list);
             markBlocks(gc_threads[i]->gens[g].scavd_list);
             markBlocks(gc_threads[i]->gens[g].todo_bd);
@@ -789,7 +767,7 @@ findMemoryLeak (void)
 
     for (i = 0; i < n_capabilities; i++) {
         markBlocks(nurseries[i].blocks);
-        markBlocks(capabilities[i].pinned_object_block);
+        markBlocks(capabilities[i]->pinned_object_block);
     }
 
 #ifdef PROFILING
@@ -834,18 +812,18 @@ checkRunQueue(Capability *cap)
 void findSlop(bdescr *bd);
 void findSlop(bdescr *bd)
 {
-    lnat slop;
+    W_ slop;
 
     for (; bd != NULL; bd = bd->link) {
         slop = (bd->blocks * BLOCK_SIZE_W) - (bd->free - bd->start);
         if (slop > (1024/sizeof(W_))) {
-            debugBelch("block at %p (bdescr %p) has %ldKB slop\n",
+            debugBelch("block at %p (bdescr %p) has %" FMT_SizeT "KB slop\n",
                        bd->start, bd, slop / (1024/sizeof(W_)));
         }
     }
 }
 
-static lnat
+static W_
 genBlocks (generation *gen)
 {
     ASSERT(countBlocks(gen->blocks) == gen->n_blocks);
@@ -858,10 +836,10 @@ void
 memInventory (rtsBool show)
 {
   nat g, i;
-  lnat gen_blocks[RtsFlags.GcFlags.generations];
-  lnat nursery_blocks, retainer_blocks,
+  W_ gen_blocks[RtsFlags.GcFlags.generations];
+  W_ nursery_blocks, retainer_blocks,
        arena_blocks, exec_blocks;
-  lnat live_blocks = 0, free_blocks = 0;
+  W_ live_blocks = 0, free_blocks = 0;
   rtsBool leak;
 
   // count the blocks we current have
@@ -869,11 +847,11 @@ memInventory (rtsBool show)
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
       gen_blocks[g] = 0;
       for (i = 0; i < n_capabilities; i++) {
-	  gen_blocks[g] += countBlocks(capabilities[i].mut_lists[g]);
+          gen_blocks[g] += countBlocks(capabilities[i]->mut_lists[g]);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].part_list);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].scavd_list);
           gen_blocks[g] += countBlocks(gc_threads[i]->gens[g].todo_bd);
-      }	  
+      }
       gen_blocks[g] += genBlocks(&generations[g]);
   }
 
@@ -881,9 +859,10 @@ memInventory (rtsBool show)
   for (i = 0; i < n_capabilities; i++) {
       ASSERT(countBlocks(nurseries[i].blocks) == nurseries[i].n_blocks);
       nursery_blocks += nurseries[i].n_blocks;
-      if (capabilities[i].pinned_object_block != NULL) {
-          nursery_blocks += capabilities[i].pinned_object_block->blocks;
+      if (capabilities[i]->pinned_object_block != NULL) {
+          nursery_blocks += capabilities[i]->pinned_object_block->blocks;
       }
+      nursery_blocks += countBlocks(capabilities[i]->pinned_object_blocks);
   }
 
   retainer_blocks = 0;
@@ -909,7 +888,7 @@ memInventory (rtsBool show)
   live_blocks += nursery_blocks + 
                + retainer_blocks + arena_blocks + exec_blocks;
 
-#define MB(n) (((n) * BLOCK_SIZE_W) / ((1024*1024)/sizeof(W_)))
+#define MB(n) (((double)(n) * BLOCK_SIZE_W) / ((1024*1024)/sizeof(W_)))
 
   leak = live_blocks + free_blocks != mblocks_allocated * BLOCKS_PER_MBLOCK;
 
@@ -921,24 +900,24 @@ memInventory (rtsBool show)
           debugBelch("Memory inventory:\n");
       }
       for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
-	  debugBelch("  gen %d blocks : %5lu blocks (%lu MB)\n", g, 
+          debugBelch("  gen %d blocks : %5" FMT_Word " blocks (%6.1lf MB)\n", g,
                      gen_blocks[g], MB(gen_blocks[g]));
       }
-      debugBelch("  nursery      : %5lu blocks (%lu MB)\n", 
+      debugBelch("  nursery      : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  nursery_blocks, MB(nursery_blocks));
-      debugBelch("  retainer     : %5lu blocks (%lu MB)\n", 
+      debugBelch("  retainer     : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  retainer_blocks, MB(retainer_blocks));
-      debugBelch("  arena blocks : %5lu blocks (%lu MB)\n", 
+      debugBelch("  arena blocks : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  arena_blocks, MB(arena_blocks));
-      debugBelch("  exec         : %5lu blocks (%lu MB)\n", 
+      debugBelch("  exec         : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  exec_blocks, MB(exec_blocks));
-      debugBelch("  free         : %5lu blocks (%lu MB)\n", 
+      debugBelch("  free         : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  free_blocks, MB(free_blocks));
-      debugBelch("  total        : %5lu blocks (%lu MB)\n",
+      debugBelch("  total        : %5" FMT_Word " blocks (%6.1lf MB)\n",
                  live_blocks + free_blocks, MB(live_blocks+free_blocks));
       if (leak) {
-          debugBelch("\n  in system    : %5lu blocks (%lu MB)\n", 
-                     mblocks_allocated * BLOCKS_PER_MBLOCK, mblocks_allocated);
+          debugBelch("\n  in system    : %5" FMT_Word " blocks (%" FMT_Word " MB)\n", 
+                     (W_)(mblocks_allocated * BLOCKS_PER_MBLOCK), mblocks_allocated);
       }
   }
 

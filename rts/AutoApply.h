@@ -19,10 +19,10 @@
     W_ i;						\
     size = SIZEOF_StgPAP + WDS(n);			\
     HP_CHK_NP_ASSIGN_SP0(size,f);			\
-    TICK_ALLOC_HEAP_NOCTR(BYTES_TO_WDS(size));		\
-    TICK_ALLOC_PAP(n+1 /* +1 for the FUN */, 0);	\
+    TICK_ALLOC_PAP(size, 0);				\
+    CCCS_ALLOC(size);					\
     pap = Hp + WDS(1) - size;				\
-    SET_HDR(pap, stg_PAP_info, W_[CCCS]);		\
+    SET_HDR(pap, stg_PAP_info, CCCS);                   \
     StgPAP_arity(pap) = HALF_W_(arity - m);		\
     StgPAP_fun(pap)   = R1;				\
     StgPAP_n_args(pap) = HALF_W_(n);			\
@@ -35,7 +35,7 @@
     }							\
     R1 = pap;						\
     Sp_adj(1 + n);					\
-    jump %ENTRY_CODE(Sp(0));
+    jump %ENTRY_CODE(Sp(0)) [R1];
 
 // Copy the old PAP, build a new one with the extra arg(s)
 // ret addr and m arguments taking up n words are on the stack.
@@ -49,10 +49,10 @@
      pap = R1;							\
      size = SIZEOF_StgPAP + WDS(TO_W_(StgPAP_n_args(pap))) + WDS(n);	\
      HP_CHK_NP_ASSIGN_SP0(size,f);				\
-     TICK_ALLOC_HEAP_NOCTR(BYTES_TO_WDS(size));			\
-     TICK_ALLOC_PAP(n+1 /* +1 for the FUN */, 0);		\
+     TICK_ALLOC_PAP(size, 0);					\
+     CCCS_ALLOC(size);						\
      new_pap = Hp + WDS(1) - size;				\
-     SET_HDR(new_pap, stg_PAP_info, W_[CCCS]);			\
+     SET_HDR(new_pap, stg_PAP_info, CCCS);                      \
      StgPAP_arity(new_pap) = HALF_W_(arity - m);		\
      W_ n_args;							\
      n_args = TO_W_(StgPAP_n_args(pap));			\
@@ -74,7 +74,18 @@
      }								\
      R1 = new_pap;						\
      Sp_adj(n+1);						\
-     jump %ENTRY_CODE(Sp(0));
+     jump %ENTRY_CODE(Sp(0)) [R1];
+
+// Jump to target, saving CCCS and restoring it on return
+#if defined(PROFILING)
+#define jump_SAVE_CCCS(target)                  \
+    Sp(-1) = CCCS;                              \
+    Sp(-2) = stg_restore_cccs_info;             \
+    Sp_adj(-2);                                 \
+    jump (target) [R1]
+#else
+#define jump_SAVE_CCCS(target) jump (target) [R1]
+#endif
 
 #endif /* APPLY_H */
 

@@ -15,16 +15,28 @@
 
 /* Block related constants (BLOCK_SHIFT is defined in Constants.h) */
 
+#ifdef CMINUSMINUS
 #define BLOCK_SIZE   (1<<BLOCK_SHIFT)
+#else
+#define BLOCK_SIZE   (1UL<<BLOCK_SHIFT)
+// Note [integer overflow]
+#endif
+
 #define BLOCK_SIZE_W (BLOCK_SIZE/sizeof(W_))
 #define BLOCK_MASK   (BLOCK_SIZE-1)
 
-#define BLOCK_ROUND_UP(p)   ((void *) (((W_)(p)+BLOCK_SIZE-1) & ~BLOCK_MASK))
+#define BLOCK_ROUND_UP(p)   (((W_)(p)+BLOCK_SIZE-1) & ~BLOCK_MASK)
 #define BLOCK_ROUND_DOWN(p) ((void *) ((W_)(p) & ~BLOCK_MASK))
 
 /* Megablock related constants (MBLOCK_SHIFT is defined in Constants.h) */
 
+#ifdef CMINUSMINUS
 #define MBLOCK_SIZE    (1<<MBLOCK_SHIFT)
+#else
+#define MBLOCK_SIZE    (1UL<<MBLOCK_SHIFT)
+// Note [integer overflow]
+#endif
+
 #define MBLOCK_SIZE_W  (MBLOCK_SIZE/sizeof(W_))
 #define MBLOCK_MASK    (MBLOCK_SIZE-1)
 
@@ -36,6 +48,18 @@
  * fraction of BLOCK_SIZE.
  */
 #define LARGE_OBJECT_THRESHOLD ((nat)(BLOCK_SIZE * 8 / 10))
+
+/*
+ * Note [integer overflow]
+ *
+ * The UL suffix in BLOCK_SIZE and MBLOCK_SIZE promotes the expression
+ * to an unsigned long, which means that expressions involving these
+ * will be promoted to unsigned long, which makes integer overflow
+ * less likely.  Historically, integer overflow in expressions like
+ *    (n * BLOCK_SIZE)
+ * where n is int or unsigned int, have caused obscure segfaults in
+ * programs that use large amounts of memory (e.g. #7762, #5086).
+ */
 
 /* -----------------------------------------------------------------------------
  * Block descriptor.  This structure *must* be the right length, so we
@@ -224,17 +248,17 @@ dbl_link_insert_after(bdescr *bd, bdescr *after)
 }
 
 INLINE_HEADER void
-dbl_link_replace(bdescr *new, bdescr *old, bdescr **list)
+dbl_link_replace(bdescr *new_, bdescr *old, bdescr **list)
 {
-    new->link = old->link;
-    new->u.back = old->u.back;
+    new_->link = old->link;
+    new_->u.back = old->u.back;
     if (old->link) {
-        old->link->u.back = new;
+        old->link->u.back = new_;
     }
     if (old->u.back) {
-        old->u.back->link = new;
+        old->u.back->link = new_;
     } else {
-        *list = new;
+        *list = new_;
     }
 }
 
@@ -244,11 +268,11 @@ extern void initBlockAllocator(void);
 
 /* Allocation -------------------------------------------------------------- */
 
-bdescr *allocGroup(nat n);
+bdescr *allocGroup(W_ n);
 bdescr *allocBlock(void);
 
 // versions that take the storage manager lock for you:
-bdescr *allocGroup_lock(nat n);
+bdescr *allocGroup_lock(W_ n);
 bdescr *allocBlock_lock(void);
 
 /* De-Allocation ----------------------------------------------------------- */

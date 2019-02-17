@@ -1,25 +1,27 @@
 %
 % (c) The University of Glasgow 2006
-% (c) The University of Glasgow 1992-2002
 %
 
 \begin{code}
+
 -- | Highly random utility functions
+--
 module Util (
         -- * Flags dependent on the compiler build
-        ghciSupported, debugIsOn, ghciTablesNextToCode, isDynamicGhcLib,
-        isWindowsHost, isWindowsTarget, isDarwinTarget,
+        ghciSupported, debugIsOn, ncgDebugIsOn,
+        ghciTablesNextToCode,
+        isWindowsHost, isDarwinHost,
 
         -- * General list processing
         zipEqual, zipWithEqual, zipWith3Equal, zipWith4Equal,
-        zipLazy, stretchZipWith,
-        
+        zipLazy, stretchZipWith, zipWithAndUnzip,
+
         unzipWith,
-        
-        mapFst, mapSnd,
-        mapAndUnzip, mapAndUnzip3,
+
+        mapFst, mapSnd, chkAppend,
+        mapAndUnzip, mapAndUnzip3, mapAccumL2,
         nOfThem, filterOut, partitionWith, splitEithers,
-        
+
         foldl1', foldl2, count, all2,
 
         lengthExceeds, lengthIs, lengthAtLeast,
@@ -32,6 +34,9 @@ module Util (
 
         -- * Tuples
         fstOf3, sndOf3, thirdOf3,
+        firstM, first3M,
+        third3,
+        uncurry3,
 
         -- * List operations controlled by another list
         takeList, dropList, splitAtList, split,
@@ -41,13 +46,13 @@ module Util (
         nTimes,
 
         -- * Sorting
-        sortLe, sortWith, on,
+        sortWith, minWith,
 
         -- * Comparisons
-        isEqual, eqListBy,
+        isEqual, eqListBy, eqMaybeBy,
         thenCmp, cmpList,
         removeSpaces,
-        
+
         -- * Edit distance
         fuzzyMatch, fuzzyLookup,
 
@@ -67,14 +72,14 @@ module Util (
         readRational,
 
         -- * read helpers
-        maybeReadFuzzy,
+        maybeRead, maybeReadFuzzy,
 
         -- * IO-ish utilities
-        createDirectoryHierarchy,
         doesDirNameExist,
+        getModificationUTCTime,
         modificationTimeIfExists,
 
-        global, consIORef, globalMVar, globalEmptyMVar,
+        global, consIORef, globalM,
 
         -- * Filenames and paths
         Suffix,
@@ -82,12 +87,16 @@ module Util (
         escapeSpaces,
         parseSearchPath,
         Direction(..), reslash,
+        makeRelativeTo,
 
         -- * Utils for defining Data instances
         abstractConstr, abstractDataType, mkNoRepType,
 
         -- * Utils for printing C code
-        charToC
+        charToC,
+
+        -- * Hashing
+        hashString,
     ) where
 
 #include "HsVersions.h"
@@ -99,25 +108,29 @@ import Data.Data
 import Data.IORef       ( IORef, newIORef, atomicModifyIORef )
 import System.IO.Unsafe ( unsafePerformIO )
 import Data.List        hiding (group)
-import Control.Concurrent.MVar ( MVar, newMVar, newEmptyMVar )
 
 #ifdef DEBUG
 import FastTypes
 #endif
 
-import Control.Monad    ( unless )
+import Control.Monad    ( liftM )
 import System.IO.Error as IO ( isDoesNotExistError )
-import System.Directory ( doesDirectoryExist, createDirectory,
-                          getModificationTime )
+import System.Directory ( doesDirectoryExist, getModificationTime )
 import System.FilePath
-import System.Time      ( ClockTime )
 
 import Data.Char        ( isUpper, isAlphaNum, isSpace, chr, ord, isDigit )
+import Data.Int
 import Data.Ratio       ( (%) )
 import Data.Ord         ( comparing )
 import Data.Bits
 import Data.Word
 import qualified Data.IntMap as IM
+
+import Data.Time
+#if __GLASGOW_HASKELL__ < 705
+import Data.Time.Clock.POSIX
+import System.Time
+#endif
 
 infixr 9 `thenCmp`
 \end{code}
@@ -152,18 +165,18 @@ debugIsOn = True
 debugIsOn = False
 #endif
 
+ncgDebugIsOn :: Bool
+#ifdef NCG_DEBUG
+ncgDebugIsOn = True
+#else
+ncgDebugIsOn = False
+#endif
+
 ghciTablesNextToCode :: Bool
 #ifdef GHCI_TABLES_NEXT_TO_CODE
 ghciTablesNextToCode = True
 #else
 ghciTablesNextToCode = False
-#endif
-
-isDynamicGhcLib :: Bool
-#ifdef DYNAMIC
-isDynamicGhcLib = True
-#else
-isDynamicGhcLib = False
 #endif
 
 isWindowsHost :: Bool
@@ -173,18 +186,11 @@ isWindowsHost = True
 isWindowsHost = False
 #endif
 
-isWindowsTarget :: Bool
-#ifdef mingw32_TARGET_OS
-isWindowsTarget = True
+isDarwinHost :: Bool
+#ifdef darwin_HOST_OS
+isDarwinHost = True
 #else
-isWindowsTarget = False
-#endif
-
-isDarwinTarget :: Bool
-#ifdef darwin_TARGET_OS
-isDarwinTarget = True
-#else
-isDarwinTarget = False
+isDarwinHost = False
 #endif
 \end{code}
 
@@ -203,12 +209,26 @@ nTimes n f = f . nTimes (n-1) f
 \end{code}
 
 \begin{code}
-fstOf3   :: (a,b,c) -> a    
-sndOf3   :: (a,b,c) -> b    
-thirdOf3 :: (a,b,c) -> c    
+fstOf3   :: (a,b,c) -> a
+sndOf3   :: (a,b,c) -> b
+thirdOf3 :: (a,b,c) -> c
 fstOf3      (a,_,_) =  a
 sndOf3      (_,b,_) =  b
 thirdOf3    (_,_,c) =  c
+
+third3 :: (c -> d) -> (a, b, c) -> (a, b, d)
+third3 f (a, b, c) = (a, b, f c)
+
+uncurry3 :: (a -> b -> c -> d) -> (a, b, c) -> d
+uncurry3 f (a, b, c) = f a b c
+\end{code}
+
+\begin{code}
+firstM :: Monad m => (a -> m c) -> (a, b) -> m (c, b)
+firstM f (x, y) = liftM (\x' -> (x', y)) (f x)
+
+first3M :: Monad m => (a -> m d) -> (a, b, c) -> m (d, b, c)
+first3M f (x, y, z) = liftM (\x' -> (x', y, z)) (f x)
 \end{code}
 
 %************************************************************************
@@ -239,6 +259,13 @@ splitEithers (e : es) = case e of
                         Left x -> (x:xs, ys)
                         Right y -> (xs, y:ys)
     where (xs,ys) = splitEithers es
+
+chkAppend :: [a] -> [a] -> [a]
+-- Checks for the second arguemnt being empty
+-- Used in situations where that situation is common
+chkAppend xs ys 
+  | null ys   = xs
+  | otherwise = xs ++ ys
 \end{code}
 
 A paranoid @zip@ (and some @zipWith@ friends) that checks the lists
@@ -281,12 +308,7 @@ zipWith4Equal msg _ _  _  _  _  =  panic ("zipWith4Equal: unequal lists:"++msg)
 -- | 'zipLazy' is a kind of 'zip' that is lazy in the second list (observe the ~)
 zipLazy :: [a] -> [b] -> [(a,b)]
 zipLazy []     _       = []
--- We want to write this, but with GHC 6.4 we get a warning, so it
--- doesn't validate:
--- zipLazy (x:xs) ~(y:ys) = (x,y) : zipLazy xs ys
--- so we write this instead:
-zipLazy (x:xs) zs = let y : ys = zs
-                    in (x,y) : zipLazy xs ys
+zipLazy (x:xs) ~(y:ys) = (x,y) : zipLazy xs ys
 \end{code}
 
 
@@ -328,6 +350,20 @@ mapAndUnzip3 f (x:xs)
         (rs1, rs2, rs3) = mapAndUnzip3 f xs
     in
     (r1:rs1, r2:rs2, r3:rs3)
+
+zipWithAndUnzip :: (a -> b -> (c,d)) -> [a] -> [b] -> ([c],[d])
+zipWithAndUnzip f (a:as) (b:bs)
+  = let (r1,  r2)  = f a b
+        (rs1, rs2) = zipWithAndUnzip f as bs
+    in
+    (r1:rs1, r2:rs2)
+zipWithAndUnzip _ _ _ = ([],[])
+
+mapAccumL2 :: (s1 -> s2 -> a -> (s1, s2, b)) -> s1 -> s2 -> [a] -> (s1, s2, [b])
+mapAccumL2 f s1 s2 xs = (s1', s2', ys)
+  where ((s1', s2'), ys) = mapAccumL (\(s1, s2) x -> case f s1 s2 x of
+                                                       (s1', s2', y) -> ((s1', s2'), y))
+                                     (s1, s2) xs
 \end{code}
 
 \begin{code}
@@ -442,110 +478,17 @@ isn'tIn msg x ys
 
 %************************************************************************
 %*                                                                      *
-\subsubsection[Utils-Carsten-mergesort]{A mergesort from Carsten}
+\subsubsection{Sort utils}
 %*                                                                      *
 %************************************************************************
 
-\begin{display}
-Date: Mon, 3 May 93 20:45:23 +0200
-From: Carsten Kehler Holst <kehler@cs.chalmers.se>
-To: partain@dcs.gla.ac.uk
-Subject: natural merge sort beats quick sort [ and it is prettier ]
-
-Here is a piece of Haskell code that I'm rather fond of. See it as an
-attempt to get rid of the ridiculous quick-sort routine. group is
-quite useful by itself I think it was John's idea originally though I
-believe the lazy version is due to me [surprisingly complicated].
-gamma [used to be called] is called gamma because I got inspired by
-the Gamma calculus. It is not very close to the calculus but does
-behave less sequentially than both foldr and foldl. One could imagine
-a version of gamma that took a unit element as well thereby avoiding
-the problem with empty lists.
-
-I've tried this code against
-
-   1) insertion sort - as provided by haskell
-   2) the normal implementation of quick sort
-   3) a deforested version of quick sort due to Jan Sparud
-   4) a super-optimized-quick-sort of Lennart's
-
-If the list is partially sorted both merge sort and in particular
-natural merge sort wins. If the list is random [ average length of
-rising subsequences = approx 2 ] mergesort still wins and natural
-merge sort is marginally beaten by Lennart's soqs. The space
-consumption of merge sort is a bit worse than Lennart's quick sort
-approx a factor of 2. And a lot worse if Sparud's bug-fix [see his
-fpca article ] isn't used because of group.
-
-have fun
-Carsten
-\end{display}
-
 \begin{code}
-group :: (a -> a -> Bool) -> [a] -> [[a]]
--- Given a <= function, group finds maximal contiguous up-runs
--- or down-runs in the input list.
--- It's stable, in the sense that it never re-orders equal elements
---
--- Date: Mon, 12 Feb 1996 15:09:41 +0000
--- From: Andy Gill <andy@dcs.gla.ac.uk>
--- Here is a `better' definition of group.
-
-group _ []     = []
-group p (x:xs) = group' xs x x (x :)
-  where
-    group' []     _     _     s  = [s []]
-    group' (x:xs) x_min x_max s
-        |      x_max `p` x  = group' xs x_min x     (s . (x :))
-        | not (x_min `p` x) = group' xs x     x_max ((x :) . s)
-        | otherwise         = s [] : group' xs x x (x :)
-        -- NB: the 'not' is essential for stablity
-        --     x `p` x_min would reverse equal elements
-
-generalMerge :: (a -> a -> Bool) -> [a] -> [a] -> [a]
-generalMerge _ xs [] = xs
-generalMerge _ [] ys = ys
-generalMerge p (x:xs) (y:ys) | x `p` y   = x : generalMerge p xs     (y:ys)
-                             | otherwise = y : generalMerge p (x:xs) ys
-
--- gamma is now called balancedFold
-
-balancedFold :: (a -> a -> a) -> [a] -> a
-balancedFold _ [] = error "can't reduce an empty list using balancedFold"
-balancedFold _ [x] = x
-balancedFold f l  = balancedFold f (balancedFold' f l)
-
-balancedFold' :: (a -> a -> a) -> [a] -> [a]
-balancedFold' f (x:y:xs) = f x y : balancedFold' f xs
-balancedFold' _ xs = xs
-
-generalNaturalMergeSort :: (a -> a -> Bool) -> [a] -> [a]
-generalNaturalMergeSort _ [] = []
-generalNaturalMergeSort p xs = (balancedFold (generalMerge p) . group p) xs
-
-#if NOT_USED
-generalMergeSort p [] = []
-generalMergeSort p xs = (balancedFold (generalMerge p) . map (: [])) xs
-
-mergeSort, naturalMergeSort :: Ord a => [a] -> [a]
-
-mergeSort = generalMergeSort (<=)
-naturalMergeSort = generalNaturalMergeSort (<=)
-
-mergeSortLe le = generalMergeSort le
-#endif
-
-sortLe :: (a->a->Bool) -> [a] -> [a]
-sortLe le = generalNaturalMergeSort le
-
 sortWith :: Ord b => (a->b) -> [a] -> [a]
-sortWith get_key xs = sortLe le xs
-  where
-    x `le` y = get_key x < get_key y
+sortWith get_key xs = sortBy (comparing get_key) xs
 
-on :: (a -> a -> c) -> (b -> a) -> b -> b -> c
-on cmp sel = \x y -> sel x `cmp` sel y
-
+minWith :: Ord b => (a -> b) -> [a] -> a
+minWith get_key xs = ASSERT( not (null xs) )
+                     head (sortWith get_key xs)
 \end{code}
 
 %************************************************************************
@@ -631,7 +574,15 @@ splitAtList (_:xs) (y:ys) = (y:ys', ys'')
 
 -- drop from the end of a list
 dropTail :: Int -> [a] -> [a]
-dropTail n = reverse . drop n . reverse
+-- Specification: dropTail n = reverse . drop n . reverse
+-- Better implemention due to Joachim Breitner
+-- http://www.joachim-breitner.de/blog/archives/600-On-taking-the-last-n-elements-of-a-list.html
+dropTail n xs
+  = go (drop n xs) xs
+  where
+    go (_:ys) (x:xs) = x : go ys xs 
+    go _      _      = []  -- Stop when ys runs out
+                           -- It'll always run out before xs does
 
 snocView :: [a] -> Maybe ([a],a)
         -- Split off the last element
@@ -673,6 +624,11 @@ eqListBy :: (a->a->Bool) -> [a] -> [a] -> Bool
 eqListBy _  []     []     = True
 eqListBy eq (x:xs) (y:ys) = eq x y && eqListBy eq xs ys
 eqListBy _  _      _      = False
+
+eqMaybeBy :: (a ->a->Bool) -> Maybe a -> Maybe a -> Bool
+eqMaybeBy _  Nothing  Nothing  = True
+eqMaybeBy eq (Just x) (Just y) = eq x y
+eqMaybeBy _  _        _        = False
 
 cmpList :: (a -> a -> Ordering) -> [a] -> [a] -> Ordering
     -- `cmpList' uses a user-specified comparer
@@ -723,8 +679,8 @@ restrictedDamerauLevenshteinDistanceWithLengths m n str1 str2
     else restrictedDamerauLevenshteinDistance' (undefined :: Integer) n m str2 str1
 
 restrictedDamerauLevenshteinDistance'
-  :: (Bits bv) => bv -> Int -> Int -> String -> String -> Int
-restrictedDamerauLevenshteinDistance' _bv_dummy m n str1 str2 
+  :: (Bits bv, Num bv) => bv -> Int -> Int -> String -> String -> Int
+restrictedDamerauLevenshteinDistance' _bv_dummy m n str1 str2
   | [] <- str1 = n
   | otherwise  = extractAnswer $
                  foldl' (restrictedDamerauLevenshteinDistanceWorker
@@ -736,7 +692,7 @@ restrictedDamerauLevenshteinDistance' _bv_dummy m n str1 str2
     extractAnswer (_, _, _, _, distance) = distance
 
 restrictedDamerauLevenshteinDistanceWorker
-      :: (Bits bv) => IM.IntMap bv -> bv -> bv
+      :: (Bits bv, Num bv) => IM.IntMap bv -> bv -> bv
       -> (bv, bv, bv, bv, Int) -> Char -> (bv, bv, bv, bv, Int)
 restrictedDamerauLevenshteinDistanceWorker str1_mvs top_bit_mask vector_mask
                                            (pm, d0, vp, vn, distance) char2
@@ -746,26 +702,26 @@ restrictedDamerauLevenshteinDistanceWorker str1_mvs top_bit_mask vector_mask
     (pm', d0', vp', vn', distance'')
   where
     pm' = IM.findWithDefault 0 (ord char2) str1_mvs
-    
+
     d0' = ((((sizedComplement vector_mask d0) .&. pm') `shiftL` 1) .&. pm)
       .|. ((((pm' .&. vp) + vp) .&. vector_mask) `xor` vp) .|. pm' .|. vn
           -- No need to mask the shiftL because of the restricted range of pm
 
     hp' = vn .|. sizedComplement vector_mask (d0' .|. vp)
     hn' = d0' .&. vp
-    
+
     hp'_shift = ((hp' `shiftL` 1) .|. 1) .&. vector_mask
     hn'_shift = (hn' `shiftL` 1) .&. vector_mask
     vp' = hn'_shift .|. sizedComplement vector_mask (d0' .|. hp'_shift)
     vn' = d0' .&. hp'_shift
-    
+
     distance' = if hp' .&. top_bit_mask /= 0 then distance + 1 else distance
     distance'' = if hn' .&. top_bit_mask /= 0 then distance' - 1 else distance'
 
 sizedComplement :: Bits bv => bv -> bv -> bv
 sizedComplement vector_mask vect = vector_mask `xor` vect
 
-matchVectors :: Bits bv => String -> IM.IntMap bv
+matchVectors :: (Bits bv, Num bv) => String -> IM.IntMap bv
 matchVectors = snd . foldl' go (0 :: Int, IM.empty)
   where
     go (ix, im) char = let ix' = ix + 1
@@ -807,16 +763,16 @@ fuzzyLookup user_entered possibilites
                                             poss_str user_entered
                        , distance <= fuzzy_threshold ]
   where
-    -- Work out an approriate match threshold: 
-    -- We report a candidate if its edit distance is <= the threshold, 
+    -- Work out an approriate match threshold:
+    -- We report a candidate if its edit distance is <= the threshold,
     -- The threshhold is set to about a quarter of the # of characters the user entered
-    -- 	 Length    Threshold
-    --	   1	     0		-- Don't suggest *any* candidates
-    --	   2	     1		-- for single-char identifiers
-    -- 	   3	     1
-    --	   4	     1
-    --	   5	     1
-    --	   6	     2
+    --   Length    Threshold
+    --     1         0          -- Don't suggest *any* candidates
+    --     2         1          -- for single-char identifiers
+    --     3         1
+    --     4         1
+    --     5         1
+    --     6         2
     --
     fuzzy_threshold = truncate $ fromIntegral (length user_entered + 2) / (4 :: Rational)
     mAX_RESULTS = 3
@@ -853,11 +809,8 @@ consIORef var x = do
 \end{code}
 
 \begin{code}
-globalMVar :: a -> MVar a
-globalMVar a = unsafePerformIO (newMVar a)
-
-globalEmptyMVar :: MVar a
-globalEmptyMVar = unsafePerformIO newEmptyMVar
+globalM :: IO a -> IORef a
+globalM ma = unsafePerformIO (ma >>= newIORef)
 \end{code}
 
 Module names:
@@ -971,6 +924,11 @@ readRational top_s
 -----------------------------------------------------------------------------
 -- read helpers
 
+maybeRead :: Read a => String -> Maybe a
+maybeRead str = case reads str of
+                [(x, "")] -> Just x
+                _         -> Nothing
+
 maybeReadFuzzy :: Read a => String -> Maybe a
 maybeReadFuzzy str = case reads str of
                      [(x, s)]
@@ -980,16 +938,6 @@ maybeReadFuzzy str = case reads str of
                          Nothing
 
 -----------------------------------------------------------------------------
--- Create a hierarchy of directories
-
-createDirectoryHierarchy :: FilePath -> IO ()
-createDirectoryHierarchy dir | isDrive dir = return () -- XXX Hack
-createDirectoryHierarchy dir = do
-  b <- doesDirectoryExist dir
-  unless b $ do createDirectoryHierarchy (takeDirectory dir)
-                createDirectory dir
-
------------------------------------------------------------------------------
 -- Verify that the 'dirname' portion of a FilePath exists.
 --
 doesDirNameExist :: FilePath -> IO Bool
@@ -997,12 +945,24 @@ doesDirNameExist fpath = case takeDirectory fpath of
                          "" -> return True -- XXX Hack
                          _  -> doesDirectoryExist (takeDirectory fpath)
 
+-----------------------------------------------------------------------------
+-- Backwards compatibility definition of getModificationTime
+
+getModificationUTCTime :: FilePath -> IO UTCTime
+#if __GLASGOW_HASKELL__ < 705
+getModificationUTCTime f = do
+    TOD secs _ <- getModificationTime f
+    return $ posixSecondsToUTCTime (realToFrac secs)
+#else
+getModificationUTCTime = getModificationTime
+#endif
+
 -- --------------------------------------------------------------
 -- check existence & modification time at the same time
 
-modificationTimeIfExists :: FilePath -> IO (Maybe ClockTime)
+modificationTimeIfExists :: FilePath -> IO (Maybe UTCTime)
 modificationTimeIfExists f = do
-  (do t <- getModificationTime f; return (Just t))
+  (do t <- getModificationUTCTime f; return (Just t))
         `catchIO` \e -> if isDoesNotExistError e
                         then return Nothing
                         else ioError e
@@ -1063,6 +1023,17 @@ reslash d = f
           slash = case d of
                   Forwards -> '/'
                   Backwards -> '\\'
+
+makeRelativeTo :: FilePath -> FilePath -> FilePath
+this `makeRelativeTo` that = directory </> thisFilename
+    where (thisDirectory, thisFilename) = splitFileName this
+          thatDirectory = dropFileName that
+          directory = joinPath $ f (splitPath thisDirectory)
+                                   (splitPath thatDirectory)
+
+          f (x : xs) (y : ys)
+           | x == y = f xs ys
+          f xs ys = replicate (length ys) ".." ++ xs
 \end{code}
 
 %************************************************************************
@@ -1091,14 +1062,82 @@ abstractDataType n = mkDataType n [abstractConstr n]
 
 \begin{code}
 charToC :: Word8 -> String
-charToC w = 
+charToC w =
   case chr (fromIntegral w) of
-	'\"' -> "\\\""
-	'\'' -> "\\\'"
-	'\\' -> "\\\\"
-	c | c >= ' ' && c <= '~' -> [c]
+        '\"' -> "\\\""
+        '\'' -> "\\\'"
+        '\\' -> "\\\\"
+        c | c >= ' ' && c <= '~' -> [c]
           | otherwise -> ['\\',
                          chr (ord '0' + ord c `div` 64),
                          chr (ord '0' + ord c `div` 8 `mod` 8),
                          chr (ord '0' + ord c         `mod` 8)]
 \end{code}
+
+%************************************************************************
+%*                                                                      *
+\subsection[Utils-Hashing]{Utils for hashing}
+%*                                                                      *
+%************************************************************************
+
+\begin{code}
+-- | A sample hash function for Strings.  We keep multiplying by the
+-- golden ratio and adding.  The implementation is:
+--
+-- > hashString = foldl' f golden
+-- >   where f m c = fromIntegral (ord c) * magic + hashInt32 m
+-- >         magic = 0xdeadbeef
+--
+-- Where hashInt32 works just as hashInt shown above.
+--
+-- Knuth argues that repeated multiplication by the golden ratio
+-- will minimize gaps in the hash space, and thus it's a good choice
+-- for combining together multiple keys to form one.
+--
+-- Here we know that individual characters c are often small, and this
+-- produces frequent collisions if we use ord c alone.  A
+-- particular problem are the shorter low ASCII and ISO-8859-1
+-- character strings.  We pre-multiply by a magic twiddle factor to
+-- obtain a good distribution.  In fact, given the following test:
+--
+-- > testp :: Int32 -> Int
+-- > testp k = (n - ) . length . group . sort . map hs . take n $ ls
+-- >   where ls = [] : [c : l | l <- ls, c <- ['\0'..'\xff']]
+-- >         hs = foldl' f golden
+-- >         f m c = fromIntegral (ord c) * k + hashInt32 m
+-- >         n = 100000
+--
+-- We discover that testp magic = 0.
+hashString :: String -> Int32
+hashString = foldl' f golden
+   where f m c = fromIntegral (ord c) * magic + hashInt32 m
+         magic = fromIntegral (0xdeadbeef :: Word32)
+
+golden :: Int32
+golden = 1013904242 -- = round ((sqrt 5 - 1) * 2^32) :: Int32
+-- was -1640531527 = round ((sqrt 5 - 1) * 2^31) :: Int32
+-- but that has bad mulHi properties (even adding 2^32 to get its inverse)
+-- Whereas the above works well and contains no hash duplications for
+-- [-32767..65536]
+
+-- | A sample (and useful) hash function for Int32,
+-- implemented by extracting the uppermost 32 bits of the 64-bit
+-- result of multiplying by a 33-bit constant.  The constant is from
+-- Knuth, derived from the golden ratio:
+--
+-- > golden = round ((sqrt 5 - 1) * 2^32)
+--
+-- We get good key uniqueness on small inputs
+-- (a problem with previous versions):
+--  (length $ group $ sort $ map hashInt32 [-32767..65536]) == 65536 + 32768
+--
+hashInt32 :: Int32 -> Int32
+hashInt32 x = mulHi x golden + x
+
+-- hi 32 bits of a x-bit * 32 bit -> 64-bit multiply
+mulHi :: Int32 -> Int32 -> Int32
+mulHi a b = fromIntegral (r `shiftR` 32)
+   where r :: Int64
+         r = fromIntegral a * fromIntegral b
+\end{code}
+

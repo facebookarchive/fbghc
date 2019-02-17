@@ -1,12 +1,15 @@
-%
-% (c) The GRASP/AQUA Project, Glasgow University, 1993-1998
-%
-\section[CoreToStg]{Converts Core to STG Syntax}
-
-And, as we have the info in hand, we may convert some lets to
-let-no-escapes.
-
 \begin{code}
+--
+-- (c) The GRASP/AQUA Project, Glasgow University, 1993-1998
+--
+
+--------------------------------------------------------------
+-- Converting Core to STG Syntax
+--------------------------------------------------------------
+
+-- And, as we have the info in hand, we may convert some lets to
+-- let-no-escapes.
+
 module CoreToStg ( coreToStg, coreExprToStg ) where
 
 #include "HsVersions.h"
@@ -18,131 +21,174 @@ import StgSyn
 
 import Type
 import TyCon
+import MkId             ( coercionTokenId )
 import Id
-import Var              ( Var )
 import IdInfo
 import DataCon
 import CostCentre       ( noCCS )
 import VarSet
 import VarEnv
-import Maybes           ( maybeToBool )
+import Module
 import Name             ( getOccName, isExternalName, nameOccName )
 import OccName          ( occNameString, occNameFS )
 import BasicTypes       ( Arity )
-import Module
+import TysWiredIn       ( unboxedUnitDataCon )
+import Literal
 import Outputable
 import MonadUtils
 import FastString
 import Util
+import DynFlags
 import ForeignCall
+import Demand           ( isSingleUsed )
 import PrimOp           ( PrimCall(..) )
-\end{code}
 
-%************************************************************************
-%*                                                                      *
-\subsection[live-vs-free-doc]{Documentation}
-%*                                                                      *
-%************************************************************************
+import Data.Maybe    (isJust)
+import Control.Monad (liftM, ap)
 
-(There is other relevant documentation in codeGen/CgLetNoEscape.)
+-- Note [Live vs free]
+-- ~~~~~~~~~~~~~~~~~~~
+--
+-- The actual Stg datatype is decorated with live variable information, as well
+-- as free variable information. The two are not the same. Liveness is an
+-- operational property rather than a semantic one. A variable is live at a
+-- particular execution point if it can be referred to directly again. In
+-- particular, a dead variable's stack slot (if it has one):
+--
+--           - should be stubbed to avoid space leaks, and
+--           - may be reused for something else.
+--
+-- There ought to be a better way to say this. Here are some examples:
+--
+--         let v = [q] \[x] -> e
+--         in
+--         ...v...  (but no q's)
+--
+-- Just after the `in', v is live, but q is dead. If the whole of that
+-- let expression was enclosed in a case expression, thus:
+--
+--         case (let v = [q] \[x] -> e in ...v...) of
+--                 alts[...q...]
+--
+-- (ie `alts' mention `q'), then `q' is live even after the `in'; because
+-- we'll return later to the `alts' and need it.
+--
+-- Let-no-escapes make this a bit more interesting:
+--
+--         let-no-escape v = [q] \ [x] -> e
+--         in
+--         ...v...
+--
+-- Here, `q' is still live at the `in', because `v' is represented not by
+-- a closure but by the current stack state.  In other words, if `v' is
+-- live then so is `q'. Furthermore, if `e' mentions an enclosing
+-- let-no-escaped variable, then its free variables are also live if `v' is.
 
-The actual Stg datatype is decorated with {\em live variable}
-information, as well as {\em free variable} information.  The two are
-{\em not} the same.  Liveness is an operational property rather than a
-semantic one.  A variable is live at a particular execution point if
-it can be referred to {\em directly} again.  In particular, a dead
-variable's stack slot (if it has one):
-\begin{enumerate}
-\item
-should be stubbed to avoid space leaks, and
-\item
-may be reused for something else.
-\end{enumerate}
-
-There ought to be a better way to say this.  Here are some examples:
-\begin{verbatim}
-        let v = [q] \[x] -> e
-        in
-        ...v...  (but no q's)
-\end{verbatim}
-
-Just after the `in', v is live, but q is dead.  If the whole of that
-let expression was enclosed in a case expression, thus:
-\begin{verbatim}
-        case (let v = [q] \[x] -> e in ...v...) of
-                alts[...q...]
-\end{verbatim}
-(ie @alts@ mention @q@), then @q@ is live even after the `in'; because
-we'll return later to the @alts@ and need it.
-
-Let-no-escapes make this a bit more interesting:
-\begin{verbatim}
-        let-no-escape v = [q] \ [x] -> e
-        in
-        ...v...
-\end{verbatim}
-Here, @q@ is still live at the `in', because @v@ is represented not by
-a closure but by the current stack state.  In other words, if @v@ is
-live then so is @q@.  Furthermore, if @e@ mentions an enclosing
-let-no-escaped variable, then {\em its} free variables are also live
-if @v@ is.
-
-%************************************************************************
-%*                                                                      *
-\subsection[caf-info]{Collecting live CAF info}
-%*                                                                      *
-%************************************************************************
-
-In this pass we also collect information on which CAFs are live for
-constructing SRTs (see SRT.lhs).
-
-A top-level Id has CafInfo, which is
-
-        - MayHaveCafRefs, if it may refer indirectly to
-          one or more CAFs, or
-        - NoCafRefs if it definitely doesn't
-
-The CafInfo has already been calculated during the CoreTidy pass.
-
-During CoreToStg, we then pin onto each binding and case expression, a
-list of Ids which represents the "live" CAFs at that point.  The meaning
-of "live" here is the same as for live variables, see above (which is
-why it's convenient to collect CAF information here rather than elsewhere).
-
-The later SRT pass takes these lists of Ids and uses them to construct
-the actual nested SRTs, and replaces the lists of Ids with (offset,length)
-pairs.
+-- Note [Collecting live CAF info]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- In this pass we also collect information on which CAFs are live for
+-- constructing SRTs (see SRT.lhs).
+--
+-- A top-level Id has CafInfo, which is
+--
+--         - MayHaveCafRefs, if it may refer indirectly to
+--           one or more CAFs, or
+--         - NoCafRefs if it definitely doesn't
+--
+-- The CafInfo has already been calculated during the CoreTidy pass.
+--
+-- During CoreToStg, we then pin onto each binding and case expression, a
+-- list of Ids which represents the "live" CAFs at that point.  The meaning
+-- of "live" here is the same as for live variables, see above (which is
+-- why it's convenient to collect CAF information here rather than elsewhere).
+--
+-- The later SRT pass takes these lists of Ids and uses them to construct
+-- the actual nested SRTs, and replaces the lists of Ids with (offset,length)
+-- pairs.
 
 
-Interaction of let-no-escape with SRTs   [Sept 01]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Consider
+-- Note [Interaction of let-no-escape with SRTs]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-- Consider
+--
+--         let-no-escape x = ...caf1...caf2...
+--         in
+--         ...x...x...x...
+--
+-- where caf1,caf2 are CAFs.  Since x doesn't have a closure, we
+-- build SRTs just as if x's defn was inlined at each call site, and
+-- that means that x's CAF refs get duplicated in the overall SRT.
+--
+-- This is unlike ordinary lets, in which the CAF refs are not duplicated.
+--
+-- We could fix this loss of (static) sharing by making a sort of pseudo-closure
+-- for x, solely to put in the SRTs lower down.
 
-        let-no-escape x = ...caf1...caf2...
-        in
-        ...x...x...x...
+-- Note [What is a non-escaping let]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- Consider:
+--
+--     let x = fvs \ args -> e
+--     in
+--         if ... then x else
+--            if ... then x else ...
+--
+-- `x' is used twice (so we probably can't unfold it), but when it is
+-- entered, the stack is deeper than it was when the definition of `x'
+-- happened.  Specifically, if instead of allocating a closure for `x',
+-- we saved all `x's fvs on the stack, and remembered the stack depth at
+-- that moment, then whenever we enter `x' we can simply set the stack
+-- pointer(s) to these remembered (compile-time-fixed) values, and jump
+-- to the code for `x'.
+--
+-- All of this is provided x is:
+--   1. non-updatable - it must have at least one parameter (see Note
+--      [Join point abstraction]);
+--   2. guaranteed to be entered before the stack retreats -- ie x is not
+--      buried in a heap-allocated closure, or passed as an argument to
+--      something;
+--   3. all the enters have exactly the right number of arguments,
+--      no more no less;
+--   4. all the enters are tail calls; that is, they return to the
+--      caller enclosing the definition of `x'.
+--
+-- Under these circumstances we say that `x' is non-escaping.
+--
+-- An example of when (4) does not hold:
+--
+--     let x = ...
+--     in case x of ...alts...
+--
+-- Here, `x' is certainly entered only when the stack is deeper than when
+-- `x' is defined, but here it must return to ...alts... So we can't just
+-- adjust the stack down to `x''s recalled points, because that would lost
+-- alts' context.
+--
+-- Things can get a little more complicated.  Consider:
+--
+--     let y = ...
+--     in let x = fvs \ args -> ...y...
+--     in ...x...
+--
+-- Now, if `x' is used in a non-escaping way in ...x..., and `y' is used in a
+-- non-escaping way in ...y..., then `y' is non-escaping.
+--
+-- `x' can even be recursive!  Eg:
+--
+--     letrec x = [y] \ [v] -> if v then x True else ...
+--     in
+--         ...(x b)...
 
-where caf1,caf2 are CAFs.  Since x doesn't have a closure, we
-build SRTs just as if x's defn was inlined at each call site, and
-that means that x's CAF refs get duplicated in the overall SRT.
+-- --------------------------------------------------------------
+-- Setting variable info: top-level, binds, RHSs
+-- --------------------------------------------------------------
 
-This is unlike ordinary lets, in which the CAF refs are not duplicated.
-
-We could fix this loss of (static) sharing by making a sort of pseudo-closure
-for x, solely to put in the SRTs lower down.
-
-
-%************************************************************************
-%*                                                                      *
-\subsection[binds-StgVarInfo]{Setting variable info: top-level, binds, RHSs}
-%*                                                                      *
-%************************************************************************
-
-\begin{code}
-coreToStg :: PackageId -> [CoreBind] -> IO [StgBinding]
-coreToStg this_pkg pgm
+coreToStg :: DynFlags -> Module -> CoreProgram -> IO [StgBinding]
+coreToStg dflags this_mod pgm
   = return pgm'
-  where (_, _, pgm') = coreTopBindsToStg this_pkg emptyVarEnv pgm
+  where (_, _, pgm') = coreTopBindsToStg dflags this_mod emptyVarEnv pgm
 
 coreExprToStg :: CoreExpr -> StgExpr
 coreExprToStg expr
@@ -150,36 +196,38 @@ coreExprToStg expr
 
 
 coreTopBindsToStg
-    :: PackageId
+    :: DynFlags
+    -> Module
     -> IdEnv HowBound           -- environment for the bindings
-    -> [CoreBind]
+    -> CoreProgram
     -> (IdEnv HowBound, FreeVarsInfo, [StgBinding])
 
-coreTopBindsToStg _        env [] = (env, emptyFVInfo, [])
-coreTopBindsToStg this_pkg env (b:bs)
+coreTopBindsToStg _      _        env [] = (env, emptyFVInfo, [])
+coreTopBindsToStg dflags this_mod env (b:bs)
   = (env2, fvs2, b':bs')
   where
         -- Notice the mutually-recursive "knot" here:
         --   env accumulates down the list of binds,
         --   fvs accumulates upwards
-        (env1, fvs2, b' ) = coreTopBindToStg this_pkg env fvs1 b
-        (env2, fvs1, bs') = coreTopBindsToStg this_pkg env1 bs
+        (env1, fvs2, b' ) = coreTopBindToStg dflags this_mod env fvs1 b
+        (env2, fvs1, bs') = coreTopBindsToStg dflags this_mod env1 bs
 
 coreTopBindToStg
-        :: PackageId
+        :: DynFlags
+        -> Module
         -> IdEnv HowBound
         -> FreeVarsInfo         -- Info about the body
         -> CoreBind
         -> (IdEnv HowBound, FreeVarsInfo, StgBinding)
 
-coreTopBindToStg this_pkg env body_fvs (NonRec id rhs)
+coreTopBindToStg dflags this_mod env body_fvs (NonRec id rhs)
   = let
         env'      = extendVarEnv env id how_bound
         how_bound = LetBound TopLet $! manifestArity rhs
 
         (stg_rhs, fvs') =
             initLne env $ do
-              (stg_rhs, fvs') <- coreToTopStgRhs this_pkg body_fvs (id,rhs)
+              (stg_rhs, fvs') <- coreToTopStgRhs dflags this_mod body_fvs (id,rhs)
               return (stg_rhs, fvs')
 
         bind = StgNonRec id stg_rhs
@@ -191,7 +239,7 @@ coreTopBindToStg this_pkg env body_fvs (NonRec id rhs)
       --     assertion again!
     (env', fvs' `unionFVInfo` body_fvs, bind)
 
-coreTopBindToStg this_pkg env body_fvs (Rec pairs)
+coreTopBindToStg dflags this_mod env body_fvs (Rec pairs)
   = ASSERT( not (null pairs) )
     let
         binders = map fst pairs
@@ -202,7 +250,7 @@ coreTopBindToStg this_pkg env body_fvs (Rec pairs)
 
         (stg_rhss, fvs')
           = initLne env' $ do
-               (stg_rhss, fvss') <- mapAndUnzipM (coreToTopStgRhs this_pkg body_fvs) pairs
+               (stg_rhss, fvss') <- mapAndUnzipM (coreToTopStgRhs dflags this_mod body_fvs) pairs
                let fvs' = unionFVInfos fvss'
                return (stg_rhss, fvs')
 
@@ -218,7 +266,7 @@ coreTopBindToStg this_pkg env body_fvs (Rec pairs)
 -- floated out a binding, in which case it will be approximate.
 consistentCafInfo :: Id -> GenStgBinding Var Id -> Bool
 consistentCafInfo id bind
-  = WARN( not (exact || is_sat_thing) , ppr id )
+  = WARN( not (exact || is_sat_thing) , ppr id <+> ppr id_marked_caffy <+> ppr binding_is_caffy )
     safe
   where
     safe  = id_marked_caffy || not binding_is_caffy
@@ -226,20 +274,19 @@ consistentCafInfo id bind
     id_marked_caffy  = mayHaveCafRefs (idCafInfo id)
     binding_is_caffy = stgBindHasCafRefs bind
     is_sat_thing = occNameFS (nameOccName (idName id)) == fsLit "sat"
-\end{code}
 
-\begin{code}
 coreToTopStgRhs
-        :: PackageId
+        :: DynFlags
+        -> Module
         -> FreeVarsInfo         -- Free var info for the scope of the binding
         -> (Id,CoreExpr)
         -> LneM (StgRhs, FreeVarsInfo)
 
-coreToTopStgRhs this_pkg scope_fv_info (bndr, rhs)
+coreToTopStgRhs dflags this_mod scope_fv_info (bndr, rhs)
   = do { (new_rhs, rhs_fvs, _) <- coreToStgExpr rhs
        ; lv_info <- freeVarsToLiveVars rhs_fvs
 
-       ; let stg_rhs   = mkTopStgRhs this_pkg rhs_fvs (mkSRT lv_info) bndr_info new_rhs
+       ; let stg_rhs   = mkTopStgRhs dflags this_mod rhs_fvs (mkSRT lv_info) bndr bndr_info new_rhs
              stg_arity = stgRhsArity stg_rhs
        ; return (ASSERT2( arity_ok stg_arity, mk_arity_msg stg_arity) stg_rhs,
                  rhs_fvs) }
@@ -265,35 +312,37 @@ coreToTopStgRhs this_pkg scope_fv_info (bndr, rhs)
                 ptext (sLit "Id arity:") <+> ppr id_arity,
                 ptext (sLit "STG arity:") <+> ppr stg_arity]
 
-mkTopStgRhs :: PackageId -> FreeVarsInfo
-            -> SRT -> StgBinderInfo -> StgExpr
+mkTopStgRhs :: DynFlags -> Module -> FreeVarsInfo
+            -> SRT -> Id -> StgBinderInfo -> StgExpr
             -> StgRhs
 
-mkTopStgRhs _ rhs_fvs srt binder_info (StgLam _ bndrs body)
+mkTopStgRhs _ _ rhs_fvs srt _ binder_info (StgLam bndrs body)
   = StgRhsClosure noCCS binder_info
                   (getFVs rhs_fvs)
                   ReEntrant
                   srt
                   bndrs body
 
-mkTopStgRhs this_pkg _ _ _ (StgConApp con args)
-  | not (isDllConApp this_pkg con args)  -- Dynamic StgConApps are updatable
+mkTopStgRhs dflags this_mod _ _ _ _ (StgConApp con args)
+  | not (isDllConApp dflags this_mod con args)  -- Dynamic StgConApps are updatable
   = StgRhsCon noCCS con args
 
-mkTopStgRhs _ rhs_fvs srt binder_info rhs
+mkTopStgRhs _ _ rhs_fvs srt bndr binder_info rhs
   = StgRhsClosure noCCS binder_info
                   (getFVs rhs_fvs)
-                  Updatable
+                  (getUpdateFlag bndr)
                   srt
                   [] rhs
-\end{code}
 
+getUpdateFlag :: Id -> UpdateFlag
+getUpdateFlag bndr
+  = if isSingleUsed (idDemandInfo bndr)
+    then SingleEntry else Updatable
 
 -- ---------------------------------------------------------------------------
 -- Expressions
 -- ---------------------------------------------------------------------------
 
-\begin{code}
 coreToStgExpr
         :: CoreExpr
         -> LneM (StgExpr,       -- Decorated STG expr
@@ -303,17 +352,19 @@ coreToStgExpr
                                 -- because we are only interested in the escapees
                                 -- for vars which might be turned into
                                 -- let-no-escaped ones.
-\end{code}
 
-The second and third components can be derived in a simple bottom up pass, not
-dependent on any decisions about which variables will be let-no-escaped or
-not.  The first component, that is, the decorated expression, may then depend
-on these components, but it in turn is not scrutinised as the basis for any
-decisions.  Hence no black holes.
+-- The second and third components can be derived in a simple bottom up pass, not
+-- dependent on any decisions about which variables will be let-no-escaped or
+-- not.  The first component, that is, the decorated expression, may then depend
+-- on these components, but it in turn is not scrutinised as the basis for any
+-- decisions.  Hence no black holes.
 
-\begin{code}
-coreToStgExpr (Lit l) = return (StgLit l, emptyFVInfo, emptyVarSet)
-coreToStgExpr (Var v) = coreToStgApp Nothing v []
+-- No LitInteger's should be left by the time this is called. CorePrep
+-- should have converted them all to a real core representation.
+coreToStgExpr (Lit (LitInteger {})) = panic "coreToStgExpr: LitInteger"
+coreToStgExpr (Lit l)      = return (StgLit l, emptyFVInfo, emptyVarSet)
+coreToStgExpr (Var v)      = coreToStgApp Nothing v               []
+coreToStgExpr (Coercion _) = coreToStgApp Nothing coercionTokenId []
 
 coreToStgExpr expr@(App _ _)
   = coreToStgApp Nothing f args
@@ -331,26 +382,37 @@ coreToStgExpr expr@(Lam _ _)
         fvs             = args' `minusFVBinders` body_fvs
         escs            = body_escs `delVarSetList` args'
         result_expr | null args' = body
-                    | otherwise  = StgLam (exprType expr) args' body
+                    | otherwise  = StgLam args' body
 
     return (result_expr, fvs, escs)
 
-coreToStgExpr (Note (SCC cc) expr) = do
-    (expr2, fvs, escs) <- coreToStgExpr expr
-    return (StgSCC cc expr2, fvs, escs)
+coreToStgExpr (Tick (HpcTick m n) expr)
+  = do (expr2, fvs, escs) <- coreToStgExpr expr
+       return (StgTick m n expr2, fvs, escs)
 
-coreToStgExpr (Case (Var id) _bndr _ty [(DEFAULT,[],expr)])
-  | Just (TickBox m n) <- isTickBoxOp_maybe id = do
-    (expr2, fvs, escs) <- coreToStgExpr expr
-    return (StgTick m n expr2, fvs, escs)
+coreToStgExpr (Tick (ProfNote cc tick push) expr)
+  = do (expr2, fvs, escs) <- coreToStgExpr expr
+       return (StgSCC cc tick push expr2, fvs, escs)
 
-coreToStgExpr (Note _ expr)
-  = coreToStgExpr expr
+coreToStgExpr (Tick Breakpoint{} _expr)
+  = panic "coreToStgExpr: breakpoint should not happen"
 
 coreToStgExpr (Cast expr _)
   = coreToStgExpr expr
 
 -- Cases require a little more real work.
+
+coreToStgExpr (Case scrut _ _ [])
+  = coreToStgExpr scrut
+    -- See Note [Empty case alternatives] in CoreSyn If the case
+    -- alternatives are empty, the scrutinee must diverge or raise an
+    -- exception, so we can just dive into it.
+    --
+    -- Of course this may seg-fault if the scrutinee *does* return.  A
+    -- belt-and-braces approach would be to move this case into the
+    -- code generator, and put a return point anyway that calls a
+    -- runtime system error function.
+
 
 coreToStgExpr (Case scrut bndr _ alts) = do
     (alts2, alts_fvs, alts_escs)
@@ -397,6 +459,14 @@ coreToStgExpr (Case scrut bndr _ alts) = do
       )
   where
     vars_alt (con, binders, rhs)
+      | DataAlt c <- con, c == unboxedUnitDataCon
+      = -- This case is a bit smelly.
+        -- See Note [Nullary unboxed tuple] in Type.lhs
+        -- where a nullary tuple is mapped to (State# World#)
+        ASSERT( null binders )
+        do { (rhs2, rhs_fvs, rhs_escs) <- coreToStgExpr rhs
+           ; return ((DEFAULT, [], [], rhs2), rhs_fvs, rhs_escs) }
+      | otherwise
       = let     -- Remove type variables
             binders' = filterStgBinders binders
         in
@@ -411,13 +481,12 @@ coreToStgExpr (Case scrut bndr _ alts) = do
                  rhs_escs `delVarSetList` binders' )
                 -- ToDo: remove the delVarSet;
                 -- since escs won't include any of these binders
-\end{code}
 
-Lets not only take quite a bit of work, but this is where we convert
-then to let-no-escapes, if we wish.
+-- Lets not only take quite a bit of work, but this is where we convert
+-- then to let-no-escapes, if we wish.
+-- (Meanwhile, we don't expect to see let-no-escapes...)
 
-(Meanwhile, we don't expect to see let-no-escapes...)
-\begin{code}
+
 coreToStgExpr (Let bind body) = do
     (new_let, fvs, escs, _)
        <- mfix (\ ~(_, _, _, no_binder_escapes) ->
@@ -427,30 +496,28 @@ coreToStgExpr (Let bind body) = do
     return (new_let, fvs, escs)
 
 coreToStgExpr e = pprPanic "coreToStgExpr" (ppr e)
-\end{code}
 
-\begin{code}
 mkStgAltType :: Id -> [CoreAlt] -> AltType
-mkStgAltType bndr alts
-  = case splitTyConApp_maybe (repType (idType bndr)) of
-        Just (tc,_) | isUnboxedTupleTyCon tc -> UbxTupAlt tc
-                    | isUnLiftedTyCon tc     -> PrimAlt tc
-                    | isHiBootTyCon tc       -> look_for_better_tycon
-                    | isAlgTyCon tc          -> AlgAlt tc
-                    | otherwise              -> ASSERT2( _is_poly_alt_tycon tc, ppr tc )
-                                                PolyAlt
-        Nothing                              -> PolyAlt
-
+mkStgAltType bndr alts = case repType (idType bndr) of
+    UnaryRep rep_ty -> case tyConAppTyCon_maybe rep_ty of
+        Just tc | isUnLiftedTyCon tc -> PrimAlt tc
+                | isAbstractTyCon tc -> look_for_better_tycon
+                | isAlgTyCon tc      -> AlgAlt tc
+                | otherwise          -> ASSERT2( _is_poly_alt_tycon tc, ppr tc )
+                                        PolyAlt
+        Nothing                      -> PolyAlt
+    UbxTupleRep rep_tys -> UbxTupAlt (length rep_tys)
+    -- NB Nullary unboxed tuples have UnaryRep, and generate a PrimAlt
   where
    _is_poly_alt_tycon tc
         =  isFunTyCon tc
         || isPrimTyCon tc   -- "Any" is lifted but primitive
-        || isFamilyTyCon tc   -- Type family; e.g. arising from strict
+        || isFamilyTyCon tc -- Type family; e.g. Any, or arising from strict
                             -- function application where argument has a
                             -- type-family type
 
-   -- Sometimes, the TyCon is a HiBootTyCon which may not have any
-   -- constructors inside it.  Then we can get a better TyCon by
+   -- Sometimes, the TyCon is a AbstractTyCon which may not have any
+   -- constructors inside it.  Then we may get a better TyCon by
    -- grabbing the one from a constructor alternative
    -- if one exists.
    look_for_better_tycon
@@ -461,14 +528,11 @@ mkStgAltType bndr alts
                 PolyAlt
         where
                 (data_alts, _deflt) = findDefault alts
-\end{code}
-
 
 -- ---------------------------------------------------------------------------
 -- Applications
 -- ---------------------------------------------------------------------------
 
-\begin{code}
 coreToStgApp
          :: Maybe UpdateFlag            -- Just upd <=> this application is
                                         -- the rhs of a thunk binding
@@ -534,7 +598,7 @@ coreToStgApp _ f args = do
                                     StgOpApp (StgPrimOp op) args' res_ty
 
                 -- A call to some primitive Cmm function.
-                FCallId (CCall (CCallSpec (StaticTarget lbl (Just pkgId)) PrimCallConv _))
+                FCallId (CCall (CCallSpec (StaticTarget lbl (Just pkgId) True) PrimCallConv _))
                                  -> ASSERT( saturated )
                                     StgOpApp (StgPrimCallOp (PrimCall lbl pkgId)) args' res_ty
 
@@ -572,6 +636,10 @@ coreToStgArgs (Type _ : args) = do     -- Type argument
     (args', fvs) <- coreToStgArgs args
     return (args', fvs)
 
+coreToStgArgs (Coercion _ : args)  -- Coercion argument; replace with place holder
+  = do { (args', fvs) <- coreToStgArgs args
+       ; return (StgVarArg coercionTokenId : args', fvs) }
+
 coreToStgArgs (arg : args) = do         -- Non-type argument
     (stg_args, args_fvs) <- coreToStgArgs args
     (arg', arg_fvs, _escs) <- coreToStgExpr arg
@@ -596,7 +664,8 @@ coreToStgArgs (arg : args) = do         -- Non-type argument
         arg_ty = exprType arg
         stg_arg_ty = stgArgType stg_arg
         bad_args = (isUnLiftedType arg_ty && not (isUnLiftedType stg_arg_ty))
-                || (typePrimRep arg_ty /= typePrimRep stg_arg_ty)
+                || (map typePrimRep (flattenRepType (repType arg_ty))
+                        /= map typePrimRep (flattenRepType (repType stg_arg_ty)))
         -- In GHCi we coerce an argument of type BCO# (unlifted) to HValue (lifted),
         -- and pass it to a function expecting an HValue (arg_ty).  This is ok because
         -- we can treat an unlifted value as lifted.  But the other way round
@@ -736,10 +805,8 @@ is_join_var :: Id -> Bool
 -- A hack (used only for compiler debuggging) to tell if
 -- a variable started life as a join point ($j)
 is_join_var j = occNameString (getOccName j) == "$j"
-\end{code}
 
-\begin{code}
-coreToStgRhs :: FreeVarsInfo            -- Free var info for the scope of the binding
+coreToStgRhs :: FreeVarsInfo      -- Free var info for the scope of the binding
              -> [Id]
              -> (Id,CoreExpr)
              -> LneM (StgRhs, FreeVarsInfo, LiveInfo, EscVarsSet)
@@ -747,44 +814,67 @@ coreToStgRhs :: FreeVarsInfo            -- Free var info for the scope of the bi
 coreToStgRhs scope_fv_info binders (bndr, rhs) = do
     (new_rhs, rhs_fvs, rhs_escs) <- coreToStgExpr rhs
     lv_info <- freeVarsToLiveVars (binders `minusFVBinders` rhs_fvs)
-    return (mkStgRhs rhs_fvs (mkSRT lv_info) bndr_info new_rhs,
+    return (mkStgRhs rhs_fvs (mkSRT lv_info) bndr bndr_info new_rhs,
             rhs_fvs, lv_info, rhs_escs)
   where
     bndr_info = lookupFVInfo scope_fv_info bndr
 
-mkStgRhs :: FreeVarsInfo -> SRT -> StgBinderInfo -> StgExpr -> StgRhs
+mkStgRhs :: FreeVarsInfo -> SRT -> Id -> StgBinderInfo -> StgExpr -> StgRhs
 
-mkStgRhs _ _ _ (StgConApp con args) = StgRhsCon noCCS con args
+mkStgRhs _ _ _ _ (StgConApp con args) = StgRhsCon noCCS con args
 
-mkStgRhs rhs_fvs srt binder_info (StgLam _ bndrs body)
+mkStgRhs rhs_fvs srt _ binder_info (StgLam bndrs body)
   = StgRhsClosure noCCS binder_info
                   (getFVs rhs_fvs)
                   ReEntrant
                   srt bndrs body
 
-mkStgRhs rhs_fvs srt binder_info rhs
+mkStgRhs rhs_fvs srt bndr binder_info rhs
   = StgRhsClosure noCCS binder_info
                   (getFVs rhs_fvs)
                   upd_flag srt [] rhs
   where
-   upd_flag = Updatable
+     upd_flag = getUpdateFlag bndr
   {-
     SDM: disabled.  Eval/Apply can't handle functions with arity zero very
     well; and making these into simple non-updatable thunks breaks other
     assumptions (namely that they will be entered only once).
 
     upd_flag | isPAP env rhs  = ReEntrant
-	     | otherwise      = Updatable
-  -}
+             | otherwise      = Updatable
+
+-- Detect thunks which will reduce immediately to PAPs, and make them
+-- non-updatable.  This has several advantages:
+--
+--         - the non-updatable thunk behaves exactly like the PAP,
+--
+--         - the thunk is more efficient to enter, because it is
+--           specialised to the task.
+--
+--         - we save one update frame, one stg_update_PAP, one update
+--           and lots of PAP_enters.
+--
+--         - in the case where the thunk is top-level, we save building
+--           a black hole and futhermore the thunk isn't considered to
+--           be a CAF any more, so it doesn't appear in any SRTs.
+--
+-- We do it here, because the arity information is accurate, and we need
+-- to do it before the SRT pass to save the SRT entries associated with
+-- any top-level PAPs.
+
+isPAP env (StgApp f args) = listLengthCmp args arity == LT -- idArity f > length args
+                              where
+                                 arity = stgArity f (lookupBinding env f)
+isPAP env _               = False
+
+-}
 
 {- ToDo:
           upd = if isOnceDem dem
                     then (if isNotTop toplev
                             then SingleEntry    -- HA!  Paydirt for "dem"
                             else
-#ifdef DEBUG
-                     trace "WARNING: SE CAFs unsupported, forcing UPD instead" $
-#endif
+                     (if debugIsOn then trace "WARNING: SE CAFs unsupported, forcing UPD instead" else id) $
                      Updatable)
                 else Updatable
         -- For now we forbid SingleEntry CAFs; they tickle the
@@ -795,43 +885,14 @@ mkStgRhs rhs_fvs srt binder_info rhs
         -- specifically Main.lvl6 in spectral/cryptarithm2.
         -- So no great loss.  KSW 2000-07.
 -}
-\end{code}
 
-Detect thunks which will reduce immediately to PAPs, and make them
-non-updatable.  This has several advantages:
+-- ---------------------------------------------------------------------------
+-- A little monad for this let-no-escaping pass
+-- ---------------------------------------------------------------------------
 
-        - the non-updatable thunk behaves exactly like the PAP,
+-- There's a lot of stuff to pass around, so we use this LneM monad to
+-- help.  All the stuff here is only passed *down*.
 
-        - the thunk is more efficient to enter, because it is
-          specialised to the task.
-
-        - we save one update frame, one stg_update_PAP, one update
-          and lots of PAP_enters.
-
-        - in the case where the thunk is top-level, we save building
-          a black hole and futhermore the thunk isn't considered to
-          be a CAF any more, so it doesn't appear in any SRTs.
-
-We do it here, because the arity information is accurate, and we need
-to do it before the SRT pass to save the SRT entries associated with
-any top-level PAPs.
-
-isPAP env (StgApp f args) = listLengthCmp args arity == LT -- idArity f > length args
-                          where
-                            arity = stgArity f (lookupBinding env f)
-isPAP env _               = False
-
-
-%************************************************************************
-%*                                                                      *
-\subsection[LNE-monad]{A little monad for this let-no-escaping pass}
-%*                                                                      *
-%************************************************************************
-
-There's a lot of stuff to pass around, so we use this @LneM@ monad to
-help.  All the stuff here is only passed *down*.
-
-\begin{code}
 newtype LneM a = LneM
     { unLneM :: IdEnv HowBound
              -> LiveInfo                -- Vars and CAFs live in continuation
@@ -871,23 +932,21 @@ topLevelBound :: HowBound -> Bool
 topLevelBound ImportBound         = True
 topLevelBound (LetBound TopLet _) = True
 topLevelBound _                   = False
-\end{code}
 
-For a let(rec)-bound variable, x, we record LiveInfo, the set of
-variables that are live if x is live.  This LiveInfo comprises
-        (a) dynamic live variables (ones with a non-top-level binding)
-        (b) static live variabes (CAFs or things that refer to CAFs)
+-- For a let(rec)-bound variable, x, we record LiveInfo, the set of
+-- variables that are live if x is live.  This LiveInfo comprises
+--         (a) dynamic live variables (ones with a non-top-level binding)
+--         (b) static live variabes (CAFs or things that refer to CAFs)
+--
+-- For "normal" variables (a) is just x alone.  If x is a let-no-escaped
+-- variable then x is represented by a code pointer and a stack pointer
+-- (well, one for each stack).  So all of the variables needed in the
+-- execution of x are live if x is, and are therefore recorded in the
+-- LetBound constructor; x itself *is* included.
+--
+-- The set of dynamic live variables is guaranteed ot have no further
+-- let-no-escaped variables in it.
 
-For "normal" variables (a) is just x alone.  If x is a let-no-escaped
-variable then x is represented by a code pointer and a stack pointer
-(well, one for each stack).  So all of the variables needed in the
-execution of x are live if x is, and are therefore recorded in the
-LetBound constructor; x itself *is* included.
-
-The set of dynamic live variables is guaranteed ot have no further let-no-escaped
-variables in it.
-
-\begin{code}
 emptyLiveInfo :: LiveInfo
 emptyLiveInfo = (emptyVarSet,emptyVarSet)
 
@@ -908,11 +967,9 @@ mkSRT (_, cafs) = SRTEntries cafs
 
 getLiveVars :: LiveInfo -> StgLiveVars
 getLiveVars (lvs, _) = lvs
-\end{code}
 
+-- The std monad functions:
 
-The std monad functions:
-\begin{code}
 initLne :: IdEnv HowBound -> LneM a -> a
 initLne env m = unLneM m env emptyLiveInfo
 
@@ -928,6 +985,13 @@ thenLne :: LneM a -> (a -> LneM b) -> LneM b
 thenLne m k = LneM $ \env lvs_cont
   -> unLneM (k (unLneM m env lvs_cont)) env lvs_cont
 
+instance Functor LneM where
+    fmap = liftM
+
+instance Applicative LneM where
+    pure = return
+    (<*>) = ap
+
 instance Monad LneM where
     return = returnLne
     (>>=)  = thenLne
@@ -936,11 +1000,9 @@ instance MonadFix LneM where
     mfix expr = LneM $ \env lvs_cont ->
                        let result = unLneM (expr result) env lvs_cont
                        in  result
-\end{code}
 
-Functions specific to this monad:
+-- Functions specific to this monad:
 
-\begin{code}
 getVarsLiveInCont :: LneM LiveInfo
 getVarsLiveInCont = LneM $ \_env lvs_cont -> lvs_cont
 
@@ -987,15 +1049,12 @@ freeVarsToLiveVars fvs = LneM freeVarsToLiveVars'
                                                         -- (see the invariant on NestedLet)
 
           _lambda_or_case_binding         -> unitLiveVar v      -- Bound by lambda or case
-\end{code}
 
-%************************************************************************
-%*                                                                      *
-\subsection[Free-var info]{Free variable information}
-%*                                                                      *
-%************************************************************************
 
-\begin{code}
+-- ---------------------------------------------------------------------------
+-- Free variable information
+-- ---------------------------------------------------------------------------
+
 type FreeVarsInfo = VarEnv (Var, HowBound, StgBinderInfo)
         -- The Var is so we can gather up the free variables
         -- as a set.
@@ -1017,13 +1076,11 @@ type FreeVarsInfo = VarEnv (Var, HowBound, StgBinderInfo)
         --
         -- All case/lambda-bound things are also mapped to
         -- noBinderInfo, since we aren't interested in their
-        -- occurence info.
+        -- occurrence info.
         --
         -- For ILX we track free var info for type variables too;
         -- hence VarEnv not IdEnv
-\end{code}
 
-\begin{code}
 emptyFVInfo :: FreeVarsInfo
 emptyFVInfo = emptyVarEnv
 
@@ -1049,7 +1106,7 @@ minusFVBinder v fv = fv `delVarEnv` v
         -- c.f. CoreFVs.delBinderFV
 
 elementOfFVInfo :: Id -> FreeVarsInfo -> Bool
-elementOfFVInfo id fvs = maybeToBool (lookupVarEnv fvs id)
+elementOfFVInfo id fvs = isJust (lookupVarEnv fvs id)
 
 lookupFVInfo :: FreeVarsInfo -> Id -> StgBinderInfo
 -- Find how the given Id is used.
@@ -1077,7 +1134,7 @@ plusFVInfo :: (Var, HowBound, StgBinderInfo)
            -> (Var, HowBound, StgBinderInfo)
            -> (Var, HowBound, StgBinderInfo)
 plusFVInfo (id1,hb1,info1) (id2,hb2,info2)
-  = ASSERT (id1 == id2 && hb1 `check_eq_how_bound` hb2)
+  = ASSERT(id1 == id2 && hb1 `check_eq_how_bound` hb2)
     (id1, hb1, combineStgBinderInfo info1 info2)
 
 -- The HowBound info for a variable in the FVInfo should be consistent
@@ -1091,25 +1148,22 @@ check_eq_li :: LetInfo -> LetInfo -> Bool
 check_eq_li (NestedLet _) (NestedLet _) = True
 check_eq_li TopLet        TopLet        = True
 check_eq_li _             _             = False
-\end{code}
 
-Misc.
-\begin{code}
+-- Misc.
+
 filterStgBinders :: [Var] -> [Var]
 filterStgBinders bndrs = filter isId bndrs
-\end{code}
 
-
-\begin{code}
-        -- Ignore all notes except SCC
 myCollectBinders :: Expr Var -> ([Var], Expr Var)
 myCollectBinders expr
   = go [] expr
   where
     go bs (Lam b e)          = go (b:bs) e
-    go bs e@(Note (SCC _) _) = (reverse bs, e)
+    go bs e@(Tick t e')
+        | tickishIsCode t    = (reverse bs, e)
+        | otherwise          = go bs e'
+        -- Ignore only non-code source annotations
     go bs (Cast e _)         = go bs e
-    go bs (Note _ e)         = go bs e
     go bs e                  = (reverse bs, e)
 
 myCollectArgs :: CoreExpr -> (Id, [CoreArg])
@@ -1120,20 +1174,18 @@ myCollectArgs expr
   where
     go (Var v)          as = (v, as)
     go (App f a) as        = go f (a:as)
-    go (Note (SCC _) _) _  = pprPanic "CoreToStg.myCollectArgs" (ppr expr)
+    go (Tick _ _)     _  = pprPanic "CoreToStg.myCollectArgs" (ppr expr)
     go (Cast e _)       as = go e as
-    go (Note _ e)       as = go e as
     go (Lam b e)        as
-       | isTyCoVar b         = go e as  -- Note [Collect args]
+       | isTyVar b         = go e as  -- Note [Collect args]
     go _                _  = pprPanic "CoreToStg.myCollectArgs" (ppr expr)
-\end{code}
 
-Note [Collect args]
-~~~~~~~~~~~~~~~~~~~
-This big-lambda case occurred following a rather obscure eta expansion.
-It all seems a bit yukky to me.
+-- Note [Collect args]
+-- ~~~~~~~~~~~~~~~~~~~
+--
+-- This big-lambda case occurred following a rather obscure eta expansion.
+-- It all seems a bit yukky to me.
 
-\begin{code}
 stgArity :: Id -> HowBound -> Arity
 stgArity _ (LetBound _ arity) = arity
 stgArity f ImportBound        = idArity f

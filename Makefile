@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -45,7 +45,7 @@ endif
 include mk/custom-settings.mk
 
 # No need to update makefiles for these targets:
-REALGOALS=$(filter-out binary-dist binary-dist-prep bootstrapping-files framework-pkg clean clean_% distclean maintainer-clean show help install-docs test fulltest,$(MAKECMDGOALS))
+REALGOALS=$(filter-out binary-dist binary-dist-prep bootstrapping-files framework-pkg clean clean_% distclean maintainer-clean show echo help test fulltest,$(MAKECMDGOALS))
 
 # configure touches certain files even if they haven't changed.  This
 # can mean a lot of unnecessary recompilation after a re-configure, so
@@ -72,15 +72,11 @@ endif
 	$(MAKE) -r --no-print-directory -f ghc.mk phase=final $@
 
 binary-dist: binary-dist-prep
-ifeq "$(mingw32_TARGET_OS)" "1"
-	mv bindistprep/*.exe .
-endif
-	mv bindistprep/*.tar.bz2 .
+	mv bindistprep/*.tar.$(TAR_COMP_EXT) .
 
 binary-dist-prep:
 ifeq "$(mingw32_TARGET_OS)" "1"
 	$(MAKE) -r --no-print-directory -f ghc.mk windows-binary-dist-prep
-	$(MAKE) -r --no-print-directory -f ghc.mk windows-installer
 else
 	rm -f bindist-list
 	$(MAKE) -r --no-print-directory -f ghc.mk bindist BINDIST=YES
@@ -94,19 +90,13 @@ clean distclean maintainer-clean:
 $(filter clean_%, $(MAKECMDGOALS)) : clean_% :
 	$(MAKE) -r --no-print-directory -f ghc.mk $@ CLEANING=YES
 
-bootstrapping-files show:
+bootstrapping-files show echo:
 	$(MAKE) -r --no-print-directory -f ghc.mk $@
 
 ifeq "$(darwin_TARGET_OS)" "1"
 framework-pkg:
 	$(MAKE) -C distrib/MacOS $@
 endif
-
-# install-docs is a historical target that isn't supported in GHC 6.12. See #3662.
-install-docs:
-	@echo "The install-docs target is not supported in GHC 6.12.1 and later."
-	@echo "'make install' now installs everything, including documentation."
-	@exit 1
 
 # If the user says 'make A B', then we don't want to invoke two
 # instances of the rule above in parallel:
@@ -116,9 +106,9 @@ endif
 
 .PHONY: test
 test:
-	$(MAKE) -C testsuite/tests/ghc-regress CLEANUP=1 OUTPUT_SUMMARY=../../../testsuite_summary.txt fast
+	$(MAKE) -C testsuite/tests CLEANUP=1 OUTPUT_SUMMARY=../../testsuite_summary.txt fast
 
 .PHONY: fulltest
 fulltest:
-	$(MAKE) -C testsuite/tests/ghc-regress CLEANUP=1 OUTPUT_SUMMARY=../../../testsuite_summary.txt
+	$(MAKE) -C testsuite/tests CLEANUP=1 OUTPUT_SUMMARY=../../testsuite_summary.txt
 

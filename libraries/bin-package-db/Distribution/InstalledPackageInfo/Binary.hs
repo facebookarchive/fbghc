@@ -1,14 +1,17 @@
-{-# LANGUAGE RecordWildCards, TypeSynonymInstances, StandaloneDeriving, GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE CPP, RecordWildCards, TypeSynonymInstances, StandaloneDeriving, GeneralizedNewtypeDeriving #-}
 {-# OPTIONS_GHC -fno-warn-name-shadowing #-}
 -- This module deliberately defines orphan instances for now. Should
 -- become unnecessary once we move to using the binary package properly:
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+#if __GLASGOW_HASKELL__ >= 701
+{-# LANGUAGE Trustworthy #-}
+#endif
 -----------------------------------------------------------------------------
 -- |
 -- Module      :  Distribution.InstalledPackageInfo.Binary
 -- Copyright   :  (c) The University of Glasgow 2009
 --
--- Maintainer  :  cvs-ghc@haskell.org
+-- Maintainer  :  ghc-devs@haskell.org
 -- Portability :  portable
 --
 
@@ -33,13 +36,7 @@ readBinPackageDB file
       (\err -> error ("While parsing " ++ show file ++ ": " ++ err))
 
 catchUserError :: IO a -> (String -> IO a) -> IO a
-#ifdef BASE3
-catchUserError io f = io `Exception.catch` \e -> case e of
-                                                 ErrorCall err -> f err
-                                                 _ -> throw e
-#else
 catchUserError io f = io `Exception.catch` \(ErrorCall err) -> f err
-#endif
 
 writeBinPackageDB :: Binary m => FilePath -> [InstalledPackageInfo_ m] -> IO ()
 writeBinPackageDB file ipis = Bin.encodeFile file ipis
@@ -65,6 +62,7 @@ putInstalledPackageInfo ipi = do
   put (exposed ipi)
   put (exposedModules ipi)
   put (hiddenModules ipi)
+  put (trusted ipi)
   put (importDirs ipi)
   put (libraryDirs ipi)
   put (hsLibraries ipi)
@@ -98,6 +96,7 @@ getInstalledPackageInfo = do
   exposed <- get
   exposedModules <- get
   hiddenModules <- get
+  trusted <- get
   importDirs <- get
   libraryDirs <- get
   hsLibraries <- get
@@ -131,7 +130,9 @@ instance Binary License where
   put PublicDomain         = do putWord8 5
   put AllRightsReserved    = do putWord8 6
   put OtherLicense         = do putWord8 7
-  put (UnknownLicense str) = do putWord8 8; put str
+  put (Apache v)           = do putWord8 8; put v
+  put (AGPL v)             = do putWord8 9; put v
+  put (UnknownLicense str) = do putWord8 10; put str
 
   get = do
     n <- getWord8
@@ -144,6 +145,8 @@ instance Binary License where
       5 -> return PublicDomain
       6 -> return AllRightsReserved
       7 -> return OtherLicense
+      8 -> do v <- get; return (Apache v)
+      9 -> do v <- get; return (AGPL v)
       _ -> do str <- get; return (UnknownLicense str)
 
 instance Binary Version where

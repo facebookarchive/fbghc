@@ -19,7 +19,7 @@
  * "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * ---------------------------------------------------------------------------*/
 
@@ -49,7 +49,10 @@
 # define _BSD_SOURCE
 #endif
 
-#if IN_STG_CODE == 0
+#if IN_STG_CODE == 0 || defined(llvm_CC_FLAVOR)
+// C compilers that use an LLVM back end (clang or llvm-gcc) do not
+// correctly support global register variables so we make sure that
+// we do not declare them for these compilers.
 # define NO_GLOBAL_REG_DECLS	/* don't define fixed registers */
 #endif
 
@@ -88,7 +91,7 @@
 
 /*
  * The C backend likes to refer to labels by just mentioning their
- * names.  Howevver, when a symbol is declared as a variable in C, the
+ * names.  However, when a symbol is declared as a variable in C, the
  * C compiler will implicitly dereference it when it occurs in source.
  * So we must subvert this behaviour for .hc files by declaring
  * variables as arrays, which eliminates the implicit dereference.
@@ -114,7 +117,7 @@
  * 'Portable' inlining:
  * INLINE_HEADER is for inline functions in header files (macros)
  * STATIC_INLINE is for inline functions in source files
- * EXTERN_INLINE is for functions that we want to inline sometimes 
+ * EXTERN_INLINE is for functions that we want to inline sometimes
  * (we also compile a static version of the function; see Inlines.c)
  */
 #if defined(__GNUC__) || defined( __INTEL_COMPILER)
@@ -174,7 +177,7 @@
 #define GNU_ATTRIBUTE(at)
 #endif
 
-#if __GNUC__ >= 3 
+#if __GNUC__ >= 3
 #define GNUC3_ATTRIBUTE(at) __attribute__((at))
 #else
 #define GNUC3_ATTRIBUTE(at)
@@ -199,62 +202,62 @@
    Shorthand forms
    -------------------------------------------------------------------------- */
 
-typedef StgChar		C_;
-typedef StgWord		W_;
-typedef StgWord*	P_;
-typedef StgInt		I_;
+typedef StgChar      C_;
+typedef StgWord      W_;
+typedef StgWord*  P_;
+typedef StgInt    I_;
 typedef StgWord StgWordArray[];
 typedef StgFunPtr       F_;
 
 #define EI_(X)          extern StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
 #define II_(X)          static StgWordArray (X) GNU_ATTRIBUTE(aligned (8))
-#define IF_(f)		static StgFunPtr GNUC3_ATTRIBUTE(used) f(void) 
-#define FN_(f)		StgFunPtr f(void)
-#define EF_(f)		extern StgFunPtr f(void)
+#define IF_(f)    static StgFunPtr GNUC3_ATTRIBUTE(used) f(void)
+#define FN_(f)    StgFunPtr f(void)
+#define EF_(f)    extern StgFunPtr f(void)
 
 /* -----------------------------------------------------------------------------
    Tail calls
-
-   This needs to be up near the top as the register line on alpha needs
-   to be before all procedures (inline & out-of-line).
    -------------------------------------------------------------------------- */
 
-#include "stg/TailCalls.h"
+#define JMP_(cont) return((StgFunPtr)(cont))
+#define FB_
+#define FE_
 
 /* -----------------------------------------------------------------------------
    Other Stg stuff...
    -------------------------------------------------------------------------- */
 
 #include "stg/DLL.h"
-#include "stg/MachRegs.h"
+#include "stg/RtsMachRegs.h"
 #include "stg/Regs.h"
 #include "stg/Ticky.h"
 
 #if IN_STG_CODE
 /*
  * This is included later for RTS sources, after definitions of
- * StgInfoTable, StgClosure and so on. 
+ * StgInfoTable, StgClosure and so on.
  */
 #include "stg/MiscClosures.h"
 #endif
 
-#include "stg/SMP.h" // write_barrier() inline is required 
+#include "stg/Prim.h" /* ghc-prim fallbacks */
+#include "stg/SMP.h" // write_barrier() inline is required
 
 /* -----------------------------------------------------------------------------
    Moving Floats and Doubles
 
    ASSIGN_FLT is for assigning a float to memory (usually the
               stack/heap).  The memory address is guaranteed to be
-	      StgWord aligned (currently == sizeof(void *)).
+         StgWord aligned (currently == sizeof(void *)).
 
    PK_FLT     is for pulling a float out of memory.  The memory is
               guaranteed to be StgWord aligned.
    -------------------------------------------------------------------------- */
 
-INLINE_HEADER void	  ASSIGN_FLT (W_ [], StgFloat);
+INLINE_HEADER void     ASSIGN_FLT (W_ [], StgFloat);
 INLINE_HEADER StgFloat    PK_FLT     (W_ []);
 
-#if ALIGNMENT_FLOAT <= ALIGNMENT_LONG
+#if ALIGNMENT_FLOAT <= ALIGNMENT_VOID_P
 
 INLINE_HEADER void     ASSIGN_FLT(W_ p_dest[], StgFloat src) { *(StgFloat *)p_dest = src; }
 INLINE_HEADER StgFloat PK_FLT    (W_ p_src[])                { return *(StgFloat *)p_src; }
@@ -275,17 +278,17 @@ INLINE_HEADER StgFloat PK_FLT(W_ p_src[])
     return(y.f);
 }
 
-#endif /* ALIGNMENT_FLOAT > ALIGNMENT_LONG */
+#endif /* ALIGNMENT_FLOAT > ALIGNMENT_VOID_P */
 
-#if ALIGNMENT_DOUBLE <= ALIGNMENT_LONG
+#if ALIGNMENT_DOUBLE <= ALIGNMENT_VOID_P
 
-INLINE_HEADER void	  ASSIGN_DBL (W_ [], StgDouble);
+INLINE_HEADER void     ASSIGN_DBL (W_ [], StgDouble);
 INLINE_HEADER StgDouble   PK_DBL     (W_ []);
 
 INLINE_HEADER void      ASSIGN_DBL(W_ p_dest[], StgDouble src) { *(StgDouble *)p_dest = src; }
 INLINE_HEADER StgDouble PK_DBL    (W_ p_src[])                 { return *(StgDouble *)p_src; }
 
-#else	/* ALIGNMENT_DOUBLE > ALIGNMENT_LONG */
+#else /* ALIGNMENT_DOUBLE > ALIGNMENT_VOID_P */
 
 /* Sparc uses two floating point registers to hold a double.  We can
  * write ASSIGN_DBL and PK_DBL by directly accessing the registers
@@ -297,19 +300,19 @@ INLINE_HEADER StgDouble PK_DBL    (W_ p_src[])                 { return *(StgDou
 #define ASSIGN_DBL(dst0,src) \
     { StgPtr dst = (StgPtr)(dst0); \
       __asm__("st %2,%0\n\tst %R2,%1" : "=m" (((P_)(dst))[0]), \
-	"=m" (((P_)(dst))[1]) : "f" (src)); \
+   "=m" (((P_)(dst))[1]) : "f" (src)); \
     }
 
 #define PK_DBL(src0) \
     ( { StgPtr src = (StgPtr)(src0); \
         register double d; \
       __asm__("ld %1,%0\n\tld %2,%R0" : "=f" (d) : \
-	"m" (((P_)(src))[0]), "m" (((P_)(src))[1])); d; \
+   "m" (((P_)(src))[0]), "m" (((P_)(src))[1])); d; \
     } )
 
 #else /* ! sparc_HOST_ARCH */
 
-INLINE_HEADER void	  ASSIGN_DBL (W_ [], StgDouble);
+INLINE_HEADER void     ASSIGN_DBL (W_ [], StgDouble);
 INLINE_HEADER StgDouble   PK_DBL     (W_ []);
 
 typedef struct
@@ -334,8 +337,8 @@ INLINE_HEADER void ASSIGN_DBL(W_ p_dest[], StgDouble src)
    the same code as the previous one, and is not ANSI
 
 #define ASSIGN_DBL( p_dest, src ) \
-	*p_dest = ((double_thing) src).du.dhi; \
-	*(p_dest+1) = ((double_thing) src).du.dlo \
+   *p_dest = ((double_thing) src).du.dhi; \
+   *(p_dest+1) = ((double_thing) src).du.dlo \
 */
 
 INLINE_HEADER StgDouble PK_DBL(W_ p_src[])
@@ -413,7 +416,7 @@ INLINE_HEADER StgInt64 PK_Int64(W_ p_src[])
 
 INLINE_HEADER void ASSIGN_Word64(W_ p_dest[], StgWord64 src)
 {
-	p_dest[0] = src;
+   p_dest[0] = src;
 }
 
 INLINE_HEADER StgWord64 PK_Word64(W_ p_src[])
@@ -454,12 +457,12 @@ INLINE_HEADER StgInt64 PK_Int64(W_ p_src[])
 INLINE_HEADER void
 wcStore (StgPtr p, StgWord w)
 {
-#ifdef x86_64_HOST_ARCH    
+#ifdef x86_64_HOST_ARCH
     __asm__(
-	"movnti\t%1, %0"
-	: "=m" (*p)
-	: "r" (w)
-	);
+   "movnti\t%1, %0"
+   : "=m" (*p)
+   : "r" (w)
+   );
 #else
       *p = w;
 #endif
@@ -471,7 +474,7 @@ wcStore (StgPtr p, StgWord w)
 
 /* Multiply with overflow checking.
  *
- * This is tricky - the usual sign rules for add/subtract don't apply.  
+ * This is tricky - the usual sign rules for add/subtract don't apply.
  *
  * On 32-bit machines we use gcc's 'long long' types, finding
  * overflow with some careful bit-twiddling.
@@ -501,17 +504,17 @@ typedef union {
     StgInt32 i[2];
 } long_long_u ;
 
-#define mulIntMayOflo(a,b)			\
+#define mulIntMayOflo(a,b)       \
 ({                                              \
-  StgInt32 r, c;				\
-  long_long_u z;				\
-  z.l = (StgInt64)a * (StgInt64)b;		\
-  r = z.i[RTS_REM_IDX__];			\
-  c = z.i[RTS_CARRY_IDX__];			\
-  if (c == 0 || c == -1) {			\
-    c = ((StgWord)((a^b) ^ r))			\
-      >> (BITS_IN (I_) - 1);			\
-  }						\
+  StgInt32 r, c;           \
+  long_long_u z;           \
+  z.l = (StgInt64)a * (StgInt64)b;     \
+  r = z.i[RTS_REM_IDX__];        \
+  c = z.i[RTS_CARRY_IDX__];         \
+  if (c == 0 || c == -1) {       \
+    c = ((StgWord)((a^b) ^ r))         \
+      >> (BITS_IN (I_) - 1);        \
+  }                  \
   c;                                            \
 })
 
@@ -528,15 +531,15 @@ typedef union {
 #define HALF_POS_INT  (((I_)1) << ((BITS_IN (I_) - 1) / 2))
 #define HALF_NEG_INT  (-HALF_POS_INT)
 
-#define mulIntMayOflo(a,b)			\
+#define mulIntMayOflo(a,b)       \
 ({                                              \
-  I_ c; 					\
+  I_ c;              \
   if ((I_)a <= HALF_NEG_INT || a >= HALF_POS_INT    \
       || (I_)b <= HALF_NEG_INT || b >= HALF_POS_INT) {\
-    c = 1;					\
-  } else {					\
-    c = 0;					\
-  }						\
+    c = 1;              \
+  } else {              \
+    c = 0;              \
+  }                  \
   c;                                            \
 })
 #endif

@@ -58,7 +58,7 @@ sub sanity_check_tree {
         if (/^#/) {
             # Comment; do nothing
         }
-        elsif (/^([a-zA-Z0-9\/.-]+) +([^ ]+) +[^ ]+ +[^ ]+ +[^ ]+$/) {
+        elsif (/^([a-zA-Z0-9\/.-]+) +([^ ]+) +[^ ]+ +[^ ]+$/) {
             $dir = $1;
             $tag = $2;
 
@@ -85,51 +85,8 @@ sub sanity_check_tree {
 # Create libraries/*/{ghc.mk,GNUmakefile}
 sub boot_pkgs {
     my @library_dirs = ();
-    my @tarballs = glob("libraries/tarballs/*");
 
-    my $tarball;
     my $package;
-    my $stamp;
-
-    for $tarball (@tarballs) {
-        $package = $tarball;
-        $package =~ s#^libraries/tarballs/##;
-        $package =~ s/-[0-9.]*(-snapshot)?\.tar\.gz$//;
-
-        # Sanity check, so we don't rmtree the wrong thing below
-        if (($package eq "") || ($package =~ m#[/.\\]#)) {
-            die "Bad package name: $package";
-        }
-
-        if (-d "libraries/$package/_darcs") {
-            print "Ignoring libraries/$package as it looks like a darcs checkout\n"
-        }
-        elsif (-d "libraries/$package/.git") {
-            print "Ignoring libraries/$package as it looks like a git checkout\n"
-        }
-        else {
-            if (! -d "libraries/stamp") {
-                mkdir "libraries/stamp";
-            }
-            $stamp = "libraries/stamp/$package";
-            if ((! -d "libraries/$package") || (! -f "$stamp")
-             || ((-M "libraries/stamp/$package") > (-M $tarball))) {
-                print "Unpacking $package\n";
-                if (-d "libraries/$package") {
-                    &rmtree("libraries/$package")
-                        or die "Can't remove libraries/$package: $!";
-                }
-                mkdir "libraries/$package"
-                    or die "Can't create libraries/$package: $!";
-                system ("sh", "-c", "cd 'libraries/$package' && { cat ../../$tarball | gzip -d | tar xf - ; } && mv */* .") == 0
-                    or die "Failed to unpack $package";
-                open STAMP, "> $stamp"
-                    or die "Failed to open stamp file: $!";
-                close STAMP
-                    or die "Failed to close stamp file: $!";
-            }
-        }
-    }
 
     for $package (glob "libraries/*/") {
         $package =~ s/\/$//;
@@ -174,7 +131,9 @@ sub boot_pkgs {
                     or die "Opening $package/ghc.mk failed: $!";
                 print GHCMK "${package}_PACKAGE = ${pkg}\n";
                 print GHCMK "${package}_dist-install_GROUP = libraries\n";
-                print GHCMK "\$(eval \$(call build-package,${package},dist-install,\$(if \$(filter ${dir},\$(STAGE2_PACKAGES)),2,1)))\n";
+                print GHCMK "\$(if \$(filter ${dir},\$(PACKAGES_STAGE0)),\$(eval \$(call build-package,${package},dist-boot,0)))\n";
+                print GHCMK "\$(if \$(filter ${dir},\$(PACKAGES_STAGE1)),\$(eval \$(call build-package,${package},dist-install,1)))\n";
+                print GHCMK "\$(if \$(filter ${dir},\$(PACKAGES_STAGE2)),\$(eval \$(call build-package,${package},dist-install,2)))\n";
                 close GHCMK
                     or die "Closing $package/ghc.mk failed: $!";
 
@@ -219,7 +178,7 @@ not be what you want if you are developing GHC or the libraries, rather
 than simply building it to use it.
 
 For information on creating a mk/build.mk file, please see:
-    http://hackage.haskell.org/trac/ghc/wiki/Building/Using#Buildconfiguration
+    http://ghc.haskell.org/trac/ghc/wiki/Building/Using#Buildconfiguration
 
 EOF
     }

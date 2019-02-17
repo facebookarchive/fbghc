@@ -3,6 +3,10 @@
 --
 -- The IO Monad with an environment
 --
+-- The environment is passed around as a Reader monad but
+-- as its in the IO monad, mutable references can be used
+-- for updating state.
+--
 {-# LANGUAGE UndecidableInstances #-}
 
 module IOEnv (
@@ -18,7 +22,7 @@ module IOEnv (
         -- Getting at the environment
         getEnv, setEnv, updEnv,
 
-        runIOEnv, unsafeInterleaveM,
+        runIOEnv, unsafeInterleaveM, uninterruptibleMaskM_,
         tryM, tryAllM, tryMostM, fixM,
 
         -- I/O operations
@@ -26,7 +30,9 @@ module IOEnv (
         atomicUpdMutVar, atomicUpdMutVar'
   ) where
 
+import DynFlags
 import Exception
+import Module
 import Panic
 
 import Data.IORef       ( IORef, newIORef, readIORef, writeIORef, modifyIORef,
@@ -36,6 +42,7 @@ import System.IO.Unsafe ( unsafeInterleaveIO )
 import System.IO        ( fixIO )
 import Control.Monad
 import MonadUtils
+import Control.Applicative (Alternative(..))
 
 ----------------------------------------------------------------------
 -- Defining the monad type
@@ -83,6 +90,14 @@ instance Show IOEnvFailure where
     show IOEnvFailure = "IOEnv failure"
 
 instance Exception IOEnvFailure
+
+instance ContainsDynFlags env => HasDynFlags (IOEnv env) where
+    getDynFlags = do env <- getEnv
+                     return $ extractDynFlags env
+
+instance ContainsModule env => HasModule (IOEnv env) where
+    getModule = do env <- getEnv
+                   return $ extractModule env
 
 ----------------------------------------------------------------------
 -- Fundmantal combinators specific to the monad
@@ -134,10 +149,16 @@ tryMostM (IOEnv thing) = IOEnv (\ env -> tryMost (thing env))
 unsafeInterleaveM :: IOEnv env a -> IOEnv env a
 unsafeInterleaveM (IOEnv m) = IOEnv (\ env -> unsafeInterleaveIO (m env))
 
+uninterruptibleMaskM_ :: IOEnv env a -> IOEnv env a
+uninterruptibleMaskM_ (IOEnv m) = IOEnv (\ env -> uninterruptibleMask_ (m env))
 
 ----------------------------------------------------------------------
--- MonadPlus
+-- Alternative/MonadPlus
 ----------------------------------------------------------------------
+
+instance MonadPlus IO => Alternative (IOEnv env) where
+      empty = mzero
+      (<|>) = mplus
 
 -- For use if the user has imported Control.Monad.Error from MTL
 -- Requires UndecidableInstances
@@ -194,23 +215,3 @@ updEnv :: (env -> env') -> IOEnv env' a -> IOEnv env a
 {-# INLINE updEnv #-}
 updEnv upd (IOEnv m) = IOEnv (\ env -> m (upd env))
 
-
-----------------------------------------------------------------------
--- Standard combinators, but specialised for this monad
--- (for efficiency)
-----------------------------------------------------------------------
-
--- {-# SPECIALIZE mapM          :: (a -> IOEnv env b) -> [a] -> IOEnv env [b] #-}
--- {-# SPECIALIZE mapM_         :: (a -> IOEnv env b) -> [a] -> IOEnv env () #-}
--- {-# SPECIALIZE mapSndM       :: (b -> IOEnv env c) -> [(a,b)] -> IOEnv env [(a,c)] #-}
--- {-# SPECIALIZE sequence      :: [IOEnv env a] -> IOEnv env [a] #-}
--- {-# SPECIALIZE sequence_     :: [IOEnv env a] -> IOEnv env () #-}
--- {-# SPECIALIZE foldlM        :: (a -> b -> IOEnv env a)  -> a -> [b] -> IOEnv env a #-}
--- {-# SPECIALIZE foldrM        :: (b -> a -> IOEnv env a)  -> a -> [b] -> IOEnv env a #-}
--- {-# SPECIALIZE mapAndUnzipM  :: (a -> IOEnv env (b,c))   -> [a] -> IOEnv env ([b],[c]) #-}
--- {-# SPECIALIZE mapAndUnzip3M :: (a -> IOEnv env (b,c,d)) -> [a] -> IOEnv env ([b],[c],[d]) #-}
--- {-# SPECIALIZE zipWithM      :: (a -> b -> IOEnv env c) -> [a] -> [b] -> IOEnv env [c] #-}
--- {-# SPECIALIZE zipWithM_     :: (a -> b -> IOEnv env c) -> [a] -> [b] -> IOEnv env () #-}
--- {-# SPECIALIZE anyM          :: (a -> IOEnv env Bool) -> [a] -> IOEnv env Bool #-}
--- {-# SPECIALIZE when          :: Bool -> IOEnv env a -> IOEnv env () #-}
--- {-# SPECIALIZE unless        :: Bool -> IOEnv env a -> IOEnv env () #-}

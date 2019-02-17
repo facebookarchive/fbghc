@@ -23,20 +23,15 @@
    have values in the lower 2Gb of the address space, so offsets all
    fit in 32 bits.  Hence we can use 32-bit offset fields.
 
-   When going via-C, the mangler arranges that we only generate
-   relative relocations between symbols in the same segment (the text
-   segment).  The NCG, however, puts things in the right sections and
-   uses 32-bit relative offsets instead.
-
    Somewhere between binutils-2.16.1 and binutils-2.16.91.0.6,
    support for 64-bit PC-relative relocations was added, so maybe this
    hackery can go away sometime.
    ------------------------------------------------------------------------- */
 
 #if x86_64_TARGET_ARCH
-#define OFFSET_FIELD(n) StgHalfInt n; StgHalfWord __pad_##n;
+#define OFFSET_FIELD(n) StgHalfInt n; StgHalfWord __pad_##n
 #else   
-#define OFFSET_FIELD(n) StgInt n;
+#define OFFSET_FIELD(n) StgInt n
 #endif
 
 /* -----------------------------------------------------------------------------
@@ -82,7 +77,7 @@ typedef struct {
 /* The type flags provide quick access to certain properties of a closure. */
 
 #define _HNF (1<<0)  /* head normal form?    */
-#define _BTM (1<<1)  /* bitmap-style layout? */
+#define _BTM (1<<1)  /* uses info->layout.bitmap */
 #define _NS  (1<<2)  /* non-sparkable        */
 #define _STA (1<<3)  /* static?              */
 #define _THU (1<<4)  /* thunk?               */
@@ -201,7 +196,7 @@ typedef union {
 #ifndef TABLES_NEXT_TO_CODE
     StgLargeBitmap* large_bitmap; /* pointer to large bitmap structure */
 #else
-    OFFSET_FIELD( large_bitmap_offset );  /* offset from info table to large bitmap structure */
+    OFFSET_FIELD(large_bitmap_offset);  /* offset from info table to large bitmap structure */
 #endif
     
     StgWord selector_offset;	  /* used in THUNK_SELECTORs */
@@ -214,7 +209,7 @@ typedef union {
  */
 typedef struct StgInfoTable_ {
 
-#ifndef TABLES_NEXT_TO_CODE
+#if !defined(TABLES_NEXT_TO_CODE)
     StgFunPtr       entry;	/* pointer to the entry code */
 #endif
 
@@ -260,12 +255,12 @@ typedef struct StgInfoTable_ {
    -------------------------------------------------------------------------- */
 
 typedef struct StgFunInfoExtraRev_ {
-    OFFSET_FIELD ( slow_apply_offset ); /* apply to args on the stack */
+    OFFSET_FIELD(slow_apply_offset); /* apply to args on the stack */
     union { 
 	StgWord bitmap;
-	OFFSET_FIELD ( bitmap_offset );	/* arg ptr/nonptr bitmap */
+	OFFSET_FIELD(bitmap_offset);	/* arg ptr/nonptr bitmap */
     } b;
-    OFFSET_FIELD ( srt_offset ); /* pointer to the SRT table */
+    OFFSET_FIELD(srt_offset);   /* pointer to the SRT table */
     StgHalfWord    fun_type;    /* function type */
     StgHalfWord    arity;       /* function arity */
 } StgFunInfoExtraRev;
@@ -304,7 +299,7 @@ extern StgWord stg_arg_bitmaps[];
 
 typedef struct {
 #if defined(TABLES_NEXT_TO_CODE)
-    OFFSET_FIELD( srt_offset );	/* offset to the SRT table */
+    OFFSET_FIELD(srt_offset);	/* offset to the SRT table */
     StgInfoTable i;
 #else
     StgInfoTable i;
@@ -326,7 +321,7 @@ typedef struct StgThunkInfoTable_ {
     StgInfoTable i;
 #endif
 #if defined(TABLES_NEXT_TO_CODE)
-    OFFSET_FIELD( srt_offset );	/* offset to the SRT table */
+    OFFSET_FIELD(srt_offset);	/* offset to the SRT table */
 #else
     StgSRT         *srt;	/* pointer to the SRT table */
 #endif
@@ -344,11 +339,11 @@ typedef struct StgConInfoTable_ {
     StgInfoTable i;
 #endif
 
-#ifndef TABLES_NEXT_TO_CODE
-    char *con_desc;
+#if defined(TABLES_NEXT_TO_CODE)
+    OFFSET_FIELD(con_desc); // the name of the data constructor 
+                            // as: Package:Module.Name
 #else
-    OFFSET_FIELD(con_desc) // the name of the data constructor 
-                           // as: Package:Module.Name
+    char *con_desc;
 #endif
 
 #if defined(TABLES_NEXT_TO_CODE)

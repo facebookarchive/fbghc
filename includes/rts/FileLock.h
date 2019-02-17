@@ -7,18 +7,16 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * ---------------------------------------------------------------------------*/
 
 #ifndef RTS_FILELOCK_H
 #define RTS_FILELOCK_H
 
-#ifdef HAVE_SYS_TYPES_H
-#include <sys/types.h>
-#endif
+#include "Stg.h"
 
-int  lockFile(int fd, dev_t dev, ino_t ino, int for_writing);
+int  lockFile(int fd, StgWord64 dev, StgWord64 ino, int for_writing);
 int  unlockFile(int fd);
 
 #endif /* RTS_FILELOCK_H */

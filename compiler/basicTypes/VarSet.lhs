@@ -4,9 +4,16 @@
 %
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module VarSet (
         -- * Var, Id and TyVar set types
-	VarSet, IdSet, TyVarSet,
+	VarSet, IdSet, TyVarSet, CoVarSet,
 	
 	-- ** Manipulating these sets
 	emptyVarSet, unitVarSet, mkVarSet,
@@ -17,12 +24,12 @@ module VarSet (
 	isEmptyVarSet, delVarSet, delVarSetList, delVarSetByKey,
 	minusVarSet, foldVarSet, filterVarSet, fixVarSet,
 	lookupVarSet, mapVarSet, sizeVarSet, seqVarSet,
-	elemVarSetByKey
+	elemVarSetByKey, partitionVarSet
     ) where
 
 #include "HsVersions.h"
 
-import Var      ( Var, TyVar, Id )
+import Var      ( Var, TyVar, CoVar, Id )
 import Unique
 import UniqSet
 \end{code}
@@ -37,6 +44,7 @@ import UniqSet
 type VarSet       = UniqSet Var
 type IdSet 	  = UniqSet Id
 type TyVarSet	  = UniqSet TyVar
+type CoVarSet     = UniqSet CoVar
 
 emptyVarSet	:: VarSet
 intersectVarSet	:: VarSet -> VarSet -> VarSet
@@ -64,6 +72,7 @@ extendVarSet_C  :: (Var->Var->Var) -> VarSet -> Var -> VarSet
 delVarSetByKey	:: VarSet -> Unique -> VarSet
 elemVarSetByKey :: Unique -> VarSet -> Bool
 fixVarSet       :: (VarSet -> VarSet) -> VarSet -> VarSet
+partitionVarSet :: (Var -> Bool) -> VarSet -> (VarSet, VarSet)
 
 emptyVarSet	= emptyUniqSet
 unitVarSet	= unitUniqSet
@@ -94,6 +103,7 @@ filterVarSet	= filterUniqSet
 extendVarSet_C = addOneToUniqSet_C
 delVarSetByKey	= delOneFromUniqSet_Directly
 elemVarSetByKey	= elemUniqSet_Directly
+partitionVarSet = partitionUniqSet
 \end{code}
 
 \begin{code}

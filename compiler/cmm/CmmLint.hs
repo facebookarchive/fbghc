@@ -1,64 +1,77 @@
--- The above warning supression flag is a temporary kludge.
--- While working on this module you are encouraged to remove it and fix
--- any warnings in the module. See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#Warnings
--- for details
-
 -----------------------------------------------------------------------------
 --
--- (c) The University of Glasgow 2004-2006
+-- (c) The University of Glasgow 2011
 --
 -- CmmLint: checking the correctness of Cmm statements and expressions
 --
 -----------------------------------------------------------------------------
-
+{-# LANGUAGE GADTs #-}
 module CmmLint (
-  cmmLint, cmmLintTop
+    cmmLint, cmmLintGraph
   ) where
 
+import Hoopl
+import Cmm
+import CmmUtils
+import CmmLive
+import PprCmm ()
 import BlockId
-import OldCmm
-import CLabel
-import Outputable
-import OldPprCmm()
-import Constants
 import FastString
+import Outputable
+import DynFlags
 
 import Data.Maybe
+import Control.Monad (liftM, ap)
+import Control.Applicative (Applicative(..))
+
+-- Things to check:
+--     - invariant on CmmBlock in CmmExpr (see comment there)
+--     - check for branches to blocks that don't exist
+--     - check types
 
 -- -----------------------------------------------------------------------------
 -- Exported entry points:
 
 cmmLint :: (Outputable d, Outputable h)
-	=> GenCmm d h (ListGraph CmmStmt) -> Maybe SDoc
-cmmLint (Cmm tops) = runCmmLint (mapM_ lintCmmTop) tops
+        => DynFlags -> GenCmmGroup d h CmmGraph -> Maybe SDoc
+cmmLint dflags tops = runCmmLint dflags (mapM_ (lintCmmDecl dflags)) tops
 
-cmmLintTop :: (Outputable d, Outputable h)
-	   => GenCmmTop d h (ListGraph CmmStmt) -> Maybe SDoc
-cmmLintTop top = runCmmLint lintCmmTop top
+cmmLintGraph :: DynFlags -> CmmGraph -> Maybe SDoc
+cmmLintGraph dflags g = runCmmLint dflags (lintCmmGraph dflags) g
 
-runCmmLint :: Outputable a => (a -> CmmLint b) -> a -> Maybe SDoc
-runCmmLint l p = 
-   case unCL (l p) of
-	Left err -> Just (vcat [ptext $ sLit ("Cmm lint error:"),
-				nest 2 err,
-				ptext $ sLit ("Program was:"),
-				nest 2 (ppr p)])
-  	Right _  -> Nothing
+runCmmLint :: Outputable a => DynFlags -> (a -> CmmLint b) -> a -> Maybe SDoc
+runCmmLint dflags l p =
+   case unCL (l p) dflags of
+     Left err -> Just (vcat [ptext $ sLit ("Cmm lint error:"),
+                             nest 2 err,
+                             ptext $ sLit ("Program was:"),
+                             nest 2 (ppr p)])
+     Right _  -> Nothing
 
-lintCmmTop :: (GenCmmTop h i (ListGraph CmmStmt)) -> CmmLint ()
-lintCmmTop (CmmProc _ lbl (ListGraph blocks))
-  = addLintInfo (text "in proc " <> pprCLabel lbl) $
-        let labels = foldl (\s b -> setInsert (blockId b) s) setEmpty blocks
-	in  mapM_ (lintCmmBlock labels) blocks
-
-lintCmmTop (CmmData {})
+lintCmmDecl :: DynFlags -> GenCmmDecl h i CmmGraph -> CmmLint ()
+lintCmmDecl dflags (CmmProc _ lbl _ g)
+  = addLintInfo (text "in proc " <> ppr lbl) $ lintCmmGraph dflags g
+lintCmmDecl _ (CmmData {})
   = return ()
 
-lintCmmBlock :: BlockSet -> GenBasicBlock CmmStmt -> CmmLint ()
-lintCmmBlock labels (BasicBlock id stmts)
-  = addLintInfo (text "in basic block " <> ppr id) $
-	mapM_ (lintCmmStmt labels) stmts
+
+lintCmmGraph :: DynFlags -> CmmGraph -> CmmLint ()
+lintCmmGraph dflags g =
+    cmmLocalLiveness dflags g `seq` mapM_ (lintCmmBlock labels) blocks
+    -- cmmLiveness throws an error if there are registers
+    -- live on entry to the graph (i.e. undefined
+    -- variables)
+  where
+       blocks = toBlockList g
+       labels = setFromList (map entryLabel blocks)
+
+
+lintCmmBlock :: BlockSet -> CmmBlock -> CmmLint ()
+lintCmmBlock labels block
+  = addLintInfo (text "in basic block " <> ppr (entryLabel block)) $ do
+        let (_, middle, last) = blockSplit block
+        mapM_ lintCmmMiddle (blockToList middle)
+        lintCmmLast labels last
 
 -- -----------------------------------------------------------------------------
 -- lintCmmExpr
@@ -75,24 +88,29 @@ lintCmmExpr (CmmLoad expr rep) = do
   --   cmmCheckWordAddress expr
   return rep
 lintCmmExpr expr@(CmmMachOp op args) = do
+  dflags <- getDynFlags
   tys <- mapM lintCmmExpr args
-  if map (typeWidth . cmmExprType) args == machOpArgReps op
-  	then cmmCheckMachOp op args tys
-	else cmmLintMachOpErr expr (map cmmExprType args) (machOpArgReps op)
+  if map (typeWidth . cmmExprType dflags) args == machOpArgReps dflags op
+        then cmmCheckMachOp op args tys
+        else cmmLintMachOpErr expr (map (cmmExprType dflags) args) (machOpArgReps dflags op)
 lintCmmExpr (CmmRegOff reg offset)
-  = lintCmmExpr (CmmMachOp (MO_Add rep)
-		[CmmReg reg, CmmLit (CmmInt (fromIntegral offset) rep)])
-  where rep = typeWidth (cmmRegType reg)
-lintCmmExpr expr = 
-  return (cmmExprType expr)
+  = do dflags <- getDynFlags
+       let rep = typeWidth (cmmRegType dflags reg)
+       lintCmmExpr (CmmMachOp (MO_Add rep)
+                [CmmReg reg, CmmLit (CmmInt (fromIntegral offset) rep)])
+lintCmmExpr expr =
+  do dflags <- getDynFlags
+     return (cmmExprType dflags expr)
 
 -- Check for some common byte/word mismatches (eg. Sp + 1)
 cmmCheckMachOp   :: MachOp -> [CmmExpr] -> [CmmType] -> CmmLint CmmType
 cmmCheckMachOp op [lit@(CmmLit (CmmInt { })), reg@(CmmReg _)] tys
   = cmmCheckMachOp op [reg, lit] tys
 cmmCheckMachOp op _ tys
-  = return (machOpResultType op tys)
+  = do dflags <- getDynFlags
+       return (machOpResultType dflags op tys)
 
+{-
 isOffsetOp :: MachOp -> Bool
 isOffsetOp (MO_Add _) = True
 isOffsetOp (MO_Sub _) = True
@@ -102,10 +120,10 @@ isOffsetOp _ = False
 -- check for funny-looking sub-word offsets.
 _cmmCheckWordAddress :: CmmExpr -> CmmLint ()
 _cmmCheckWordAddress e@(CmmMachOp op [arg, CmmLit (CmmInt i _)])
-  | isOffsetOp op && notNodeReg arg && i `rem` fromIntegral wORD_SIZE /= 0
+  | isOffsetOp op && notNodeReg arg && i `rem` fromIntegral (wORD_SIZE dflags) /= 0
   = cmmLintDubiousWordOffset e
 _cmmCheckWordAddress e@(CmmMachOp op [CmmLit (CmmInt i _), arg])
-  | isOffsetOp op && notNodeReg arg && i `rem` fromIntegral wORD_SIZE /= 0
+  | isOffsetOp op && notNodeReg arg && i `rem` fromIntegral (wORD_SIZE dflags) /= 0
   = cmmLintDubiousWordOffset e
 _cmmCheckWordAddress _
   = return ()
@@ -115,87 +133,127 @@ _cmmCheckWordAddress _
 notNodeReg :: CmmExpr -> Bool
 notNodeReg (CmmReg reg) | reg == nodeReg = False
 notNodeReg _                             = True
+-}
 
-lintCmmStmt :: BlockSet -> CmmStmt -> CmmLint ()
-lintCmmStmt labels = lint
-    where lint (CmmNop) = return ()
-          lint (CmmComment {}) = return ()
-          lint stmt@(CmmAssign reg expr) = do
+lintCmmMiddle :: CmmNode O O -> CmmLint ()
+lintCmmMiddle node = case node of
+  CmmComment _ -> return ()
+
+  CmmAssign reg expr -> do
+            dflags <- getDynFlags
             erep <- lintCmmExpr expr
-	    let reg_ty = cmmRegType reg
+            let reg_ty = cmmRegType dflags reg
             if (erep `cmmEqType_ignoring_ptrhood` reg_ty)
                 then return ()
-                else cmmLintAssignErr stmt erep reg_ty
-          lint (CmmStore l r) = do
+                else cmmLintAssignErr (CmmAssign reg expr) erep reg_ty
+
+  CmmStore l r -> do
             _ <- lintCmmExpr l
             _ <- lintCmmExpr r
             return ()
-          lint (CmmCall target _res args _ _) =
-              lintTarget target >> mapM_ (lintCmmExpr . hintlessCmm) args
-          lint (CmmCondBranch e id) = checkTarget id >> lintCmmExpr e >> checkCond e
-          lint (CmmSwitch e branches) = do
+
+  CmmUnsafeForeignCall target _formals actuals -> do
+            lintTarget target
+            mapM_ lintCmmExpr actuals
+
+
+lintCmmLast :: BlockSet -> CmmNode O C -> CmmLint ()
+lintCmmLast labels node = case node of
+  CmmBranch id -> checkTarget id
+
+  CmmCondBranch e t f -> do
+            dflags <- getDynFlags
+            mapM_ checkTarget [t,f]
+            _ <- lintCmmExpr e
+            checkCond dflags e
+
+  CmmSwitch e branches -> do
+            dflags <- getDynFlags
             mapM_ checkTarget $ catMaybes branches
             erep <- lintCmmExpr e
-            if (erep `cmmEqType_ignoring_ptrhood` bWord)
+            if (erep `cmmEqType_ignoring_ptrhood` bWord dflags)
               then return ()
-              else cmmLintErr (text "switch scrutinee is not a word: " <> ppr e <>
-                               text " :: " <> ppr erep)
-          lint (CmmJump e args) = lintCmmExpr e >> mapM_ (lintCmmExpr . hintlessCmm) args
-          lint (CmmReturn ress) = mapM_ (lintCmmExpr . hintlessCmm) ress
-          lint (CmmBranch id)    = checkTarget id
-          checkTarget id = if setMember id labels then return ()
-                           else cmmLintErr (text "Branch to nonexistent id" <+> ppr id)
+              else cmmLintErr (text "switch scrutinee is not a word: " <>
+                               ppr e <> text " :: " <> ppr erep)
 
-lintTarget :: CmmCallTarget -> CmmLint ()
-lintTarget (CmmCallee e _) = lintCmmExpr e >> return ()
-lintTarget (CmmPrim {})    = return ()
+  CmmCall { cml_target = target, cml_cont = cont } -> do
+          _ <- lintCmmExpr target
+          maybe (return ()) checkTarget cont
+
+  CmmForeignCall tgt _ args succ _ _ _ -> do
+          lintTarget tgt
+          mapM_ lintCmmExpr args
+          checkTarget succ
+ where
+  checkTarget id
+     | setMember id labels = return ()
+     | otherwise = cmmLintErr (text "Branch to nonexistent id" <+> ppr id)
 
 
-checkCond :: CmmExpr -> CmmLint ()
-checkCond (CmmMachOp mop _) | isComparisonMachOp mop = return ()
-checkCond (CmmLit (CmmInt x t)) | x == 0 || x == 1, t == wordWidth = return () -- constant values
-checkCond expr = cmmLintErr (hang (text "expression is not a conditional:") 2
-				    (ppr expr))
+lintTarget :: ForeignTarget -> CmmLint ()
+lintTarget (ForeignTarget e _) = lintCmmExpr e >> return ()
+lintTarget (PrimTarget {})     = return ()
+
+
+checkCond :: DynFlags -> CmmExpr -> CmmLint ()
+checkCond _ (CmmMachOp mop _) | isComparisonMachOp mop = return ()
+checkCond dflags (CmmLit (CmmInt x t)) | x == 0 || x == 1, t == wordWidth dflags = return () -- constant values
+checkCond _ expr
+    = cmmLintErr (hang (text "expression is not a conditional:") 2
+                         (ppr expr))
 
 -- -----------------------------------------------------------------------------
 -- CmmLint monad
 
 -- just a basic error monad:
 
-newtype CmmLint a = CmmLint { unCL :: Either SDoc a }
+newtype CmmLint a = CmmLint { unCL :: DynFlags -> Either SDoc a }
+
+instance Functor CmmLint where
+      fmap = liftM
+
+instance Applicative CmmLint where
+      pure = return
+      (<*>) = ap
 
 instance Monad CmmLint where
-  CmmLint m >>= k = CmmLint $ case m of 
-				Left e -> Left e
-				Right a -> unCL (k a)
-  return a = CmmLint (Right a)
+  CmmLint m >>= k = CmmLint $ \dflags ->
+                                case m dflags of
+                                Left e -> Left e
+                                Right a -> unCL (k a) dflags
+  return a = CmmLint (\_ -> Right a)
+
+instance HasDynFlags CmmLint where
+    getDynFlags = CmmLint (\dflags -> Right dflags)
 
 cmmLintErr :: SDoc -> CmmLint a
-cmmLintErr msg = CmmLint (Left msg)
+cmmLintErr msg = CmmLint (\_ -> Left msg)
 
 addLintInfo :: SDoc -> CmmLint a -> CmmLint a
-addLintInfo info thing = CmmLint $ 
-   case unCL thing of
-	Left err -> Left (hang info 2 err)
-	Right a  -> Right a
+addLintInfo info thing = CmmLint $ \dflags ->
+   case unCL thing dflags of
+        Left err -> Left (hang info 2 err)
+        Right a  -> Right a
 
 cmmLintMachOpErr :: CmmExpr -> [CmmType] -> [Width] -> CmmLint a
 cmmLintMachOpErr expr argsRep opExpectsRep
-     = cmmLintErr (text "in MachOp application: " $$ 
-					nest 2 (ppr expr) $$
-				        (text "op is expecting: " <+> ppr opExpectsRep) $$
-					(text "arguments provide: " <+> ppr argsRep))
+     = cmmLintErr (text "in MachOp application: " $$
+                   nest 2 (ppr  expr) $$
+                      (text "op is expecting: " <+> ppr opExpectsRep) $$
+                      (text "arguments provide: " <+> ppr argsRep))
 
-cmmLintAssignErr :: CmmStmt -> CmmType -> CmmType -> CmmLint a
+cmmLintAssignErr :: CmmNode e x -> CmmType -> CmmType -> CmmLint a
 cmmLintAssignErr stmt e_ty r_ty
-  = cmmLintErr (text "in assignment: " $$ 
-		nest 2 (vcat [ppr stmt, 
-			      text "Reg ty:" <+> ppr r_ty,
-			      text "Rhs ty:" <+> ppr e_ty]))
-			 
-					
+  = cmmLintErr (text "in assignment: " $$
+                nest 2 (vcat [ppr stmt,
+                              text "Reg ty:" <+> ppr r_ty,
+                              text "Rhs ty:" <+> ppr e_ty]))
 
+
+{-
 cmmLintDubiousWordOffset :: CmmExpr -> CmmLint a
 cmmLintDubiousWordOffset expr
    = cmmLintErr (text "offset is not a multiple of words: " $$
-			nest 2 (ppr expr))
+                 nest 2 (ppr expr))
+-}
+

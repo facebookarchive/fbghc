@@ -22,17 +22,36 @@ import LeaveCriticalSection;
    Stack underflow
    ------------------------------------------------------------------------- */
 
-INFO_TABLE_RET (stg_stack_underflow_frame, UNDERFLOW_FRAME, P_ unused)
+INFO_TABLE_RET (stg_stack_underflow_frame, UNDERFLOW_FRAME,
+                W_ info_ptr, P_ unused)
+    /* no args => explicit stack */
 {
     W_ new_tso;
     W_ ret_off;
+
+    SAVE_STGREGS
 
     SAVE_THREAD_STATE();
     ("ptr" ret_off) = foreign "C" threadStackUnderflow(MyCapability(),
                                                        CurrentTSO);
     LOAD_THREAD_STATE();
 
-    jump %ENTRY_CODE(Sp(ret_off));
+    RESTORE_STGREGS
+
+    jump %ENTRY_CODE(Sp(ret_off)) [*]; // NB. all registers live!
+}
+
+/* ----------------------------------------------------------------------------
+   Restore a saved cost centre
+   ------------------------------------------------------------------------- */
+
+INFO_TABLE_RET (stg_restore_cccs, RET_SMALL, W_ info_ptr, W_ cccs)
+{
+#if defined(PROFILING)
+    CCCS = Sp(1);
+#endif
+    Sp_adj(2);
+    jump %ENTRY_CODE(Sp(0)) [*]; // NB. all registers live!
 }
 
 /* ----------------------------------------------------------------------------
@@ -40,10 +59,9 @@ INFO_TABLE_RET (stg_stack_underflow_frame, UNDERFLOW_FRAME, P_ unused)
    ------------------------------------------------------------------------- */
 
 /* 9 bits of return code for constructors created by the interpreter. */
-stg_interp_constr_entry
-{ 
-    /* R1 points at the constructor */
-    jump %ENTRY_CODE(Sp(0));
+stg_interp_constr_entry (P_ ret)
+{
+    return (ret);
 }
 
 /* Some info tables to be used when compiled code returns a value to
@@ -57,7 +75,7 @@ stg_interp_constr_entry
 
       ptr to BCO holding return continuation
       ptr to one of these info tables.
- 
+
    The info table code, both direct and vectored, must:
       * push R1/F1/D1 on the stack, and its tag if necessary
       * push the BCO (so it's now on the stack twice)
@@ -81,76 +99,83 @@ stg_interp_constr_entry
 */
 
 INFO_TABLE_RET( stg_ctoi_R1p, RET_BCO)
+    /* explicit stack */
 {
     Sp_adj(-2);
     Sp(1) = R1;
     Sp(0) = stg_enter_info;
-    jump stg_yield_to_interpreter;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
- * When the returned value is a pointer, but unlifted, in R1 ... 
+ * When the returned value is a pointer, but unlifted, in R1 ...
  */
 INFO_TABLE_RET( stg_ctoi_R1unpt, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-2);
     Sp(1) = R1;
-    Sp(0) = stg_gc_unpt_r1_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_p_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
  * When the returned value is a non-pointer in R1 ...
  */
 INFO_TABLE_RET( stg_ctoi_R1n, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-2);
     Sp(1) = R1;
-    Sp(0) = stg_gc_unbx_r1_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_n_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
  * When the returned value is in F1
  */
 INFO_TABLE_RET( stg_ctoi_F1, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-2);
     F_[Sp + WDS(1)] = F1;
-    Sp(0) = stg_gc_f1_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_f_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
  * When the returned value is in D1
  */
 INFO_TABLE_RET( stg_ctoi_D1, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-1) - SIZEOF_DOUBLE;
     D_[Sp + WDS(1)] = D1;
-    Sp(0) = stg_gc_d1_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_d_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
  * When the returned value is in L1
  */
 INFO_TABLE_RET( stg_ctoi_L1, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-1) - 8;
     L_[Sp + WDS(1)] = L1;
-    Sp(0) = stg_gc_l1_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_l_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
  * When the returned value is a void
  */
 INFO_TABLE_RET( stg_ctoi_V, RET_BCO )
+    /* explicit stack */
 {
     Sp_adj(-1);
-    Sp(0) = stg_gc_void_info;
-    jump stg_yield_to_interpreter;
+    Sp(0) = stg_ret_v_info;
+    jump stg_yield_to_interpreter [];
 }
 
 /*
@@ -159,9 +184,10 @@ INFO_TABLE_RET( stg_ctoi_V, RET_BCO )
  * stack.
  */
 INFO_TABLE_RET( stg_apply_interp, RET_BCO )
+    /* explicit stack */
 {
     /* Just in case we end up in here... (we shouldn't) */
-    jump stg_yield_to_interpreter;
+    jump stg_yield_to_interpreter [];
 }
 
 /* ----------------------------------------------------------------------------
@@ -169,12 +195,13 @@ INFO_TABLE_RET( stg_apply_interp, RET_BCO )
    ------------------------------------------------------------------------- */
 
 INFO_TABLE_FUN( stg_BCO, 4, 0, BCO, "BCO", "BCO", ARG_BCO )
+    /* explicit stack */
 {
   /* entering a BCO means "apply it", same as a function */
   Sp_adj(-2);
   Sp(1) = R1;
   Sp(0) = stg_apply_interp_info;
-  jump stg_yield_to_interpreter;
+  jump stg_yield_to_interpreter [];
 }
 
 /* ----------------------------------------------------------------------------
@@ -188,30 +215,48 @@ INFO_TABLE_FUN( stg_BCO, 4, 0, BCO, "BCO", "BCO", ARG_BCO )
    ------------------------------------------------------------------------- */
 
 INFO_TABLE(stg_IND,1,0,IND,"IND","IND")
+#if 0
+/*
+  This version in high-level cmm generates slightly less good code
+  than the low-level version below it. (ToDo)
+*/
+    (P_ node)
 {
-    TICK_ENT_DYN_IND();	/* tick */
+    TICK_ENT_DYN_IND(); /* tick */
+    node = UNTAG(StgInd_indirectee(node));
+    TICK_ENT_VIA_NODE();
+    jump %GET_ENTRY(node) (node);
+}
+#else
+    /* explicit stack */
+{
+    TICK_ENT_DYN_IND(); /* tick */
     R1 = UNTAG(StgInd_indirectee(R1));
     TICK_ENT_VIA_NODE();
-    jump %GET_ENTRY(R1);
+    jump %GET_ENTRY(R1) [R1];
 }
+#endif
 
 INFO_TABLE(stg_IND_direct,1,0,IND,"IND","IND")
+    (P_ node)
 {
-    TICK_ENT_DYN_IND();	/* tick */
-    R1 = StgInd_indirectee(R1);
+    TICK_ENT_DYN_IND(); /* tick */
+    node = StgInd_indirectee(node);
     TICK_ENT_VIA_NODE();
-    jump %ENTRY_CODE(Sp(0));
+    jump %ENTRY_CODE(Sp(0)) (node);
 }
 
 INFO_TABLE(stg_IND_STATIC,1,0,IND_STATIC,"IND_STATIC","IND_STATIC")
+    /* explicit stack */
 {
-    TICK_ENT_STATIC_IND();	/* tick */
+    TICK_ENT_STATIC_IND(); /* tick */
     R1 = UNTAG(StgInd_indirectee(R1));
     TICK_ENT_VIA_NODE();
-    jump %GET_ENTRY(R1);
+    jump %GET_ENTRY(R1) [R1];
 }
 
 INFO_TABLE(stg_IND_PERM,1,0,IND_PERM,"IND_PERM","IND_PERM")
+    /* explicit stack */
 {
     /* Don't add INDs to granularity cost */
 
@@ -225,9 +270,6 @@ INFO_TABLE(stg_IND_PERM,1,0,IND_PERM,"IND_PERM","IND_PERM")
 #endif
 
     LDV_ENTER(R1);
-
-    /* Enter PAP cost centre */
-    ENTER_CCS_PAP_CL(R1);
 
     /* For ticky-ticky, change the perm_ind to a normal ind on first
      * entry, so the number of ent_perm_inds is the number of *thunks*
@@ -249,8 +291,8 @@ INFO_TABLE(stg_IND_PERM,1,0,IND_PERM,"IND_PERM","IND_PERM")
     TICK_ENT_VIA_NODE();
 #endif
 
-    jump %GET_ENTRY(R1);
-}  
+    jump %GET_ENTRY(R1) [R1];
+}
 
 /* ----------------------------------------------------------------------------
    Black holes.
@@ -262,16 +304,17 @@ INFO_TABLE(stg_IND_PERM,1,0,IND_PERM,"IND_PERM","IND_PERM")
    ------------------------------------------------------------------------- */
 
 INFO_TABLE(stg_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
+    (P_ node)
 {
-    W_ r, p, info, bq, msg, owner, bd;
+    W_ r, info, owner, bd;
+    P_ p, bq, msg;
 
-    TICK_ENT_DYN_IND();	/* tick */
+    TICK_ENT_DYN_IND(); /* tick */
 
 retry:
-    p = StgInd_indirectee(R1);
+    p = StgInd_indirectee(node);
     if (GETTAG(p) != 0) {
-        R1 = p;
-        jump %ENTRY_CODE(Sp(0));
+        return (p);
     }
 
     info = StgHeader_info(p);
@@ -286,33 +329,33 @@ retry:
         info == stg_BLOCKING_QUEUE_CLEAN_info ||
         info == stg_BLOCKING_QUEUE_DIRTY_info)
     {
-        ("ptr" msg) = foreign "C" allocate(MyCapability() "ptr", 
-                                           BYTES_TO_WDS(SIZEOF_MessageBlackHole)) [R1];
-        
+        ("ptr" msg) = ccall allocate(MyCapability() "ptr",
+                                     BYTES_TO_WDS(SIZEOF_MessageBlackHole));
+
         SET_HDR(msg, stg_MSG_BLACKHOLE_info, CCS_SYSTEM);
         MessageBlackHole_tso(msg) = CurrentTSO;
-        MessageBlackHole_bh(msg) = R1;
-               
-        (r) = foreign "C" messageBlackHole(MyCapability() "ptr", msg "ptr") [R1];
+        MessageBlackHole_bh(msg) = node;
+
+        (r) = ccall messageBlackHole(MyCapability() "ptr", msg "ptr");
 
         if (r == 0) {
             goto retry;
         } else {
             StgTSO_why_blocked(CurrentTSO) = BlockedOnBlackHole::I16;
             StgTSO_block_info(CurrentTSO) = msg;
-            jump stg_block_blackhole;
+            jump stg_block_blackhole(node);
         }
     }
     else
     {
-        R1 = p;
-        ENTER();
+        ENTER(p);
     }
 }
 
 INFO_TABLE(__stg_EAGER_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
+    (P_ node)
 {
-    jump ENTRY_LBL(stg_BLACKHOLE);
+    jump ENTRY_LBL(stg_BLACKHOLE) (node);
 }
 
 // CAF_BLACKHOLE is allocated when entering a CAF.  The reason it is
@@ -322,42 +365,44 @@ INFO_TABLE(__stg_EAGER_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
 // evaluation by another thread (a BLACKHOLE).  See threadPaused().
 //
 INFO_TABLE(stg_CAF_BLACKHOLE,1,0,BLACKHOLE,"BLACKHOLE","BLACKHOLE")
+    (P_ node)
 {
-    jump ENTRY_LBL(stg_BLACKHOLE);
+    jump ENTRY_LBL(stg_BLACKHOLE) (node);
 }
 
 INFO_TABLE(stg_BLOCKING_QUEUE_CLEAN,4,0,BLOCKING_QUEUE,"BLOCKING_QUEUE","BLOCKING_QUEUE")
 { foreign "C" barf("BLOCKING_QUEUE_CLEAN object entered!") never returns; }
-    
+
 
 INFO_TABLE(stg_BLOCKING_QUEUE_DIRTY,4,0,BLOCKING_QUEUE,"BLOCKING_QUEUE","BLOCKING_QUEUE")
 { foreign "C" barf("BLOCKING_QUEUE_DIRTY object entered!") never returns; }
-    
+
 
 /* ----------------------------------------------------------------------------
    Whiteholes are used for the "locked" state of a closure (see lockClosure())
    ------------------------------------------------------------------------- */
 
 INFO_TABLE(stg_WHITEHOLE, 0,0, WHITEHOLE, "WHITEHOLE", "WHITEHOLE")
-{ 
+    (P_ node)
+{
 #if defined(THREADED_RTS)
     W_ info, i;
 
     i = 0;
 loop:
     // spin until the WHITEHOLE is updated
-    info = StgHeader_info(R1);
+    info = StgHeader_info(node);
     if (info == stg_WHITEHOLE_info) {
         i = i + 1;
         if (i == SPIN_COUNT) {
             i = 0;
-            foreign "C" yieldThread() [R1];
+            ccall yieldThread();
         }
         goto loop;
     }
-    jump %ENTRY_CODE(info);
+    jump %ENTRY_CODE(info) (node);
 #else
-    foreign "C" barf("WHITEHOLE object entered!") never returns;
+    ccall barf("WHITEHOLE object entered!") never returns;
 #endif
 }
 
@@ -392,6 +437,15 @@ INFO_TABLE(stg_WEAK,1,4,WEAK,"WEAK","WEAK")
  */
 INFO_TABLE_CONSTR(stg_DEAD_WEAK,0,5,0,CONSTR,"DEAD_WEAK","DEAD_WEAK")
 { foreign "C" barf("DEAD_WEAK object entered!") never returns; }
+
+/* ----------------------------------------------------------------------------
+   C finalizer lists
+
+   Singly linked lists that chain multiple C finalizers on a weak pointer.
+   ------------------------------------------------------------------------- */
+
+INFO_TABLE_CONSTR(stg_C_FINALIZER_LIST,1,4,0,CONSTR,"C_FINALIZER_LIST","C_FINALIZER_LIST")
+{ foreign "C" barf("C_FINALIZER_LIST object entered!") never returns; }
 
 /* ----------------------------------------------------------------------------
    NO_FINALIZER
@@ -429,8 +483,11 @@ INFO_TABLE(stg_MVAR_DIRTY,3,0,MVAR_DIRTY,"MVAR","MVAR")
    STM
    -------------------------------------------------------------------------- */
 
-INFO_TABLE(stg_TVAR, 2, 1, MUT_PRIM, "TVAR", "TVAR")
-{ foreign "C" barf("TVAR object entered!") never returns; }
+INFO_TABLE(stg_TVAR_CLEAN, 2, 1, TVAR, "TVAR", "TVAR")
+{ foreign "C" barf("TVAR_CLEAN object entered!") never returns; }
+
+INFO_TABLE(stg_TVAR_DIRTY, 2, 1, TVAR, "TVAR", "TVAR")
+{ foreign "C" barf("TVAR_DIRTY object entered!") never returns; }
 
 INFO_TABLE(stg_TVAR_WATCH_QUEUE, 3, 0, MUT_PRIM, "TVAR_WATCH_QUEUE", "TVAR_WATCH_QUEUE")
 { foreign "C" barf("TVAR_WATCH_QUEUE object entered!") never returns; }
@@ -499,15 +556,34 @@ INFO_TABLE_CONSTR(stg_END_TSO_QUEUE,0,0,0,CONSTR_NOCAF_STATIC,"END_TSO_QUEUE","E
 CLOSURE(stg_END_TSO_QUEUE_closure,stg_END_TSO_QUEUE);
 
 /* ----------------------------------------------------------------------------
+   GCD_CAF
+   ------------------------------------------------------------------------- */
+
+INFO_TABLE_CONSTR(stg_GCD_CAF,0,0,0,CONSTR_NOCAF_STATIC,"GCD_CAF","GCD_CAF")
+{ foreign "C" barf("Evaluated a CAF that was GC'd!") never returns; }
+
+/* ----------------------------------------------------------------------------
+   STM_AWOKEN
+
+   This is a static nullary constructor (like []) that we use to mark a
+   thread waiting on an STM wakeup
+   ------------------------------------------------------------------------- */
+
+INFO_TABLE_CONSTR(stg_STM_AWOKEN,0,0,0,CONSTR_NOCAF_STATIC,"STM_AWOKEN","STM_AWOKEN")
+{ foreign "C" barf("STM_AWOKEN object entered!") never returns; }
+
+CLOSURE(stg_STM_AWOKEN_closure,stg_STM_AWOKEN);
+
+/* ----------------------------------------------------------------------------
    Arrays
 
    These come in two basic flavours: arrays of data (StgArrWords) and arrays of
    pointers (StgArrPtrs).  They all have a similar layout:
 
-	___________________________
-	| Info | No. of | data....
-        |  Ptr | Words  |
-	---------------------------
+   ___________________________
+   | Info | No. of | data....
+   |  Ptr | Words  |
+   ---------------------------
 
    These are *unpointed* objects: i.e. they cannot be entered.
 
@@ -539,15 +615,16 @@ INFO_TABLE(stg_MUT_VAR_DIRTY, 1, 0, MUT_VAR_DIRTY, "MUT_VAR_DIRTY", "MUT_VAR_DIR
 
 /* ----------------------------------------------------------------------------
    Dummy return closure
- 
+
    Entering this closure will just return to the address on the top of the
    stack.  Useful for getting a thread in a canonical form where we can
    just enter the top stack word to start the thread.  (see deleteThread)
  * ------------------------------------------------------------------------- */
 
 INFO_TABLE( stg_dummy_ret, 0, 0, CONSTR_NOCAF_STATIC, "DUMMY_RET", "DUMMY_RET")
+    ()
 {
-  jump %ENTRY_CODE(Sp(0));
+    return ();
 }
 CLOSURE(stg_dummy_ret_closure,stg_dummy_ret);
 
@@ -559,21 +636,21 @@ INFO_TABLE_CONSTR(stg_MVAR_TSO_QUEUE,2,0,0,PRIM,"MVAR_TSO_QUEUE","MVAR_TSO_QUEUE
 { foreign "C" barf("MVAR_TSO_QUEUE object entered!") never returns; }
 
 /* ----------------------------------------------------------------------------
-   CHARLIKE and INTLIKE closures.  
+   CHARLIKE and INTLIKE closures.
 
    These are static representations of Chars and small Ints, so that
    we can remove dynamic Chars and Ints during garbage collection and
    replace them with references to the static objects.
    ------------------------------------------------------------------------- */
 
-#if defined(__PIC__) && defined(mingw32_HOST_OS)
+#if defined(COMPILING_WINDOWS_DLL)
 /*
  * When sticking the RTS in a Windows DLL, we delay populating the
  * Charlike and Intlike tables until load-time, which is only
  * when we've got the real addresses to the C# and I# closures.
- *	
- *	-- this is currently broken BL 2009/11/14.
- *	   we don't rewrite to static closures at all with Windows DLLs.
+ *
+ * -- this is currently broken BL 2009/11/14.
+ *    we don't rewrite to static closures at all with Windows DLLs.
  */
 // #warning Is this correct? _imp is a pointer!
 #define Char_hash_static_info _imp__ghczmprim_GHCziTypes_Czh_static_info
@@ -591,9 +668,7 @@ INFO_TABLE_CONSTR(stg_MVAR_TSO_QUEUE,2,0,0,PRIM,"MVAR_TSO_QUEUE","MVAR_TSO_QUEUE
  * on the fact that static closures live in the data section.
  */
 
-/* end the name with _closure, to convince the mangler this is a closure */
-
-#if !(defined(__PIC__) && defined(mingw32_HOST_OS))
+#if !(defined(COMPILING_WINDOWS_DLL))
 section "data" {
  stg_CHARLIKE_closure:
     CHARLIKE_HDR(0)
@@ -856,7 +931,7 @@ section "data" {
 
 section "data" {
  stg_INTLIKE_closure:
-    INTLIKE_HDR(-16)	/* MIN_INTLIKE == -16 */
+    INTLIKE_HDR(-16) /* MIN_INTLIKE == -16 */
     INTLIKE_HDR(-15)
     INTLIKE_HDR(-14)
     INTLIKE_HDR(-13)
@@ -888,7 +963,7 @@ section "data" {
     INTLIKE_HDR(13)
     INTLIKE_HDR(14)
     INTLIKE_HDR(15)
-    INTLIKE_HDR(16)	/* MAX_INTLIKE == 16 */
+    INTLIKE_HDR(16)  /* MAX_INTLIKE == 16 */
 }
 
-#endif // !(defined(__PIC__) && defined(mingw32_HOST_OS))
+#endif

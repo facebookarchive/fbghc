@@ -5,7 +5,7 @@
  * API for invoking Haskell functions via the RTS
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * --------------------------------------------------------------------------*/
 
@@ -37,22 +37,76 @@ typedef struct StgClosure_ *HaskellObj;
  */
 typedef struct Capability_ Capability;
 
+/*
+ * The public view of a Capability: we can be sure it starts with
+ * these two components (but it may have more private fields).
+ */
+typedef struct CapabilityPublic_ {
+    StgFunTable f;
+    StgRegTable r;
+} CapabilityPublic;
+
+/* ----------------------------------------------------------------------------
+   RTS configuration settings, for passing to hs_init_ghc()
+   ------------------------------------------------------------------------- */
+
+typedef enum {
+    RtsOptsNone,         // +RTS causes an error
+    RtsOptsSafeOnly,     // safe RTS options allowed; others cause an error
+    RtsOptsAll           // all RTS options allowed
+  } RtsOptsEnabledEnum;
+
+// The RtsConfig struct is passed (by value) to hs_init_ghc().  The
+// reason for using a struct is extensibility: we can add more
+// fields to this later without breaking existing client code.
+typedef struct {
+    RtsOptsEnabledEnum rts_opts_enabled;
+    const char *rts_opts;
+    HsBool rts_hs_main;
+} RtsConfig;
+
+// Clients should start with defaultRtsConfig and then customise it.
+// Bah, I really wanted this to be a const struct value, but it seems
+// you can't do that in C (it generates code).
+extern const RtsConfig defaultRtsConfig;
+
 /* ----------------------------------------------------------------------------
    Starting up and shutting down the Haskell RTS.
    ------------------------------------------------------------------------- */
-extern void startupHaskell         ( int argc, char *argv[], 
+
+/* DEPRECATED, use hs_init() or hs_init_ghc() instead  */
+extern void startupHaskell         ( int argc, char *argv[],
 				     void (*init_root)(void) );
+
+/* DEPRECATED, use hs_exit() instead  */
 extern void shutdownHaskell        ( void );
-extern void shutdownHaskellAndExit ( int exitCode );
+
+/* Like hs_init(), but allows rtsopts. For more complicated usage,
+ * use hs_init_ghc. */
+extern void hs_init_with_rtsopts (int *argc, char **argv[]);
+
+/*
+ * GHC-specific version of hs_init() that allows specifying whether
+ * +RTS ... -RTS options are allowed or not (default: only "safe"
+ * options are allowed), and allows passing an option string that is
+ * to be interpreted by the RTS only, not passed to the program.
+ */
+extern void hs_init_ghc (int *argc, char **argv[],   // program arguments
+                         RtsConfig rts_config);      // RTS configuration
+
+extern void shutdownHaskellAndExit (int exitCode, int fastExit)
+    GNUC3_ATTRIBUTE(__noreturn__);
+
+#ifndef mingw32_HOST_OS
+extern void shutdownHaskellAndSignal (int sig, int fastExit)
+     GNUC3_ATTRIBUTE(__noreturn__);
+#endif
+
 extern void getProgArgv            ( int *argc, char **argv[] );
 extern void setProgArgv            ( int argc, char *argv[] );
 extern void getFullProgArgv        ( int *argc, char **argv[] );
 extern void setFullProgArgv        ( int argc, char *argv[] );
 extern void freeFullProgArgv       ( void ) ;
-
-#ifndef mingw32_HOST_OS
-extern void shutdownHaskellAndSignal (int sig);
-#endif
 
 /* exit() override */
 extern void (*exitFn)(int);
@@ -130,32 +184,57 @@ HsBool       rts_getBool      ( HaskellObj );
    The versions ending in '_' allow you to specify an initial stack size.
    Note that these calls may cause Garbage Collection, so all HaskellObj
    references are rendered invalid by these calls.
+
+   All of these functions take a (Capability **) - there is a
+   Capability pointer both input and output.  We use an inout
+   parameter because this is less error-prone for the client than a
+   return value - the client could easily forget to use the return
+   value, whereas incorrectly using an inout parameter will usually
+   result in a type error.
    ------------------------------------------------------------------------- */
-Capability * 
-rts_eval (Capability *, HaskellObj p, /*out*/HaskellObj *ret);
 
-Capability * 
-rts_eval_ (Capability *, HaskellObj p, unsigned int stack_size, 
-	   /*out*/HaskellObj *ret);
+void rts_eval (/* inout */ Capability **,
+               /* in    */ HaskellObj p,
+               /* out */   HaskellObj *ret);
 
-Capability * 
-rts_evalIO (Capability *, HaskellObj p, /*out*/HaskellObj *ret);
+void rts_eval_ (/* inout */ Capability **,
+                /* in    */ HaskellObj p,
+                /* in    */ unsigned int stack_size,
+                /* out   */ HaskellObj *ret);
 
-Capability *
-rts_evalStableIO (Capability *, HsStablePtr s, /*out*/HsStablePtr *ret);
+void rts_evalIO (/* inout */ Capability **,
+                 /* in    */ HaskellObj p,
+                 /* out */   HaskellObj *ret);
 
-Capability * 
-rts_evalLazyIO (Capability *, HaskellObj p, /*out*/HaskellObj *ret);
+void rts_evalStableIO (/* inout */ Capability **,
+                       /* in    */ HsStablePtr s,
+                       /* out */   HsStablePtr *ret);
 
-Capability * 
-rts_evalLazyIO_ (Capability *, HaskellObj p, unsigned int stack_size, 
-		 /*out*/HaskellObj *ret);
+void rts_evalLazyIO (/* inout */ Capability **,
+                     /* in    */ HaskellObj p,
+                     /* out */   HaskellObj *ret);
 
-void
-rts_checkSchedStatus (char* site, Capability *);
+void rts_evalLazyIO_ (/* inout */ Capability **,
+                      /* in    */ HaskellObj p,
+                      /* in    */ unsigned int stack_size,
+                      /* out   */ HaskellObj *ret);
 
-SchedulerStatus
-rts_getSchedStatus (Capability *cap);
+void rts_checkSchedStatus (char* site, Capability *);
+
+SchedulerStatus rts_getSchedStatus (Capability *cap);
+
+/*
+ * The RTS allocates some thread-local data when you make a call into
+ * Haskell using one of the rts_eval() functions.  This data is not
+ * normally freed until hs_exit().  If you want to free it earlier
+ * than this, perhaps because the thread is about to exit, then call
+ * rts_done() from the thread.
+ *
+ * It is safe to make more rts_eval() calls after calling rts_done(),
+ * but the next one will cause allocation of the thread-local memory
+ * again.
+ */
+void rts_done (void);
 
 /* --------------------------------------------------------------------------
    Wrapper closures
@@ -169,7 +248,7 @@ rts_getSchedStatus (Capability *cap);
 //	Note that RtsAPI.h is also included by foreign export stubs in
 //	the base package itself.
 //
-#if defined(mingw32_HOST_OS) && defined(__PIC__) && !defined(COMPILING_BASE_PACKAGE)
+#if defined(COMPILING_WINDOWS_DLL) && !defined(COMPILING_BASE_PACKAGE)
 __declspec(dllimport) extern StgWord base_GHCziTopHandler_runIO_closure[];
 __declspec(dllimport) extern StgWord base_GHCziTopHandler_runNonIO_closure[];
 #else

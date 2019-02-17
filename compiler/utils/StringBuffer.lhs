@@ -44,17 +44,17 @@ module StringBuffer
 #include "HsVersions.h"
 
 import Encoding
-import FastString hiding ( buf )
+import FastString
 import FastTypes
 import FastFunctions
 
-import Foreign
 import System.IO                ( hGetBuf, hFileSize,IOMode(ReadMode), hClose
-                                , Handle, hTell )
+                                , Handle, hTell, openBinaryFile )
+import System.IO.Unsafe         ( unsafePerformIO )
 
 import GHC.Exts
 
-import System.IO                ( openBinaryFile )
+import Foreign.Safe
 
 -- -----------------------------------------------------------------------------
 -- The StringBuffer type

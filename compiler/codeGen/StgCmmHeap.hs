@@ -10,70 +10,52 @@ module StgCmmHeap (
         getVirtHp, setVirtHp, setRealHp,
         getHpRelOffset, hpRel,
 
-        entryHeapCheck, altHeapCheck,
+        entryHeapCheck, altHeapCheck, noEscapeHeapCheck, altHeapCheckReturnsTo,
+        heapStackCheckGen,
+        entryHeapCheck',
 
-        layOutDynConstr, layOutStaticConstr,
-        mkVirtHeapOffsets, mkStaticClosureFields, mkStaticClosure,
+        mkStaticClosureFields, mkStaticClosure,
 
-        allocDynClosure, allocDynClosureCmm, emitSetDynHdr
+        allocDynClosure, allocDynClosureCmm, allocHeapClosure,
+        emitSetDynHdr
     ) where
 
 #include "HsVersions.h"
 
-import CmmType
 import StgSyn
 import CLabel
 import StgCmmLayout
 import StgCmmUtils
 import StgCmmMonad
-import StgCmmProf
+import StgCmmProf (profDynAlloc, dynProfHdr, staticProfHdr)
 import StgCmmTicky
-import StgCmmGran
 import StgCmmClosure
 import StgCmmEnv
 
 import MkGraph
 
+import Hoopl
 import SMRep
-import CmmExpr
+import Cmm
 import CmmUtils
-import DataCon
-import TyCon
 import CostCentre
-import Outputable
+import IdInfo( CafInfo(..), mayHaveCafRefs )
+import Id ( Id )
 import Module
+import DynFlags
 import FastString( mkFastString, fsLit )
-import Constants
 
------------------------------------------------------------
---              Layout of heap objects
------------------------------------------------------------
-
-layOutDynConstr, layOutStaticConstr
-        :: DataCon -> [(PrimRep, a)]
-        -> (ClosureInfo, [(NonVoid a, VirtualHpOffset)])
-        -- No Void arguments in result
-
-layOutDynConstr    = layOutConstr False
-layOutStaticConstr = layOutConstr True
-
-layOutConstr :: Bool -> DataCon -> [(PrimRep, a)]
-             -> (ClosureInfo, [(NonVoid a, VirtualHpOffset)])
-layOutConstr is_static data_con args
-   = (mkConInfo is_static data_con tot_wds ptr_wds,
-      things_w_offsets)
-  where
-    (tot_wds, --  #ptr_wds + #nonptr_wds
-     ptr_wds, --  #ptr_wds
-     things_w_offsets) = mkVirtHeapOffsets False{-not a thunk-} args
-
+import Control.Monad (when)
+import Data.Maybe (isJust)
 
 -----------------------------------------------------------
 --              Initialise dynamic heap objects
 -----------------------------------------------------------
 
 allocDynClosure
-        :: ClosureInfo
+        :: Maybe Id
+        -> CmmInfoTable
+        -> LambdaFormInfo
         -> CmmExpr              -- Cost Centre to stick in the object
         -> CmmExpr              -- Cost Centre to blame for this alloc
                                 -- (usually the same; sometimes "OVERHEAD")
@@ -81,12 +63,12 @@ allocDynClosure
         -> [(NonVoid StgArg, VirtualHpOffset)]  -- Offsets from start of object
                                                 -- ie Info ptr has offset zero.
                                                 -- No void args in here
-        -> FCode (LocalReg, CmmAGraph)
+        -> FCode CmmExpr -- returns Hp+n
 
 allocDynClosureCmm
-        :: ClosureInfo -> CmmExpr -> CmmExpr
-        -> [(CmmExpr, VirtualHpOffset)]
-        -> FCode (LocalReg, CmmAGraph)
+        :: Maybe Id -> CmmInfoTable -> LambdaFormInfo -> CmmExpr -> CmmExpr
+        -> [(CmmExpr, ByteOff)]
+        -> FCode CmmExpr -- returns Hp+n
 
 -- allocDynClosure allocates the thing in the heap,
 -- and modifies the virtual Hp to account for this.
@@ -94,76 +76,82 @@ allocDynClosureCmm
 -- returned LocalReg, which should point to the closure after executing
 -- the graph.
 
--- Note [Return a LocalReg]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
--- allocDynClosure returns a LocalReg, not a (Hp+8) CmmExpr.
--- Reason:
---      ...allocate object...
---      obj = Hp + 8
---      y = f(z)
---      ...here obj is still valid,
---         but Hp+8 means something quite different...
+-- allocDynClosure returns an (Hp+8) CmmExpr, and hence the result is
+-- only valid until Hp is changed.  The caller should assign the
+-- result to a LocalReg if it is required to remain live.
+--
+-- The reason we don't assign it to a LocalReg here is that the caller
+-- is often about to call regIdInfo, which immediately assigns the
+-- result of allocDynClosure to a new temp in order to add the tag.
+-- So by not generating a LocalReg here we avoid a common source of
+-- new temporaries and save some compile time.  This can be quite
+-- significant - see test T4801.
 
 
-allocDynClosure cl_info use_cc _blame_cc args_w_offsets
-  = do  { let (args, offsets) = unzip args_w_offsets
-        ; cmm_args <- mapM getArgAmode args     -- No void args
-        ; allocDynClosureCmm cl_info use_cc _blame_cc (zip cmm_args offsets)
-        }
+allocDynClosure mb_id info_tbl lf_info use_cc _blame_cc args_w_offsets = do
+  let (args, offsets) = unzip args_w_offsets
+  cmm_args <- mapM getArgAmode args     -- No void args
+  allocDynClosureCmm mb_id info_tbl lf_info
+                     use_cc _blame_cc (zip cmm_args offsets)
 
-allocDynClosureCmm cl_info use_cc _blame_cc amodes_w_offsets
-  = do  { virt_hp <- getVirtHp
 
-        -- SAY WHAT WE ARE ABOUT TO DO
-        ; tickyDynAlloc cl_info
-        ; profDynAlloc cl_info use_cc
-                -- ToDo: This is almost certainly wrong
-                -- We're ignoring blame_cc. But until we've
-                -- fixed the boxing hack in chooseDynCostCentres etc,
-                -- we're worried about making things worse by "fixing"
-                -- this part to use blame_cc!
+allocDynClosureCmm mb_id info_tbl lf_info use_cc _blame_cc amodes_w_offsets = do
+  -- SAY WHAT WE ARE ABOUT TO DO
+  let rep = cit_rep info_tbl
+  tickyDynAlloc mb_id rep lf_info
+  let info_ptr = CmmLit (CmmLabel (cit_lbl info_tbl))
+  allocHeapClosure rep info_ptr use_cc amodes_w_offsets
 
-        -- FIND THE OFFSET OF THE INFO-PTR WORD
-        ; let   info_offset = virt_hp + 1
-                -- info_offset is the VirtualHpOffset of the first
-                -- word of the new object
-                -- Remember, virtHp points to last allocated word,
-                -- ie 1 *before* the info-ptr word of new object.
 
-                info_ptr = CmmLit (CmmLabel (infoTableLabelFromCI cl_info))
+-- | Low-level heap object allocation.
+allocHeapClosure
+  :: SMRep                            -- ^ representation of the object
+  -> CmmExpr                          -- ^ info pointer
+  -> CmmExpr                          -- ^ cost centre
+  -> [(CmmExpr,ByteOff)]              -- ^ payload
+  -> FCode CmmExpr                    -- ^ returns the address of the object
+allocHeapClosure rep info_ptr use_cc payload = do
+  profDynAlloc rep use_cc
 
-        -- ALLOCATE THE OBJECT
-        ; base <- getHpRelOffset info_offset
-        ; emit (mkComment $ mkFastString "allocDynClosure")
-        ; emitSetDynHdr base info_ptr  use_cc
-        ; let (cmm_args, offsets) = unzip amodes_w_offsets
-        ; hpStore base cmm_args offsets
+  virt_hp <- getVirtHp
 
-        -- BUMP THE VIRTUAL HEAP POINTER
-        ; setVirtHp (virt_hp + closureSize cl_info)
+  -- Find the offset of the info-ptr word
+  let info_offset = virt_hp + 1
+            -- info_offset is the VirtualHpOffset of the first
+            -- word of the new object
+            -- Remember, virtHp points to last allocated word,
+            -- ie 1 *before* the info-ptr word of new object.
 
-        -- Assign to a temporary and return
-        -- Note [Return a LocalReg]
-        ; hp_rel <- getHpRelOffset info_offset
-        ; getCodeR $ assignTemp hp_rel }
+  base <- getHpRelOffset info_offset
+  emitComment $ mkFastString "allocHeapClosure"
+  emitSetDynHdr base info_ptr use_cc
+
+  -- Fill in the fields
+  hpStore base payload
+
+  -- Bump the virtual heap pointer
+  dflags <- getDynFlags
+  setVirtHp (virt_hp + heapClosureSizeW dflags rep)
+
+  return base
+
 
 emitSetDynHdr :: CmmExpr -> CmmExpr -> CmmExpr -> FCode ()
 emitSetDynHdr base info_ptr ccs
-  = hpStore base header [0..]
+  = do dflags <- getDynFlags
+       hpStore base (zip (header dflags) [0, wORD_SIZE dflags ..])
   where
-    header :: [CmmExpr]
-    header = [info_ptr] ++ dynProfHdr ccs
-        -- ToDo: Gransim stuff
-        -- ToDo: Parallel stuff
+    header :: DynFlags -> [CmmExpr]
+    header dflags = [info_ptr] ++ dynProfHdr dflags ccs
+        -- ToDof: Parallel stuff
         -- No ticky header
 
-hpStore :: CmmExpr -> [CmmExpr] -> [VirtualHpOffset] -> FCode ()
 -- Store the item (expr,off) in base[off]
-hpStore base vals offs
-  = emit (catAGraphs (zipWith mk_store vals offs))
-  where
-    mk_store val off = mkStore (cmmOffsetW base off) val
-
+hpStore :: CmmExpr -> [(CmmExpr, ByteOff)] -> FCode ()
+hpStore base vals = do
+  dflags <- getDynFlags
+  sequence_ $
+    [ emitStore (cmmOffsetB dflags base off) val | (val,off) <- vals ]
 
 -----------------------------------------------------------
 --              Layout of static closures
@@ -173,16 +161,17 @@ hpStore base vals offs
 -- and adding a static link field if necessary.
 
 mkStaticClosureFields
-        :: ClosureInfo
+        :: DynFlags
+        -> CmmInfoTable
         -> CostCentreStack
-        -> Bool                 -- Has CAF refs
+        -> CafInfo
         -> [CmmLit]             -- Payload
         -> [CmmLit]             -- The full closure
-mkStaticClosureFields cl_info ccs caf_refs payload
-  = mkStaticClosure info_lbl ccs payload padding
+mkStaticClosureFields dflags info_tbl ccs caf_refs payload
+  = mkStaticClosure dflags info_lbl ccs payload padding
         static_link_field saved_info_field
   where
-    info_lbl = infoTableLabelFromCI cl_info
+    info_lbl = cit_lbl info_tbl
 
     -- CAFs must have consistent layout, regardless of whether they
     -- are actually updatable or not.  The layout of a CAF is:
@@ -192,54 +181,50 @@ mkStaticClosureFields cl_info ccs caf_refs payload
     --        1 indirectee
     --        0 info ptr
     --
-    -- the static_link and saved_info fields must always be in the same
-    -- place.  So we use closureNeedsUpdSpace rather than
-    -- closureUpdReqd here:
+    -- the static_link and saved_info fields must always be in the
+    -- same place.  So we use isThunkRep rather than closureUpdReqd
+    -- here:
 
-    is_caf = closureNeedsUpdSpace cl_info
+    is_caf = isThunkRep (cit_rep info_tbl)
 
     padding
-        | not is_caf = []
-        | otherwise  = ASSERT(null payload) [mkIntCLit 0]
+        | is_caf && null payload = [mkIntCLit dflags 0]
+        | otherwise = []
 
     static_link_field
-        | is_caf || staticClosureNeedsLink cl_info = [static_link_value]
-        | otherwise                                = []
+        | is_caf || staticClosureNeedsLink (mayHaveCafRefs caf_refs) info_tbl
+        = [static_link_value]
+        | otherwise
+        = []
 
     saved_info_field
-        | is_caf     = [mkIntCLit 0]
+        | is_caf     = [mkIntCLit dflags 0]
         | otherwise  = []
 
-        -- for a static constructor which has NoCafRefs, we set the
+        -- For a static constructor which has NoCafRefs, we set the
         -- static link field to a non-zero value so the garbage
         -- collector will ignore it.
     static_link_value
-        | caf_refs      = mkIntCLit 0
-        | otherwise     = mkIntCLit 1
+        | mayHaveCafRefs caf_refs  = mkIntCLit dflags 0
+        | otherwise                = mkIntCLit dflags 1  -- No CAF refs
 
 
-mkStaticClosure :: CLabel -> CostCentreStack -> [CmmLit]
+mkStaticClosure :: DynFlags -> CLabel -> CostCentreStack -> [CmmLit]
   -> [CmmLit] -> [CmmLit] -> [CmmLit] -> [CmmLit]
-mkStaticClosure info_lbl ccs payload padding static_link_field saved_info_field
+mkStaticClosure dflags info_lbl ccs payload padding static_link_field saved_info_field
   =  [CmmLabel info_lbl]
-  ++ variable_header_words
-  ++ concatMap padLitToWord payload
+  ++ staticProfHdr dflags ccs
+  ++ concatMap (padLitToWord dflags) payload
   ++ padding
   ++ static_link_field
   ++ saved_info_field
-  where
-    variable_header_words
-        =  staticGranHdr
-        ++ staticParHdr
-        ++ staticProfHdr ccs
-        ++ staticTickyHdr
 
 -- JD: Simon had ellided this padding, but without it the C back end asserts
 -- failure. Maybe it's a bad assertion, and this padding is indeed unnecessary?
-padLitToWord :: CmmLit -> [CmmLit]
-padLitToWord lit = lit : padding pad_length
-  where width = typeWidth (cmmLitType lit)
-        pad_length = wORD_SIZE - widthInBytes width :: Int
+padLitToWord :: DynFlags -> CmmLit -> [CmmLit]
+padLitToWord dflags lit = lit : padding pad_length
+  where width = typeWidth (cmmLitType dflags lit)
+        pad_length = wORD_SIZE dflags - widthInBytes width :: Int
 
         padding n | n <= 0 = []
                   | n `rem` 2 /= 0 = CmmInt 0 W8  : padding (n-1)
@@ -345,262 +330,351 @@ These are used in the following circumstances
 -- A heap/stack check at a function or thunk entry point.
 
 entryHeapCheck :: ClosureInfo
-               -> Int            -- Arg Offset
                -> Maybe LocalReg -- Function (closure environment)
                -> Int            -- Arity -- not same as len args b/c of voids
                -> [LocalReg]     -- Non-void args (empty for thunk)
                -> FCode ()
                -> FCode ()
 
-entryHeapCheck cl_info offset nodeSet arity args code
-  = do updfr_sz <- getUpdFrameOff
-       heapCheck True (gc_call updfr_sz) code
-
+entryHeapCheck cl_info nodeSet arity args code
+  = entryHeapCheck' is_fastf node arity args code
   where
-    is_thunk = arity == 0
+    node = case nodeSet of
+              Just r  -> CmmReg (CmmLocal r)
+              Nothing -> CmmLit (CmmLabel $ staticClosureLabel cl_info)
+
     is_fastf = case closureFunInfo cl_info of
-                    Just (_, ArgGen _) -> False
-                    _otherwise         -> True
+                 Just (_, ArgGen _) -> False
+                 _otherwise         -> True
 
-    args' = map (CmmReg . CmmLocal) args
-    setN = case nodeSet of
-                   Just n  -> mkAssign nodeReg (CmmReg $ CmmLocal n)
-                   Nothing -> mkAssign nodeReg $
-                       CmmLit (CmmLabel $ closureLabelFromCI cl_info)
+-- | lower-level version for CmmParse
+entryHeapCheck' :: Bool           -- is a known function pattern
+                -> CmmExpr        -- expression for the closure pointer
+                -> Int            -- Arity -- not same as len args b/c of voids
+                -> [LocalReg]     -- Non-void args (empty for thunk)
+                -> FCode ()
+                -> FCode ()
+entryHeapCheck' is_fastf node arity args code
+  = do dflags <- getDynFlags
+       let is_thunk = arity == 0
 
-    {- Thunks:          Set R1 = node, jump GCEnter1
-       Function (fast): Set R1 = node, jump GCFun
-       Function (slow): Set R1 = node, call generic_gc -}
-    gc_call upd = setN <*> gc_lbl upd
-    gc_lbl upd
-        | is_thunk  = mkDirectJump (CmmReg $ CmmGlobal GCEnter1) [] sp
-        | is_fastf  = mkDirectJump (CmmReg $ CmmGlobal GCFun) [] sp
-        | otherwise = mkForeignJump Slow (CmmReg $ CmmGlobal GCFun) args' upd
-        where sp = max offset upd
-    {- DT (12/08/10) This is a little fishy, mainly the sp fix up amount.
-     - This is since the ncg inserts spills before the stack/heap check.
-     - This should be fixed up and then we won't need to fix up the Sp on
-     - GC calls, but until then this fishy code works -}
+           args' = map (CmmReg . CmmLocal) args
+           stg_gc_fun    = CmmReg (CmmGlobal GCFun)
+           stg_gc_enter1 = CmmReg (CmmGlobal GCEnter1)
 
-{-
-    -- This code is slightly outdated now and we could easily keep the above
-    -- GC methods. However, there may be some performance gains to be made by
-    -- using more specialised GC entry points. Since the semi generic GCFun
-    -- entry needs to check the node and figure out what registers to save...
-    -- if we provided and used more specialised GC entry points then these
-    -- runtime decisions could be turned into compile time decisions.
+           {- Thunks:          jump stg_gc_enter_1
 
-    args'     = case fun of Just f  -> f : args
-                            Nothing -> args
-    arg_exprs = map (CmmReg . CmmLocal) args'
-    gc_call updfr_sz
-        | arity == 0 = mkJumpGC (CmmReg (CmmGlobal GCEnter1)) arg_exprs updfr_sz
-        | otherwise =
-            case gc_lbl args' of
-                Just _lbl -> panic "StgCmmHeap.entryHeapCheck: not finished"
-                            -- mkJumpGC (CmmLit (CmmLabel (mkRtsCodeLabel lbl)))
-                            --         arg_exprs updfr_sz
-                Nothing  -> mkCall generic_gc (GC, GC) [] [] updfr_sz
+              Function (fast): call (NativeNode) stg_gc_fun(fun, args)
 
-    gc_lbl :: [LocalReg] -> Maybe FastString
-    gc_lbl [reg]
-        | isGcPtrType ty  = Just (sLit "stg_gc_unpt_r1") -- "stg_gc_fun_1p"
-        | isFloatType ty  = case width of
-                              W32 -> Just (sLit "stg_gc_f1")
-                              W64 -> Just (sLit "stg_gc_d1")
-                              _other -> Nothing
-        | width == wordWidth = Just (mkGcLabel "stg_gc_unbx_r1")
-        | width == W64       = Just (mkGcLabel "stg_gc_l1")
-        | otherwise          = Nothing
-        where
-          ty = localRegType reg
-          width = typeWidth ty
+              Function (slow): call (slow) stg_gc_fun(fun, args)
+           -}
+           gc_call upd
+               | is_thunk
+                 = mkJump dflags NativeNodeCall stg_gc_enter1 [node] upd
 
-    gc_lbl regs = gc_lbl_ptrs (map (isGcPtrType . localRegType) regs)
+               | is_fastf
+                 = mkJump dflags NativeNodeCall stg_gc_fun (node : args') upd
 
-    gc_lbl_ptrs :: [Bool] -> Maybe FastString
-    -- JD: TEMPORARY -- UNTIL THESE FUNCTIONS EXIST...
-    --gc_lbl_ptrs [True,True]      = Just (sLit "stg_gc_fun_2p")
-    --gc_lbl_ptrs [True,True,True] = Just (sLit "stg_gc_fun_3p")
-    gc_lbl_ptrs _ = Nothing
--}
+               | otherwise
+                 = mkJump dflags Slow stg_gc_fun (node : args') upd
+
+       updfr_sz <- getUpdFrameOff
+
+       loop_id <- newLabelC
+       emitLabel loop_id
+       heapCheck True True (gc_call updfr_sz <*> mkBranch loop_id) code
+
+-- ------------------------------------------------------------
+-- A heap/stack check in a case alternative
 
 
---------------------------------------------------------------
--- A heap/stack check at in a case alternative
+-- If there are multiple alts and we need to GC, but don't have a
+-- continuation already (the scrut was simple), then we should
+-- pre-generate the continuation.  (if there are multiple alts it is
+-- always a canned GC point).
+
+-- altHeapCheck:
+-- If we have a return continuation,
+--   then if it is a canned GC pattern,
+--           then we do mkJumpReturnsTo
+--           else we do a normal call to stg_gc_noregs
+--   else if it is a canned GC pattern,
+--           then generate the continuation and do mkCallReturnsTo
+--           else we do a normal call to stg_gc_noregs
 
 altHeapCheck :: [LocalReg] -> FCode a -> FCode a
-altHeapCheck regs code
-  = do updfr_sz <- getUpdFrameOff
-       heapCheck False (gc_call updfr_sz) code
+altHeapCheck regs code = altOrNoEscapeHeapCheck False regs code
 
+altOrNoEscapeHeapCheck :: Bool -> [LocalReg] -> FCode a -> FCode a
+altOrNoEscapeHeapCheck checkYield regs code = do
+    dflags <- getDynFlags
+    case cannedGCEntryPoint dflags regs of
+      Nothing -> genericGC checkYield code
+      Just gc -> do
+        lret <- newLabelC
+        let (off, _, copyin) = copyInOflow dflags NativeReturn (Young lret) regs []
+        lcont <- newLabelC
+        emitOutOfLine lret (copyin <*> mkBranch lcont)
+        emitLabel lcont
+        cannedGCReturnsTo checkYield False gc regs lret off code
+
+altHeapCheckReturnsTo :: [LocalReg] -> Label -> ByteOff -> FCode a -> FCode a
+altHeapCheckReturnsTo regs lret off code
+  = do dflags <- getDynFlags
+       case cannedGCEntryPoint dflags regs of
+           Nothing -> genericGC False code
+           Just gc -> cannedGCReturnsTo False True gc regs lret off code
+
+-- noEscapeHeapCheck is implemented identically to altHeapCheck (which
+-- is more efficient), but cannot be optimized away in the non-allocating
+-- case because it may occur in a loop
+noEscapeHeapCheck :: [LocalReg] -> FCode a -> FCode a
+noEscapeHeapCheck regs code = altOrNoEscapeHeapCheck True regs code
+
+cannedGCReturnsTo :: Bool -> Bool -> CmmExpr -> [LocalReg] -> Label -> ByteOff
+                  -> FCode a
+                  -> FCode a
+cannedGCReturnsTo checkYield cont_on_stack gc regs lret off code
+  = do dflags <- getDynFlags
+       updfr_sz <- getUpdFrameOff
+       heapCheck False checkYield (gc_call dflags gc updfr_sz) code
   where
     reg_exprs = map (CmmReg . CmmLocal) regs
+      -- Note [stg_gc arguments]
 
-    gc_call sp =
-        case rts_label regs of
-             Just gc -> mkCall (CmmLit gc) (GC, GC) regs reg_exprs sp
-             Nothing -> mkCall generic_gc (GC, GC) [] [] sp
+      -- NB. we use the NativeReturn convention for passing arguments
+      -- to the canned heap-check routines, because we are in a case
+      -- alternative and hence the [LocalReg] was passed to us in the
+      -- NativeReturn convention.
+    gc_call dflags label sp
+      | cont_on_stack
+      = mkJumpReturnsTo dflags label NativeReturn reg_exprs lret off sp
+      | otherwise
+      = mkCallReturnsTo dflags label NativeReturn reg_exprs lret off sp []
 
-    rts_label [reg]
-        | isGcPtrType ty = Just (mkGcLabel "stg_gc_unpt_r1")
-        | isFloatType ty = case width of
-                                W32       -> Just (mkGcLabel "stg_gc_f1")
-                                W64       -> Just (mkGcLabel "stg_gc_d1")
-                                _         -> Nothing
+genericGC :: Bool -> FCode a -> FCode a
+genericGC checkYield code
+  = do updfr_sz <- getUpdFrameOff
+       lretry <- newLabelC
+       emitLabel lretry
+       call <- mkCall generic_gc (GC, GC) [] [] updfr_sz []
+       heapCheck False checkYield (call <*> mkBranch lretry) code
 
-        | width == wordWidth = Just (mkGcLabel "stg_gc_unbx_r1")
-        | width == W64       = Just (mkGcLabel "stg_gc_l1")
-        | otherwise          = Nothing
-        where
-            ty = localRegType reg
-            width = typeWidth ty
+cannedGCEntryPoint :: DynFlags -> [LocalReg] -> Maybe CmmExpr
+cannedGCEntryPoint dflags regs
+  = case map localRegType regs of
+      []  -> Just (mkGcLabel "stg_gc_noregs")
+      [ty]
+          | isGcPtrType ty -> Just (mkGcLabel "stg_gc_unpt_r1")
+          | isFloatType ty -> case width of
+                                  W32       -> Just (mkGcLabel "stg_gc_f1")
+                                  W64       -> Just (mkGcLabel "stg_gc_d1")
+                                  _         -> Nothing
 
-    rts_label _ = Nothing
+          | width == wordWidth dflags -> Just (mkGcLabel "stg_gc_unbx_r1")
+          | width == W64              -> Just (mkGcLabel "stg_gc_l1")
+          | otherwise                 -> Nothing
+          where
+              width = typeWidth ty
+      [ty1,ty2]
+          |  isGcPtrType ty1
+          && isGcPtrType ty2 -> Just (mkGcLabel "stg_gc_pp")
+      [ty1,ty2,ty3]
+          |  isGcPtrType ty1
+          && isGcPtrType ty2
+          && isGcPtrType ty3 -> Just (mkGcLabel "stg_gc_ppp")
+      [ty1,ty2,ty3,ty4]
+          |  isGcPtrType ty1
+          && isGcPtrType ty2
+          && isGcPtrType ty3
+          && isGcPtrType ty4 -> Just (mkGcLabel "stg_gc_pppp")
+      _otherwise -> Nothing
+
+-- Note [stg_gc arguments]
+-- It might seem that we could avoid passing the arguments to the
+-- stg_gc function, because they are already in the right registers.
+-- While this is usually the case, it isn't always.  Sometimes the
+-- code generator has cleverly avoided the eval in a case, e.g. in
+-- ffi/should_run/4221.hs we found
+--
+--   case a_r1mb of z
+--     FunPtr x y -> ...
+--
+-- where a_r1mb is bound a top-level constructor, and is known to be
+-- evaluated.  The codegen just assigns x, y and z, and continues;
+-- R1 is never assigned.
+--
+-- So we'll have to rely on optimisations to eliminatethese
+-- assignments where possible.
 
 
 -- | The generic GC procedure; no params, no results
 generic_gc :: CmmExpr
-generic_gc = CmmLit $ mkGcLabel "stg_gc_noregs"
+generic_gc = mkGcLabel "stg_gc_noregs"
 
 -- | Create a CLabel for calling a garbage collector entry point
-mkGcLabel :: String -> CmmLit
-mkGcLabel = (CmmLabel . (mkCmmCodeLabel rtsPackageId) . fsLit)
+mkGcLabel :: String -> CmmExpr
+mkGcLabel s = CmmLit (CmmLabel (mkCmmCodeLabel rtsPackageId (fsLit s)))
 
 -------------------------------
-heapCheck :: Bool -> CmmAGraph -> FCode a -> FCode a
-heapCheck checkStack do_gc code
+heapCheck :: Bool -> Bool -> CmmAGraph -> FCode a -> FCode a
+heapCheck checkStack checkYield do_gc code
   = getHeapUsage $ \ hpHw ->
     -- Emit heap checks, but be sure to do it lazily so
     -- that the conditionals on hpHw don't cause a black hole
-    do  { emit $ do_checks checkStack hpHw do_gc
-        ; tickyAllocHeap hpHw
-        ; doGranAllocate hpHw
+    do  { dflags <- getDynFlags
+        ; let mb_alloc_bytes
+                 | hpHw > 0  = Just (mkIntExpr dflags (hpHw * (wORD_SIZE dflags)))
+                 | otherwise = Nothing
+              stk_hwm | checkStack = Just (CmmLit CmmHighStackMark)
+                      | otherwise  = Nothing
+        ; codeOnly $ do_checks stk_hwm checkYield mb_alloc_bytes do_gc
+        ; tickyAllocHeap True hpHw
         ; setRealHp hpHw
         ; code }
 
-do_checks :: Bool       -- Should we check the stack?
-          -> WordOff    -- Heap headroom
-          -> CmmAGraph  -- What to do on failure
-          -> CmmAGraph
-do_checks checkStack alloc do_gc
-  = withFreshLabel "gc" $ \ loop_id ->
-    withFreshLabel "gc" $ \ gc_id   ->
-      mkLabel loop_id
-      <*> (let hpCheck = if alloc == 0 then mkNop
-                         else mkAssign hpReg bump_hp <*>
-                              mkCmmIfThen hp_oflo (alloc_n <*> mkBranch gc_id)
-           in if checkStack
-                 then mkCmmIfThenElse sp_oflo (mkBranch gc_id) hpCheck
-                 else hpCheck)
-      <*> mkComment (mkFastString "outOfLine should follow:")
-      <*> outOfLine (mkLabel gc_id
-                     <*> mkComment (mkFastString "outOfLine here")
-                     <*> do_gc
-                     <*> mkBranch loop_id)
+heapStackCheckGen :: Maybe CmmExpr -> Maybe CmmExpr -> FCode ()
+heapStackCheckGen stk_hwm mb_bytes
+  = do updfr_sz <- getUpdFrameOff
+       lretry <- newLabelC
+       emitLabel lretry
+       call <- mkCall generic_gc (GC, GC) [] [] updfr_sz []
+       do_checks stk_hwm False mb_bytes (call <*> mkBranch lretry)
+
+-- Note [Single stack check]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~
+-- When compiling a function we can determine how much stack space it
+-- will use. We therefore need to perform only a single stack check at
+-- the beginning of a function to see if we have enough stack space.
+--
+-- The check boils down to comparing Sp-N with SpLim, where N is the
+-- amount of stack space needed (see Note [Stack usage] below).  *BUT*
+-- at this stage of the pipeline we are not supposed to refer to Sp
+-- itself, because the stack is not yet manifest, so we don't quite
+-- know where Sp pointing.
+
+-- So instead of referring directly to Sp - as we used to do in the
+-- past - the code generator uses (old + 0) in the stack check. That
+-- is the address of the first word of the old area, so if we add N
+-- we'll get the address of highest used word.
+--
+-- This makes the check robust.  For example, while we need to perform
+-- only one stack check for each function, we could in theory place
+-- more stack checks later in the function. They would be redundant,
+-- but not incorrect (in a sense that they should not change program
+-- behaviour). We need to make sure however that a stack check
+-- inserted after incrementing the stack pointer checks for a
+-- respectively smaller stack space. This would not be the case if the
+-- code generator produced direct references to Sp. By referencing
+-- (old + 0) we make sure that we always check for a correct amount of
+-- stack: when converting (old + 0) to Sp the stack layout phase takes
+-- into account changes already made to stack pointer. The idea for
+-- this change came from observations made while debugging #8275.
+
+-- Note [Stack usage]
+-- ~~~~~~~~~~~~~~~~~~
+-- At the moment we convert from STG to Cmm we don't know N, the
+-- number of bytes of stack that the function will use, so we use a
+-- special late-bound CmmLit, namely
+--       CmmHighStackMark
+-- to stand for the number of bytes needed. When the stack is made
+-- manifest, the number of bytes needed is calculated, and used to
+-- replace occurrences of CmmHighStackMark
+--
+-- The (Maybe CmmExpr) passed to do_checks is usually
+--     Just (CmmLit CmmHighStackMark)
+-- but can also (in certain hand-written RTS functions)
+--     Just (CmmLit 8)  or some other fixed valuet
+-- If it is Nothing, we don't generate a stack check at all.
+
+do_checks :: Maybe CmmExpr    -- Should we check the stack?
+                              -- See Note [Stack usage]
+          -> Bool             -- Should we check for preemption?
+          -> Maybe CmmExpr    -- Heap headroom (bytes)
+          -> CmmAGraph        -- What to do on failure
+          -> FCode ()
+do_checks mb_stk_hwm checkYield mb_alloc_lit do_gc = do
+  dflags <- getDynFlags
+  gc_id <- newLabelC
+
+  let
+    Just alloc_lit = mb_alloc_lit
+
+    bump_hp   = cmmOffsetExprB dflags (CmmReg hpReg) alloc_lit
+
+    -- Sp overflow if ((old + 0) - CmmHighStack < SpLim)
+    -- At the beginning of a function old + 0 = Sp
+    -- See Note [Single stack check]
+    sp_oflo sp_hwm =
+         CmmMachOp (mo_wordULt dflags)
+                  [CmmMachOp (MO_Sub (typeWidth (cmmRegType dflags spReg)))
+                             [CmmStackSlot Old 0, sp_hwm],
+                   CmmReg spLimReg]
+
+    -- Hp overflow if (Hp > HpLim)
+    -- (Hp has been incremented by now)
+    -- HpLim points to the LAST WORD of valid allocation space.
+    hp_oflo = CmmMachOp (mo_wordUGt dflags)
+                  [CmmReg hpReg, CmmReg (CmmGlobal HpLim)]
+
+    alloc_n = mkAssign (CmmGlobal HpAlloc) alloc_lit
+
+  case mb_stk_hwm of
+    Nothing -> return ()
+    Just stk_hwm -> tickyStackCheck >> (emit =<< mkCmmIfGoto (sp_oflo stk_hwm) gc_id)
+
+  -- Emit new label that might potentially be a header
+  -- of a self-recursive tail call.
+  -- See Note [Self-recursive loop header].
+  self_loop_info <- getSelfLoop
+  case self_loop_info of
+    Just (_, loop_header_id, _)
+        | checkYield && isJust mb_stk_hwm -> emitLabel loop_header_id
+    _otherwise -> return ()
+
+  if (isJust mb_alloc_lit)
+    then do
+     tickyHeapCheck
+     emitAssign hpReg bump_hp
+     emit =<< mkCmmIfThen hp_oflo (alloc_n <*> mkBranch gc_id)
+    else do
+      when (checkYield && not (gopt Opt_OmitYields dflags)) $ do
+         -- Yielding if HpLim == 0
+         let yielding = CmmMachOp (mo_wordEq dflags)
+                                  [CmmReg (CmmGlobal HpLim),
+                                   CmmLit (zeroCLit dflags)]
+         emit =<< mkCmmIfGoto yielding gc_id
+
+  emitOutOfLine gc_id $
+     do_gc -- this is expected to jump back somewhere
+
                 -- Test for stack pointer exhaustion, then
                 -- bump heap pointer, and test for heap exhaustion
                 -- Note that we don't move the heap pointer unless the
                 -- stack check succeeds.  Otherwise we might end up
                 -- with slop at the end of the current block, which can
                 -- confuse the LDV profiler.
-  where
-    alloc_lit = CmmLit (mkIntCLit (alloc*wORD_SIZE)) -- Bytes
-    bump_hp   = cmmOffsetExprB (CmmReg hpReg) alloc_lit
 
-    -- Sp overflow if (Sp - CmmHighStack < SpLim)
-    sp_oflo = CmmMachOp mo_wordULt
-                  [CmmMachOp (MO_Sub (typeWidth (cmmRegType spReg)))
-                             [CmmReg spReg, CmmLit CmmHighStackMark],
-                   CmmReg spLimReg]
-
-    -- Hp overflow if (Hp > HpLim)
-    -- (Hp has been incremented by now)
-    -- HpLim points to the LAST WORD of valid allocation space.
-    hp_oflo = CmmMachOp mo_wordUGt
-                  [CmmReg hpReg, CmmReg (CmmGlobal HpLim)]
-
-    alloc_n = mkAssign (CmmGlobal HpAlloc) alloc_lit
-
-{-
-
-{- Unboxed tuple alternatives and let-no-escapes (the two most annoying
-constructs to generate code for!)  For unboxed tuple returns, there
-are an arbitrary number of possibly unboxed return values, some of
-which will be in registers, and the others will be on the stack.  We
-always organise the stack-resident fields into pointers &
-non-pointers, and pass the number of each to the heap check code. -}
-
-unbxTupleHeapCheck
-        :: [(Id, GlobalReg)]    -- Live registers
-        -> WordOff      -- no. of stack slots containing ptrs
-        -> WordOff      -- no. of stack slots containing nonptrs
-        -> CmmAGraph    -- code to insert in the failure path
-        -> FCode ()
-        -> FCode ()
-
-unbxTupleHeapCheck regs ptrs nptrs fail_code code
-  -- We can't manage more than 255 pointers/non-pointers
-  -- in a generic heap check.
-  | ptrs > 255 || nptrs > 255 = panic "altHeapCheck"
-  | otherwise
-  = initHeapUsage $ \ hpHw -> do
-        { codeOnly $ do { do_checks 0 {- no stack check -} hpHw
-                                    full_fail_code rts_label
-                        ; tickyAllocHeap hpHw }
-        ; setRealHp hpHw
-        ; code }
-  where
-    full_fail_code  = fail_code `plusStmts` oneStmt assign_liveness
-    assign_liveness = CmmAssign (CmmGlobal (VanillaReg 9))      -- Ho ho ho!
-                                (CmmLit (mkWordCLit liveness))
-    liveness        = mkRegLiveness regs ptrs nptrs
-    rts_label       = CmmLit (CmmLabel (mkRtsCodeLabel (sLit "stg_gc_ut")))
-
-
-{- Old Gransim com -- I have no idea whether it still makes sense (SLPJ Sep07)
-For GrAnSim the code for doing a heap check and doing a context switch
-has been separated. Especially, the HEAP_CHK macro only performs a
-heap check. THREAD_CONTEXT_SWITCH should be used for doing a context
-switch. GRAN_FETCH_AND_RESCHEDULE must be put at the beginning of
-every slow entry code in order to simulate the fetching of
-closures. If fetching is necessary (i.e. current closure is not local)
-then an automatic context switch is done. -}
-
-
-When failing a check, we save a return address on the stack and
-jump to a pre-compiled code fragment that saves the live registers
-and returns to the scheduler.
-
-The return address in most cases will be the beginning of the basic
-block in which the check resides, since we need to perform the check
-again on re-entry because someone else might have stolen the resource
-in the meantime.
-
-%************************************************************************
-%*                                                                      *
-     Generic Heap/Stack Checks - used in the RTS
-%*                                                                      *
-%************************************************************************
-
-\begin{code}
-hpChkGen :: CmmExpr -> CmmExpr -> CmmExpr -> FCode ()
-hpChkGen bytes liveness reentry
-  = do_checks' bytes True assigns stg_gc_gen
-  where
-    assigns = mkStmts [
-                CmmAssign (CmmGlobal (VanillaReg 9))  liveness,
-                CmmAssign (CmmGlobal (VanillaReg 10)) reentry
-                ]
-
--- a heap check where R1 points to the closure to enter on return, and
--- we want to assign to Sp[0] on failure (used in AutoApply.cmm:BUILD_PAP).
-hpChkNodePointsAssignSp0 :: CmmExpr -> CmmExpr -> FCode ()
-hpChkNodePointsAssignSp0 bytes sp0
-  = do_checks' bytes True assign stg_gc_enter1
-  where assign = oneStmt (CmmStore (CmmReg spReg) sp0)
-
-stg_gc_gen    = CmmLit (CmmLabel (mkRtsCodeLabel (sLit "stg_gc_gen")))
-\end{code}
-
--}
+-- Note [Self-recursive loop header]
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--
+-- Self-recursive loop header is required by loopification optimization (See
+-- Note [Self-recursive tail calls] in StgCmmExpr). We emit it if:
+--
+--  1. There is information about self-loop in the FCode environment. We don't
+--     check the binder (first component of the self_loop_info) because we are
+--     certain that if the self-loop info is present then we are compiling the
+--     binder body. Reason: the only possible way to get here with the
+--     self_loop_info present is from closureCodeBody.
+--
+--  2. checkYield && isJust mb_stk_hwm. checkYield tells us that it is possible
+--     to preempt the heap check (see #367 for motivation behind this check). It
+--     is True for heap checks placed at the entry to a function and
+--     let-no-escape heap checks but false for other heap checks (eg. in case
+--     alternatives or created from hand-written high-level Cmm). The second
+--     check (isJust mb_stk_hwm) is true for heap checks at the entry to a
+--     function and some heap checks created in hand-written Cmm. Otherwise it
+--     is Nothing. In other words the only situation when both conditions are
+--     true is when compiling stack and heap checks at the entry to a
+--     function. This is the only situation when we want to emit a self-loop
+--     label.

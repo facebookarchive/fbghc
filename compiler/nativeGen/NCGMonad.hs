@@ -1,32 +1,33 @@
 -- -----------------------------------------------------------------------------
 --
 -- (c) The University of Glasgow 1993-2004
--- 
+--
 -- The native code generator's monad.
 --
 -- -----------------------------------------------------------------------------
 
 module NCGMonad (
-	NatM_State(..), mkNatM_State,
+        NatM_State(..), mkNatM_State,
 
-	NatM, -- instance Monad
-	initNat, 
-	addImportNat, 
-	getUniqueNat,
-	mapAccumLNat, 
-	setDeltaNat, 
-	getDeltaNat,
-	getBlockIdNat, 
-	getNewLabelNat, 
-	getNewRegNat, 
-	getNewRegPairNat,
-	getPicBaseMaybeNat, 
-	getPicBaseNat, 
-	getDynFlagsNat
-) 
- 
+        NatM, -- instance Monad
+        initNat,
+        addImportNat,
+        getUniqueNat,
+        mapAccumLNat,
+        setDeltaNat,
+        getDeltaNat,
+        getThisModuleNat,
+        getBlockIdNat,
+        getNewLabelNat,
+        getNewRegNat,
+        getNewRegPairNat,
+        getPicBaseMaybeNat,
+        getPicBaseNat,
+        getDynFlags
+)
+
 where
-  
+
 #include "HsVersions.h"
 
 import Reg
@@ -34,33 +35,45 @@ import Size
 import TargetReg
 
 import BlockId
-import CLabel		( CLabel, mkAsmTempLabel )
+import CLabel           ( CLabel, mkAsmTempLabel )
 import UniqSupply
-import Unique		( Unique )
+import Unique           ( Unique )
 import DynFlags
+import Module
 
-data NatM_State 
-	= NatM_State {
-		natm_us      :: UniqSupply,
-		natm_delta   :: Int,
-		natm_imports :: [(CLabel)],
-		natm_pic     :: Maybe Reg,
-		natm_dflags  :: DynFlags
-	}
+import Control.Monad    ( liftM, ap )
+import Control.Applicative ( Applicative(..) )
+
+data NatM_State
+        = NatM_State {
+                natm_us          :: UniqSupply,
+                natm_delta       :: Int,
+                natm_imports     :: [(CLabel)],
+                natm_pic         :: Maybe Reg,
+                natm_dflags      :: DynFlags,
+                natm_this_module :: Module
+        }
 
 newtype NatM result = NatM (NatM_State -> (result, NatM_State))
 
 unNat :: NatM a -> NatM_State -> (a, NatM_State)
 unNat (NatM a) = a
 
-mkNatM_State :: UniqSupply -> Int -> DynFlags -> NatM_State
-mkNatM_State us delta dflags 
-	= NatM_State us delta [] Nothing dflags
+mkNatM_State :: UniqSupply -> Int -> DynFlags -> Module -> NatM_State
+mkNatM_State us delta dflags this_mod
+        = NatM_State us delta [] Nothing dflags this_mod
 
 initNat :: NatM_State -> NatM a -> (a, NatM_State)
-initNat init_st m 
-	= case unNat m init_st of { (r,st) -> (r,st) }
+initNat init_st m
+        = case unNat m init_st of { (r,st) -> (r,st) }
 
+
+instance Functor NatM where
+      fmap = liftM
+
+instance Applicative NatM where
+      pure = return
+      (<*>) = ap
 
 instance Monad NatM where
   (>>=) = thenNat
@@ -69,17 +82,17 @@ instance Monad NatM where
 
 thenNat :: NatM a -> (a -> NatM b) -> NatM b
 thenNat expr cont
-	= NatM $ \st -> case unNat expr st of
-			(result, st') -> unNat (cont result) st'
+        = NatM $ \st -> case unNat expr st of
+                        (result, st') -> unNat (cont result) st'
 
 returnNat :: a -> NatM a
-returnNat result 
-	= NatM $ \st ->  (result, st)
+returnNat result
+        = NatM $ \st ->  (result, st)
 
 mapAccumLNat :: (acc -> x -> NatM (acc, y))
                 -> acc
-	        -> [x]
-	        -> NatM (acc, [y])
+                -> [x]
+                -> NatM (acc, [y])
 
 mapAccumLNat _ b []
   = return (b, [])
@@ -89,72 +102,71 @@ mapAccumLNat f b (x:xs)
        return (b__3, x__2:xs__2)
 
 getUniqueNat :: NatM Unique
-getUniqueNat = NatM $ \ (NatM_State us delta imports pic dflags) ->
-    case takeUniqFromSupply us of
-         (uniq, us') -> (uniq, (NatM_State us' delta imports pic dflags))
+getUniqueNat = NatM $ \ st ->
+    case takeUniqFromSupply $ natm_us st of
+    (uniq, us') -> (uniq, st {natm_us = us'})
 
-
-getDynFlagsNat :: NatM DynFlags
-getDynFlagsNat 
-	= NatM $ \ (NatM_State us delta imports pic dflags) ->
-	          (dflags, (NatM_State us delta imports pic dflags))
+instance HasDynFlags NatM where
+    getDynFlags = NatM $ \ st -> (natm_dflags st, st)
 
 
 getDeltaNat :: NatM Int
-getDeltaNat 
-	= NatM $ \ st -> (natm_delta st, st)
+getDeltaNat = NatM $ \ st -> (natm_delta st, st)
 
 
 setDeltaNat :: Int -> NatM ()
-setDeltaNat delta 
-	= NatM $ \ (NatM_State us _ imports pic dflags) ->
-		   ((), NatM_State us delta imports pic dflags)
+setDeltaNat delta = NatM $ \ st -> ((), st {natm_delta = delta})
+
+
+getThisModuleNat :: NatM Module
+getThisModuleNat = NatM $ \ st -> (natm_this_module st, st)
 
 
 addImportNat :: CLabel -> NatM ()
-addImportNat imp 
-	= NatM $ \ (NatM_State us delta imports pic dflags) ->
-		   ((), NatM_State us delta (imp:imports) pic dflags)
+addImportNat imp
+        = NatM $ \ st -> ((), st {natm_imports = imp : natm_imports st})
 
 
 getBlockIdNat :: NatM BlockId
-getBlockIdNat 
- = do	u <- getUniqueNat
- 	return (mkBlockId u)
+getBlockIdNat
+ = do   u <- getUniqueNat
+        return (mkBlockId u)
 
 
 getNewLabelNat :: NatM CLabel
-getNewLabelNat 
- = do 	u <- getUniqueNat
- 	return (mkAsmTempLabel u)
+getNewLabelNat
+ = do   u <- getUniqueNat
+        return (mkAsmTempLabel u)
 
 
 getNewRegNat :: Size -> NatM Reg
-getNewRegNat rep 
- = do	u <- getUniqueNat
- 	return (RegVirtual $ targetMkVirtualReg u rep)
+getNewRegNat rep
+ = do u <- getUniqueNat
+      dflags <- getDynFlags
+      return (RegVirtual $ targetMkVirtualReg (targetPlatform dflags) u rep)
 
 
 getNewRegPairNat :: Size -> NatM (Reg,Reg)
-getNewRegPairNat rep 
- = do	u 	<- getUniqueNat
- 	let vLo	= targetMkVirtualReg u rep
-	let lo 	= RegVirtual $ targetMkVirtualReg u rep
-	let hi 	= RegVirtual $ getHiVirtualRegFromLo vLo
-	return (lo, hi)
+getNewRegPairNat rep
+ = do u <- getUniqueNat
+      dflags <- getDynFlags
+      let vLo = targetMkVirtualReg (targetPlatform dflags) u rep
+      let lo  = RegVirtual $ targetMkVirtualReg (targetPlatform dflags) u rep
+      let hi  = RegVirtual $ getHiVirtualRegFromLo vLo
+      return (lo, hi)
 
 
 getPicBaseMaybeNat :: NatM (Maybe Reg)
-getPicBaseMaybeNat 
-	= NatM (\state -> (natm_pic state, state))
+getPicBaseMaybeNat
+        = NatM (\state -> (natm_pic state, state))
 
 
 getPicBaseNat :: Size -> NatM Reg
-getPicBaseNat rep 
- = do	mbPicBase <- getPicBaseMaybeNat
-	case mbPicBase of
-	        Just picBase -> return picBase
-	        Nothing 
-		 -> do
-			reg <- getNewRegNat rep
-			NatM (\state -> (reg, state { natm_pic = Just reg }))
+getPicBaseNat rep
+ = do   mbPicBase <- getPicBaseMaybeNat
+        case mbPicBase of
+                Just picBase -> return picBase
+                Nothing
+                 -> do
+                        reg <- getNewRegNat rep
+                        NatM (\state -> (reg, state { natm_pic = Just reg }))

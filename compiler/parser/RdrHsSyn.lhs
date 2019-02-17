@@ -1,164 +1,99 @@
-%
+o%
 % (c) The University of Glasgow, 1996-2003
 
 Functions over HsSyn specialised to RdrName.
 
 \begin{code}
 module RdrHsSyn (
-	extractHsTyRdrTyVars, 
-	extractHsRhoRdrTyVars, extractGenericPatTyVars,
- 
-	mkHsOpApp, 
-	mkHsIntegral, mkHsFractional, mkHsIsString,
-	mkHsDo, mkHsSplice, mkTopSpliceDecl,
-        mkClassDecl, mkTyData, mkTyFamily, mkTySynonym,
-        splitCon, mkInlinePragma,	
-	mkRecConstrOrUpdate, -- HsExp -> [HsFieldUpdate] -> P HsExp
+        mkHsOpApp,
+        mkHsIntegral, mkHsFractional, mkHsIsString,
+        mkHsDo, mkSpliceDecl,
+        mkRoleAnnotDecl,
+        mkClassDecl, 
+        mkTyData, mkDataFamInst, 
+        mkTySynonym, mkTyFamInstEqn,
+        mkTyFamInst, 
+        mkFamDecl, 
+        splitCon, mkInlinePragma,
+        mkRecConstrOrUpdate, -- HsExp -> [HsFieldUpdate] -> P HsExp
+        mkTyLit,
+        mkTyClD, mkInstD,
 
-	cvBindGroup,
+        cvBindGroup,
         cvBindsAndSigs,
-	cvTopDecls,
+        cvTopDecls,
         placeHolderPunRhs,
 
-	-- Stuff to do with Foreign declarations
-	mkImport,
+        -- Stuff to do with Foreign declarations
+        mkImport,
         parseCImport,
-	mkExport,
-	mkExtName,           -- RdrName -> CLabelString
-	mkGadtDecl,          -- [Located RdrName] -> LHsType RdrName -> ConDecl RdrName
-	mkSimpleConDecl, 
-	mkDeprecatedGadtRecordDecl,
+        mkExport,
+        mkExtName,           -- RdrName -> CLabelString
+        mkGadtDecl,          -- [Located RdrName] -> LHsType RdrName -> ConDecl RdrName
+        mkSimpleConDecl,
+        mkDeprecatedGadtRecordDecl,
 
-	-- Bunch of functions in the parser monad for 
-	-- checking and constructing values
-	checkPrecP, 	      -- Int -> P Int
-	checkContext,	      -- HsType -> P HsContext
-	checkPred,	      -- HsType -> P HsPred
-	checkTyVars,          -- [LHsType RdrName] -> P ()
-	checkKindSigs,	      -- [LTyClDecl RdrName] -> P ()
-	checkInstType,	      -- HsType -> P HsType
-	checkPattern,	      -- HsExp -> P HsPat
-	bang_RDR,
-	checkPatterns,	      -- SrcLoc -> [HsExp] -> P [HsPat]
-	checkMonadComp,       -- P (HsStmtContext RdrName)
-	checkValDef,	      -- (SrcLoc, HsExp, HsRhs, [HsDecl]) -> P HsDecl
-	checkValSig,	      -- (SrcLoc, HsExp, HsRhs, [HsDecl]) -> P HsDecl
-	checkDoAndIfThenElse,
-	parseError,	    
-	parseErrorSDoc,	    
+        -- Bunch of functions in the parser monad for
+        -- checking and constructing values
+        checkPrecP,           -- Int -> P Int
+        checkContext,         -- HsType -> P HsContext
+        checkPattern,         -- HsExp -> P HsPat
+        bang_RDR,
+        checkPatterns,        -- SrcLoc -> [HsExp] -> P [HsPat]
+        checkMonadComp,       -- P (HsStmtContext RdrName)
+        checkCommand,         -- LHsExpr RdrName -> P (LHsCmd RdrName)
+        checkValDef,          -- (SrcLoc, HsExp, HsRhs, [HsDecl]) -> P HsDecl
+        checkValSig,          -- (SrcLoc, HsExp, HsRhs, [HsDecl]) -> P HsDecl
+        checkDoAndIfThenElse,
+        checkRecordSyntax,
+        parseErrorSDoc,
+
+        -- Help with processing exports
+        ImpExpSubSpec(..),
+        mkModuleImpExp,
+        mkTypeImpExp
+
     ) where
 
-import HsSyn		-- Lots of it
+import HsSyn            -- Lots of it
 import Class            ( FunDep )
-import TypeRep          ( Kind )
-import RdrName		( RdrName, isRdrTyVar, isRdrTc, mkUnqual, rdrNameOcc, 
-			  isRdrDataCon, isUnqual, getRdrName, setRdrNameSpace )
+import CoAxiom          ( Role, fsFromRole )
+import RdrName          ( RdrName, isRdrTyVar, isRdrTc, mkUnqual, rdrNameOcc, 
+                          isRdrDataCon, isUnqual, getRdrName, setRdrNameSpace,
+                          rdrNameSpace )
+import OccName          ( tcClsName, isVarNameSpace )
 import Name             ( Name )
-import BasicTypes	( maxPrecedence, Activation(..), RuleMatchInfo,
-                          InlinePragma(..), InlineSpec(..) )
+import BasicTypes       ( maxPrecedence, Activation(..), RuleMatchInfo,
+                          InlinePragma(..), InlineSpec(..), Origin(..) )
+import TcEvidence       ( idHsWrapper )
 import Lexer
-import TysWiredIn	( unitTyCon ) 
+import TysWiredIn       ( unitTyCon, unitDataCon )
 import ForeignCall
-import OccName  	( srcDataName, varName, isDataOcc, isTcOcc, 
-			  occNameString )
-import PrelNames	( forall_tv_RDR )
+import OccName          ( srcDataName, varName, isDataOcc, isTcOcc,
+                          occNameString )
+import PrelNames        ( forall_tv_RDR )
 import DynFlags
 import SrcLoc
-import OrdList		( OrdList, fromOL )
-import Bag		( Bag, emptyBag, consBag, foldrBag )
+import OrdList          ( OrdList, fromOL )
+import Bag              ( emptyBag, consBag )
 import Outputable
 import FastString
 import Maybes
+import Util
 
-import Control.Applicative ((<$>))       
+import Control.Applicative ((<$>))
 import Control.Monad
 import Text.ParserCombinators.ReadP as ReadP
-import Data.List        ( nubBy )
 import Data.Char
+
+import Data.Data       ( dataTypeOf, fromConstr, dataTypeConstrs )
 
 #include "HsVersions.h"
 \end{code}
 
 
 %************************************************************************
-%*									*
-\subsection{A few functions over HsSyn at RdrName}
-%*                                                                    *
-%************************************************************************
-
-extractHsTyRdrNames finds the free variables of a HsType
-It's used when making the for-alls explicit.
-
-\begin{code}
-extractHsTyRdrTyVars :: LHsType RdrName -> [Located RdrName]
-extractHsTyRdrTyVars ty = nubBy eqLocated (extract_lty ty [])
-
-extractHsTysRdrTyVars :: [LHsType RdrName] -> [Located RdrName]
-extractHsTysRdrTyVars ty = nubBy eqLocated (extract_ltys ty [])
-
-extractHsRhoRdrTyVars :: LHsContext RdrName -> LHsType RdrName -> [Located RdrName]
--- This one takes the context and tau-part of a 
--- sigma type and returns their free type variables
-extractHsRhoRdrTyVars ctxt ty 
- = nubBy eqLocated $ extract_lctxt ctxt (extract_lty ty [])
-
-extract_lctxt :: Located [LHsPred RdrName] -> [Located RdrName] -> [Located RdrName]
-extract_lctxt ctxt acc = foldr (extract_pred . unLoc) acc (unLoc ctxt)
-
-extract_pred :: HsPred RdrName -> [Located RdrName] -> [Located RdrName]
-extract_pred (HsClassP _   tys) acc = extract_ltys tys acc
-extract_pred (HsEqualP ty1 ty2) acc = extract_lty ty1 (extract_lty ty2 acc)
-extract_pred (HsIParam _   ty ) acc = extract_lty ty acc
-
-extract_ltys :: [LHsType RdrName] -> [Located RdrName] -> [Located RdrName]
-extract_ltys tys acc = foldr extract_lty acc tys
-
-extract_lty :: LHsType RdrName -> [Located RdrName] -> [Located RdrName]
-extract_lty (L loc ty) acc 
-  = case ty of
-      HsTyVar tv 	        -> extract_tv loc tv acc
-      HsBangTy _ ty            	-> extract_lty ty acc
-      HsRecTy flds            	-> foldr (extract_lty . cd_fld_type) acc flds
-      HsAppTy ty1 ty2          	-> extract_lty ty1 (extract_lty ty2 acc)
-      HsListTy ty              	-> extract_lty ty acc
-      HsPArrTy ty              	-> extract_lty ty acc
-      HsTupleTy _ tys          	-> extract_ltys tys acc
-      HsFunTy ty1 ty2          	-> extract_lty ty1 (extract_lty ty2 acc)
-      HsPredTy p		-> extract_pred p acc
-      HsOpTy ty1 (L loc tv) ty2 -> extract_tv loc tv (extract_lty ty1 (extract_lty ty2 acc))
-      HsParTy ty               	-> extract_lty ty acc
-      HsNumTy {}                -> acc
-      HsCoreTy {}               -> acc  -- The type is closed
-      HsQuasiQuoteTy {}	        -> acc  -- Quasi quotes mention no type variables
-      HsSpliceTy {}           	-> acc	-- Type splices mention no type variables
-      HsKindSig ty _            -> extract_lty ty acc
-      HsForAllTy _ [] cx ty     -> extract_lctxt cx (extract_lty ty acc)
-      HsForAllTy _ tvs cx ty    -> acc ++ (filter ((`notElem` locals) . unLoc) $
-					   extract_lctxt cx (extract_lty ty []))
-				where
-				   locals = hsLTyVarNames tvs
-      HsDocTy ty _              -> extract_lty ty acc
-
-extract_tv :: SrcSpan -> RdrName -> [Located RdrName] -> [Located RdrName]
-extract_tv loc tv acc | isRdrTyVar tv = L loc tv : acc
-		      | otherwise     = acc
-
-extractGenericPatTyVars :: LHsBinds RdrName -> [Located RdrName]
--- Get the type variables out of the type patterns in a bunch of
--- possibly-generic bindings in a class declaration
-extractGenericPatTyVars binds
-  = nubBy eqLocated (foldrBag get [] binds)
-  where
-    get (L _ (FunBind { fun_matches = MatchGroup ms _ })) acc = foldr (get_m.unLoc) acc ms
-    get _                                                 acc = acc
-
-    get_m (Match (L _ (TypePat ty) : _) _ _) acc = extract_lty ty acc
-    get_m _                                        acc = acc
-\end{code}
-
-
-%************************************************************************
-%*									*
+%*                                                                      *
 \subsection{Construction functions for Rdr stuff}
 %*                                                                    *
 %************************************************************************
@@ -171,80 +106,178 @@ file (which would be equally good).
 
 Similarly for mkConDecl, mkClassOpSig and default-method names.
 
-	*** See "THE NAMING STORY" in HsDecls ****
-  
+        *** See "THE NAMING STORY" in HsDecls ****
+
 \begin{code}
+mkTyClD :: LTyClDecl n -> LHsDecl n
+mkTyClD (L loc d) = L loc (TyClD d)
+
+mkInstD :: LInstDecl n -> LHsDecl n
+mkInstD (L loc d) = L loc (InstD d)
+
 mkClassDecl :: SrcSpan
             -> Located (Maybe (LHsContext RdrName), LHsType RdrName)
             -> Located [Located (FunDep RdrName)]
             -> Located (OrdList (LHsDecl RdrName))
-	    -> P (LTyClDecl RdrName)
+            -> P (LTyClDecl RdrName)
 
 mkClassDecl loc (L _ (mcxt, tycl_hdr)) fds where_cls
-  = do { let (binds, sigs, ats, docs) = cvBindsAndSigs (unLoc where_cls)
-       ; let cxt = fromMaybe (noLoc []) mcxt
+  = do { let (binds, sigs, ats, at_defs, _, docs) = cvBindsAndSigs (unLoc where_cls)
+             cxt = fromMaybe (noLoc []) mcxt
        ; (cls, tparams) <- checkTyClHdr tycl_hdr
-       ; tyvars <- checkTyVars tparams      -- Only type vars allowed
-       ; checkKindSigs ats
+       ; tyvars <- checkTyVars (ptext (sLit "class")) whereDots
+                               cls tparams      -- Only type vars allowed
        ; return (L loc (ClassDecl { tcdCtxt = cxt, tcdLName = cls, tcdTyVars = tyvars,
-		             	    tcdFDs = unLoc fds, tcdSigs = sigs, tcdMeths = binds,
-			     	    tcdATs   = ats, tcdDocs  = docs })) }
+                                    tcdFDs = unLoc fds, tcdSigs = sigs, tcdMeths = binds,
+                                    tcdATs = ats, tcdATDefs = at_defs, tcdDocs  = docs,
+                                    tcdFVs = placeHolderNames })) }
 
 mkTyData :: SrcSpan
          -> NewOrData
-	 -> Bool		-- True <=> data family instance
+         -> Maybe CType
          -> Located (Maybe (LHsContext RdrName), LHsType RdrName)
-         -> Maybe Kind
+         -> Maybe (LHsKind RdrName)
          -> [LConDecl RdrName]
          -> Maybe [LHsType RdrName]
          -> P (LTyClDecl RdrName)
-mkTyData loc new_or_data is_family (L _ (mcxt, tycl_hdr)) ksig data_cons maybe_deriv
+mkTyData loc new_or_data cType (L _ (mcxt, tycl_hdr)) ksig data_cons maybe_deriv
   = do { (tc, tparams) <- checkTyClHdr tycl_hdr
+       ; tyvars <- checkTyVars (ppr new_or_data) equalsDots tc tparams
+       ; defn <- mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+       ; return (L loc (DataDecl { tcdLName = tc, tcdTyVars = tyvars,
+                                   tcdDataDefn = defn,
+                                   tcdFVs = placeHolderNames })) }
 
-       ; checkDatatypeContext mcxt
+mkDataDefn :: NewOrData
+           -> Maybe CType
+           -> Maybe (LHsContext RdrName)
+           -> Maybe (LHsKind RdrName)
+           -> [LConDecl RdrName]
+           -> Maybe [LHsType RdrName]
+           -> P (HsDataDefn RdrName)
+mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+  = do { checkDatatypeContext mcxt
        ; let cxt = fromMaybe (noLoc []) mcxt
-       ; (tyvars, typats) <- checkTParams is_family tparams
-       ; return (L loc (TyData { tcdND = new_or_data, tcdCtxt = cxt, tcdLName = tc,
-	                  	 tcdTyVars = tyvars, tcdTyPats = typats, 
-                                 tcdCons = data_cons, 
-	                  	 tcdKindSig = ksig, tcdDerivs = maybe_deriv })) }
+       ; return (HsDataDefn { dd_ND = new_or_data, dd_cType = cType
+                            , dd_ctxt = cxt 
+                            , dd_cons = data_cons
+                            , dd_kindSig = ksig
+                            , dd_derivs = maybe_deriv }) }
 
-mkTySynonym :: SrcSpan 
-            -> Bool	        -- True <=> type family instances
+mkTySynonym :: SrcSpan
             -> LHsType RdrName  -- LHS
-            -> LHsType RdrName	-- RHS
+            -> LHsType RdrName  -- RHS
             -> P (LTyClDecl RdrName)
-mkTySynonym loc is_family lhs rhs
+mkTySynonym loc lhs rhs
   = do { (tc, tparams) <- checkTyClHdr lhs
-       ; (tyvars, typats) <- checkTParams is_family tparams
-       ; return (L loc (TySynonym tc tyvars typats rhs)) }
+       ; tyvars <- checkTyVars (ptext (sLit "type")) equalsDots tc tparams
+       ; return (L loc (SynDecl { tcdLName = tc, tcdTyVars = tyvars
+                                , tcdRhs = rhs, tcdFVs = placeHolderNames })) }
 
-mkTyFamily :: SrcSpan
-           -> FamilyFlavour
-	   -> LHsType RdrName   -- LHS
-	   -> Maybe Kind        -- Optional kind signature
-           -> P (LTyClDecl RdrName)
-mkTyFamily loc flavour lhs ksig
+mkTyFamInstEqn :: LHsType RdrName
+               -> LHsType RdrName
+               -> P (TyFamInstEqn RdrName)
+mkTyFamInstEqn lhs rhs
   = do { (tc, tparams) <- checkTyClHdr lhs
-       ; tyvars <- checkTyVars tparams
-       ; return (L loc (TyFamily flavour tc tyvars ksig)) }
+       ; return (TyFamInstEqn { tfie_tycon = tc
+                              , tfie_pats  = mkHsWithBndrs tparams
+                              , tfie_rhs   = rhs }) }
 
-mkTopSpliceDecl :: LHsExpr RdrName -> HsDecl RdrName
+mkDataFamInst :: SrcSpan
+         -> NewOrData
+         -> Maybe CType
+         -> Located (Maybe (LHsContext RdrName), LHsType RdrName)
+         -> Maybe (LHsKind RdrName)
+         -> [LConDecl RdrName]
+         -> Maybe [LHsType RdrName]
+         -> P (LInstDecl RdrName)
+mkDataFamInst loc new_or_data cType (L _ (mcxt, tycl_hdr)) ksig data_cons maybe_deriv
+  = do { (tc, tparams) <- checkTyClHdr tycl_hdr
+       ; defn <- mkDataDefn new_or_data cType mcxt ksig data_cons maybe_deriv
+       ; return (L loc (DataFamInstD (
+                  DataFamInstDecl { dfid_tycon = tc, dfid_pats = mkHsWithBndrs tparams
+                                  , dfid_defn = defn, dfid_fvs = placeHolderNames }))) }
+
+mkTyFamInst :: SrcSpan
+            -> LTyFamInstEqn RdrName
+            -> P (LInstDecl RdrName)
+mkTyFamInst loc eqn
+  = return (L loc (TyFamInstD (TyFamInstDecl { tfid_eqn  = eqn
+                                             , tfid_fvs  = placeHolderNames })))
+
+mkFamDecl :: SrcSpan
+          -> FamilyInfo RdrName
+          -> LHsType RdrName   -- LHS
+          -> Maybe (LHsKind RdrName) -- Optional kind signature
+          -> P (LTyClDecl RdrName)
+mkFamDecl loc info lhs ksig
+  = do { (tc, tparams) <- checkTyClHdr lhs
+       ; tyvars <- checkTyVars (ppr info) equals_or_where tc tparams
+       ; return (L loc (FamDecl (FamilyDecl { fdInfo = info, fdLName = tc
+                                            , fdTyVars = tyvars, fdKindSig = ksig }))) }
+  where
+    equals_or_where = case info of
+                        DataFamily          -> empty
+                        OpenTypeFamily      -> empty
+                        ClosedTypeFamily {} -> whereDots
+
+mkSpliceDecl :: LHsExpr RdrName -> HsDecl RdrName
 -- If the user wrote
 --      [pads| ... ]   then return a QuasiQuoteD
---	$(e)           then return a SpliceD
+--      $(e)           then return a SpliceD
 -- but if she wrote, say,
 --      f x            then behave as if she'd written $(f x)
---		       ie a SpliceD
-mkTopSpliceDecl (L _ (HsQuasiQuoteE qq))            = QuasiQuoteD qq
-mkTopSpliceDecl (L _ (HsSpliceE (HsSplice _ expr))) = SpliceD (SpliceDecl expr       Explicit)
-mkTopSpliceDecl other_expr                          = SpliceD (SpliceDecl other_expr Implicit)
+--                     ie a SpliceD
+mkSpliceDecl lexpr@(L loc expr)
+  | HsQuasiQuoteE qq <- expr          = QuasiQuoteD qq
+  | HsSpliceE is_typed splice <- expr = ASSERT( not is_typed )
+                                        SpliceD (SpliceDecl (L loc splice) Explicit)
+  | otherwise                         = SpliceD (SpliceDecl (L loc splice) Implicit)
+  where
+    splice = mkHsSplice lexpr
+
+mkTyLit :: Located (HsTyLit) -> P (LHsType RdrName)
+mkTyLit l =
+  do allowed <- extension typeLiteralsEnabled
+     if allowed
+       then return (HsTyLit `fmap` l)
+       else parseErrorSDoc (getLoc l)
+              (text "Illegal literal in type (use DataKinds to enable):" <+>
+              ppr l)
+
+mkRoleAnnotDecl :: SrcSpan
+                -> Located RdrName                   -- type being annotated
+                -> [Located (Maybe FastString)]      -- roles
+                -> P (LRoleAnnotDecl RdrName)
+mkRoleAnnotDecl loc tycon roles
+  = do { roles' <- mapM parse_role roles
+       ; return $ L loc $ RoleAnnotDecl tycon roles' }
+  where
+    role_data_type = dataTypeOf (undefined :: Role)
+    all_roles = map fromConstr $ dataTypeConstrs role_data_type
+    possible_roles = [(fsFromRole role, role) | role <- all_roles]
+
+    parse_role (L loc_role Nothing) = return $ L loc_role Nothing
+    parse_role (L loc_role (Just role))
+      = case lookup role possible_roles of
+          Just found_role -> return $ L loc_role $ Just found_role
+          Nothing         ->
+            let nearby = fuzzyLookup (unpackFS role) (mapFst unpackFS possible_roles) in
+            parseErrorSDoc loc_role
+              (text "Illegal role name" <+> quotes (ppr role) $$
+               suggestions nearby)
+
+    suggestions []   = empty
+    suggestions [r]  = text "Perhaps you meant" <+> quotes (ppr r)
+      -- will this last case ever happen??
+    suggestions list = hang (text "Perhaps you meant one of these:")
+                       2 (pprWithCommas (quotes . ppr) list)
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[cvBinds-etc]{Converting to @HsBinds@, etc.}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 Function definitions are restructured here. Each is assumed to be recursive
@@ -258,88 +291,94 @@ cvTopDecls :: OrdList (LHsDecl RdrName) -> [LHsDecl RdrName]
 cvTopDecls decls = go (fromOL decls)
   where
     go :: [LHsDecl RdrName] -> [LHsDecl RdrName]
-    go [] 		    = []
+    go []                   = []
     go (L l (ValD b) : ds)  = L l' (ValD b') : go ds'
-			    where (L l' b', ds') = getMonoBind (L l b) ds
-    go (d : ds)   	    = d : go ds
+                            where (L l' b', ds') = getMonoBind (L l b) ds
+    go (d : ds)             = d : go ds
 
 -- Declaration list may only contain value bindings and signatures.
 cvBindGroup :: OrdList (LHsDecl RdrName) -> HsValBinds RdrName
 cvBindGroup binding
   = case cvBindsAndSigs binding of
-      (mbs, sigs, tydecls, _) -> ASSERT( null tydecls )
-      	    	  	         ValBindsIn mbs sigs
+      (mbs, sigs, fam_ds, tfam_insts, dfam_insts, _) 
+         -> ASSERT( null fam_ds && null tfam_insts && null dfam_insts)
+            ValBindsIn mbs sigs
 
 cvBindsAndSigs :: OrdList (LHsDecl RdrName)
-  -> (Bag (LHsBind RdrName), [LSig RdrName], [LTyClDecl RdrName], [LDocDecl])
+  -> (LHsBinds RdrName, [LSig RdrName], [LFamilyDecl RdrName]
+          , [LTyFamInstDecl RdrName], [LDataFamInstDecl RdrName], [LDocDecl])
 -- Input decls contain just value bindings and signatures
 -- and in case of class or instance declarations also
 -- associated type declarations. They might also contain Haddock comments.
 cvBindsAndSigs  fb = go (fromOL fb)
   where
-    go [] 		   = (emptyBag, [], [], [])
-    go (L l (SigD s) : ds) = (bs, L l s : ss, ts, docs)
-			   where (bs, ss, ts, docs) = go ds
-    go (L l (ValD b) : ds) = (b' `consBag` bs, ss, ts, docs)
-			   where (b', ds')    = getMonoBind (L l b) ds
-				 (bs, ss, ts, docs) = go ds'
-    go (L l (TyClD t): ds) = (bs, ss, L l t : ts, docs)
-			   where (bs, ss, ts, docs) = go ds
-    go (L l (DocD d) : ds) =  (bs, ss, ts, (L l d) : docs)
-			   where (bs, ss, ts, docs) = go ds
-    go (L _ d : _)        = pprPanic "cvBindsAndSigs" (ppr d)
+    go []                  = (emptyBag, [], [], [], [], [])
+    go (L l (SigD s) : ds) = (bs, L l s : ss, ts, tfis, dfis, docs)
+                           where (bs, ss, ts, tfis, dfis, docs) = go ds
+    go (L l (ValD b) : ds) = ((FromSource, b') `consBag` bs, ss, ts, tfis, dfis, docs)
+                           where (b', ds')    = getMonoBind (L l b) ds
+                                 (bs, ss, ts, tfis, dfis, docs) = go ds'
+    go (L l (TyClD (FamDecl t)) : ds) = (bs, ss, L l t : ts, tfis, dfis, docs)
+                           where (bs, ss, ts, tfis, dfis, docs) = go ds
+    go (L l (InstD (TyFamInstD { tfid_inst = tfi })) : ds) = (bs, ss, ts, L l tfi : tfis, dfis, docs)
+                           where (bs, ss, ts, tfis, dfis, docs) = go ds
+    go (L l (InstD (DataFamInstD { dfid_inst = dfi })) : ds) = (bs, ss, ts, tfis, L l dfi : dfis, docs)
+                           where (bs, ss, ts, tfis, dfis, docs) = go ds
+    go (L l (DocD d) : ds) =  (bs, ss, ts, tfis, dfis, (L l d) : docs)
+                           where (bs, ss, ts, tfis, dfis, docs) = go ds
+    go (L _ d : _) = pprPanic "cvBindsAndSigs" (ppr d)
 
 -----------------------------------------------------------------------------
 -- Group function bindings into equation groups
 
 getMonoBind :: LHsBind RdrName -> [LHsDecl RdrName]
   -> (LHsBind RdrName, [LHsDecl RdrName])
--- Suppose 	(b',ds') = getMonoBind b ds
--- 	ds is a list of parsed bindings
---	b is a MonoBinds that has just been read off the front
+-- Suppose      (b',ds') = getMonoBind b ds
+--      ds is a list of parsed bindings
+--      b is a MonoBinds that has just been read off the front
 
 -- Then b' is the result of grouping more equations from ds that
 -- belong with b into a single MonoBinds, and ds' is the depleted
 -- list of parsed bindings.
 --
--- All Haddock comments between equations inside the group are 
+-- All Haddock comments between equations inside the group are
 -- discarded.
 --
 -- No AndMonoBinds or EmptyMonoBinds here; just single equations
 
 getMonoBind (L loc1 (FunBind { fun_id = fun_id1@(L _ f1), fun_infix = is_infix1,
-                               fun_matches = MatchGroup mtchs1 _ })) binds
+                               fun_matches = MG { mg_alts = mtchs1 } })) binds
   | has_args mtchs1
   = go is_infix1 mtchs1 loc1 binds []
   where
-    go is_infix mtchs loc 
+    go is_infix mtchs loc
        (L loc2 (ValD (FunBind { fun_id = L _ f2, fun_infix = is_infix2,
-			        fun_matches = MatchGroup mtchs2 _ })) : binds) _
-	| f1 == f2 = go (is_infix || is_infix2) (mtchs2 ++ mtchs) 
-		        (combineSrcSpans loc loc2) binds []
-    go is_infix mtchs loc (doc_decl@(L loc2 (DocD _)) : binds) doc_decls 
-	= let doc_decls' = doc_decl : doc_decls  
+                                fun_matches = MG { mg_alts = mtchs2 } })) : binds) _
+        | f1 == f2 = go (is_infix || is_infix2) (mtchs2 ++ mtchs)
+                        (combineSrcSpans loc loc2) binds []
+    go is_infix mtchs loc (doc_decl@(L loc2 (DocD _)) : binds) doc_decls
+        = let doc_decls' = doc_decl : doc_decls
           in go is_infix mtchs (combineSrcSpans loc loc2) binds doc_decls'
     go is_infix mtchs loc binds doc_decls
-	= (L loc (makeFunBind fun_id1 is_infix (reverse mtchs)), (reverse doc_decls) ++ binds)
-	-- Reverse the final matches, to get it back in the right order
+        = (L loc (makeFunBind fun_id1 is_infix (reverse mtchs)), (reverse doc_decls) ++ binds)
+        -- Reverse the final matches, to get it back in the right order
         -- Do the same thing with the trailing doc comments
 
 getMonoBind bind binds = (bind, binds)
 
-has_args :: [LMatch RdrName] -> Bool
-has_args [] 	    	     	      = panic "RdrHsSyn:has_args"
+has_args :: [LMatch RdrName (LHsExpr RdrName)] -> Bool
+has_args []                           = panic "RdrHsSyn:has_args"
 has_args ((L _ (Match args _ _)) : _) = not (null args)
-	-- Don't group together FunBinds if they have
-	-- no arguments.  This is necessary now that variable bindings
-	-- with no arguments are now treated as FunBinds rather
-	-- than pattern bindings (tests/rename/should_fail/rnfail002).
+        -- Don't group together FunBinds if they have
+        -- no arguments.  This is necessary now that variable bindings
+        -- with no arguments are now treated as FunBinds rather
+        -- than pattern bindings (tests/rename/should_fail/rnfail002).
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[PrefixToHS-utils]{Utilities for conversion}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 
@@ -361,19 +400,21 @@ splitCon :: LHsType RdrName
 splitCon ty
  = split ty []
  where
-   split (L _ (HsAppTy t u)) ts = split t (u : ts)
-   split (L l (HsTyVar tc))  ts = do data_con <- tyConToDataCon l tc
- 				     return (data_con, mk_rest ts)
-   split (L l _) _ 	        = parseErrorSDoc l (text "parse error in constructor in data/newtype declaration:" <+> ppr ty)
+   split (L _ (HsAppTy t u)) ts    = split t (u : ts)
+   split (L l (HsTyVar tc))  ts    = do data_con <- tyConToDataCon l tc
+                                        return (data_con, mk_rest ts)
+   split (L l (HsTupleTy _ [])) [] = return (L l (getRdrName unitDataCon), PrefixCon [])
+                                         -- See Note [Unit tuples] in HsTypes
+   split (L l _) _                 = parseErrorSDoc l (text "parse error in constructor in data/newtype declaration:" <+> ppr ty)
 
    mk_rest [L _ (HsRecTy flds)] = RecCon flds
    mk_rest ts                   = PrefixCon ts
 
-mkDeprecatedGadtRecordDecl :: SrcSpan 
-		     	   -> Located RdrName
-		     	   -> [ConDeclField RdrName]
-			   -> LHsType RdrName
-		     	   ->  P (LConDecl  RdrName)
+mkDeprecatedGadtRecordDecl :: SrcSpan
+                           -> Located RdrName
+                           -> [ConDeclField RdrName]
+                           -> LHsType RdrName
+                           ->  P (LConDecl  RdrName)
 -- This one uses the deprecated syntax
 --    C { x,y ::Int } :: T a b
 -- We give it a RecCon details right away
@@ -381,51 +422,51 @@ mkDeprecatedGadtRecordDecl loc (L con_loc con) flds res_ty
   = do { data_con <- tyConToDataCon con_loc con
        ; return (L loc (ConDecl { con_old_rec  = True
                                 , con_name     = data_con
-	    	 		, con_explicit = Implicit
-	    	 		, con_qvars    = []
-	    	 		, con_cxt      = noLoc []
-	    	 		, con_details  = RecCon flds
-	    	 		, con_res      = ResTyGADT res_ty
-            	 		, con_doc      = Nothing })) }
+                                , con_explicit = Implicit
+                                , con_qvars    = mkHsQTvs []
+                                , con_cxt      = noLoc []
+                                , con_details  = RecCon flds
+                                , con_res      = ResTyGADT res_ty
+                                , con_doc      = Nothing })) }
 
 mkSimpleConDecl :: Located RdrName -> [LHsTyVarBndr RdrName]
-		-> LHsContext RdrName -> HsConDeclDetails RdrName
-		-> ConDecl RdrName
+                -> LHsContext RdrName -> HsConDeclDetails RdrName
+                -> ConDecl RdrName
 
 mkSimpleConDecl name qvars cxt details
   = ConDecl { con_old_rec  = False
             , con_name     = name
-	    , con_explicit = Explicit
-	    , con_qvars    = qvars
-	    , con_cxt      = cxt
-	    , con_details  = details
-	    , con_res      = ResTyH98
+            , con_explicit = Explicit
+            , con_qvars    = mkHsQTvs qvars
+            , con_cxt      = cxt
+            , con_details  = details
+            , con_res      = ResTyH98
             , con_doc      = Nothing }
 
 mkGadtDecl :: [Located RdrName]
            -> LHsType RdrName     -- Always a HsForAllTy
            -> [ConDecl RdrName]
 -- We allow C,D :: ty
--- and expand it as if it had been 
+-- and expand it as if it had been
 --    C :: ty; D :: ty
 -- (Just like type signatures in general.)
 mkGadtDecl names (L _ (HsForAllTy imp qvars cxt tau))
   = [mk_gadt_con name | name <- names]
   where
-    (details, res_ty)		-- See Note [Sorting out the result type]
+    (details, res_ty)           -- See Note [Sorting out the result type]
       = case tau of
-    	  L _ (HsFunTy (L _ (HsRecTy flds)) res_ty) -> (RecCon flds,  res_ty)
-	  _other                                    -> (PrefixCon [], tau)
+          L _ (HsFunTy (L _ (HsRecTy flds)) res_ty) -> (RecCon flds,  res_ty)
+          _other                                    -> (PrefixCon [], tau)
 
     mk_gadt_con name
        = ConDecl { con_old_rec  = False
                  , con_name     = name
-	    	 , con_explicit = imp
-	    	 , con_qvars    = qvars
-	    	 , con_cxt      = cxt
-	    	 , con_details  = details
-	    	 , con_res      = ResTyGADT res_ty
-            	 , con_doc      = Nothing }
+                 , con_explicit = imp
+                 , con_qvars    = qvars
+                 , con_cxt      = cxt
+                 , con_details  = details
+                 , con_res      = ResTyGADT res_ty
+                 , con_doc      = Nothing }
 mkGadtDecl _ other_ty = pprPanic "mkGadtDecl" (ppr other_ty)
 
 tyConToDataCon :: SrcSpan -> RdrName -> P (Located RdrName)
@@ -437,8 +478,8 @@ tyConToDataCon loc tc
   where
     msg = text "Not a data constructor:" <+> quotes (ppr tc)
     extra | tc == forall_tv_RDR
-	  = text "Perhaps you intended to use -XExistentialQuantification"
-	  | otherwise = empty
+          = text "Perhaps you intended to use ExistentialQuantification"
+          | otherwise = empty
 \end{code}
 
 Note [Sorting out the result type]
@@ -452,82 +493,35 @@ Initially this type will parse as
 
 so it's hard to split up the arguments until we've done the precedence
 resolution (in the renamer) On the other hand, for a record
-	{ x,y :: Int } -> a :*: b
+        { x,y :: Int } -> a :*: b
 there is no doubt.  AND we need to sort records out so that
 we can bring x,y into scope.  So:
    * For PrefixCon we keep all the args in the ResTyGADT
    * For RecCon we do not
 
 \begin{code}
-----------------------------------------------------------------------------
--- Various Syntactic Checks
-
-checkInstType :: LHsType RdrName -> P (LHsType RdrName)
-checkInstType (L l t)
-  = case t of
-	HsForAllTy exp tvs ctxt ty -> do
-		dict_ty <- checkDictTy ty
-	      	return (L l (HsForAllTy exp tvs ctxt dict_ty))
-
-        HsParTy ty -> checkInstType ty
-
-	ty ->   do dict_ty <- checkDictTy (L l ty)
-	      	   return (L l (HsForAllTy Implicit [] (noLoc []) dict_ty))
-
-checkDictTy :: LHsType RdrName -> P (LHsType RdrName)
-checkDictTy (L spn ty) = check ty []
-  where
-  check (HsTyVar tc)            args | isRdrTc tc = done tc args
-  check (HsOpTy t1 (L _ tc) t2) args | isRdrTc tc = done tc (t1:t2:args)
-  check (HsAppTy l r) args = check (unLoc l) (r:args)
-  check (HsParTy t)   args = check (unLoc t) args
-  check _ _ = parseErrorSDoc spn (text "Malformed instance header:" <+> ppr ty)
-
-  done tc args = return (L spn (HsPredTy (HsClassP tc args)))
-
-checkTParams :: Bool	  -- Type/data family
-	     -> [LHsType RdrName]
-	     -> P ([LHsTyVarBndr RdrName], Maybe [LHsType RdrName])
--- checkTParams checks the type parameters of a data/newtype declaration
--- There are two cases:
---
---  a) Vanilla data/newtype decl. In that case 
---        - the type parameters should all be type variables
---        - they may have a kind annotation
---
---  b) Family data/newtype decl.  In that case
---        - The type parameters may be arbitrary types
---        - We find the type-varaible binders by find the 
---          free type vars of those types
---        - We make them all kind-sig-free binders (UserTyVar)
---          If there are kind sigs in the type parameters, they
---          will fix the binder's kind when we kind-check the 
---          type parameters
-checkTParams is_family tparams
-  | not is_family        -- Vanilla case (a)
-  = do { tyvars <- checkTyVars tparams
-       ; return (tyvars, Nothing) }
-  | otherwise		 -- Family case (b)
-  = do { let tyvars = userHsTyVarBndrs (extractHsTysRdrTyVars tparams)
-       ; return (tyvars, Just tparams) }
-
-checkTyVars :: [LHsType RdrName] -> P [LHsTyVarBndr RdrName]
+checkTyVars :: SDoc -> SDoc -> Located RdrName -> [LHsType RdrName] -> P (LHsTyVarBndrs RdrName)
 -- Check whether the given list of type parameters are all type variables
--- (possibly with a kind signature).  If the second argument is `False',
--- only type variables are allowed and we raise an error on encountering a
--- non-variable; otherwise, we allow non-variable arguments and return the
--- entire list of parameters.
-checkTyVars tparms = mapM chk tparms
+-- (possibly with a kind signature).
+checkTyVars pp_what equals_or_where tc tparms = do { tvs <- mapM chk tparms
+                                 ; return (mkHsQTvs tvs) }
   where
-	-- Check that the name space is correct!
+        -- Check that the name space is correct!
     chk (L l (HsKindSig (L _ (HsTyVar tv)) k))
-	| isRdrTyVar tv    = return (L l (KindedTyVar tv k))
+        | isRdrTyVar tv    = return (L l (KindedTyVar tv k))
     chk (L l (HsTyVar tv))
-        | isRdrTyVar tv    = return (L l (UserTyVar tv placeHolderKind))
-    chk t@(L l _)            =
-	  parseErrorSDoc l (text "Type found:" <+> ppr t
-                     $$ text "where type variable expected, in:" <+>
-                        sep (map (pprParendHsType . unLoc) tparms))
+        | isRdrTyVar tv    = return (L l (UserTyVar tv))
+    chk t@(L l _)
+        = parseErrorSDoc l $
+          vcat [ ptext (sLit "Unexpected type") <+> quotes (ppr t)
+               , ptext (sLit "In the") <+> pp_what <+> ptext (sLit "declaration for") <+> quotes (ppr tc)
+               , vcat[ (ptext (sLit "A") <+> pp_what <+> ptext (sLit "declaration should have form"))
+                     , nest 2 (pp_what <+> ppr tc <+> ptext (sLit "a b c")
+                               <+> equals_or_where) ] ]
+
+whereDots, equalsDots :: SDoc
+whereDots  = ptext (sLit "where ...")
+equalsDots = ptext (sLit "= ...")
 
 checkDatatypeContext :: Maybe (LHsContext RdrName) -> P ()
 checkDatatypeContext Nothing = return ()
@@ -535,15 +529,24 @@ checkDatatypeContext (Just (L loc c))
     = do allowed <- extension datatypeContextsEnabled
          unless allowed $
              parseErrorSDoc loc
-                 (text "Illegal datatype context (use -XDatatypeContexts):" <+>
+                 (text "Illegal datatype context (use DatatypeContexts):" <+>
                   pprHsContext c)
 
+checkRecordSyntax :: Outputable a => Located a -> P (Located a)
+checkRecordSyntax lr@(L loc r)
+    = do allowed <- extension traditionalRecordSyntaxEnabled
+         if allowed
+             then return lr
+             else parseErrorSDoc loc
+                      (text "Illegal record syntax (use TraditionalRecordSyntax):" <+>
+                       ppr r)
+
 checkTyClHdr :: LHsType RdrName
-             -> P (Located RdrName,	     -- the head symbol (type or class name)
-	           [LHsType RdrName])        -- parameters of head symbol
+             -> P (Located RdrName,          -- the head symbol (type or class name)
+                   [LHsType RdrName])        -- parameters of head symbol
 -- Well-formedness check and decomposition of type and class heads.
 -- Decomposes   T ty1 .. tyn   into    (T, [ty1, ..., tyn])
--- 		Int :*: Bool   into    (:*:, [Int, Bool])
+--              Int :*: Bool   into    (:*:, [Int, Bool])
 -- returning the pieces
 checkTyClHdr ty
   = goL ty []
@@ -551,65 +554,27 @@ checkTyClHdr ty
     goL (L l ty) acc = go l ty acc
 
     go l (HsTyVar tc) acc 
-	| isRdrTc tc 	     = return (L l tc, acc)
-				     
-    go _ (HsOpTy t1 ltc@(L _ tc) t2) acc
-	| isRdrTc tc	     = return (ltc, t1:t2:acc)
+        | isRdrTc tc          = return (L l tc, acc)
+    go _ (HsOpTy t1 (_, ltc@(L _ tc)) t2) acc
+        | isRdrTc tc         = return (ltc, t1:t2:acc)
     go _ (HsParTy ty)    acc = goL ty acc
     go _ (HsAppTy t1 t2) acc = goL t1 (t2:acc)
+    go l (HsTupleTy _ []) [] = return (L l (getRdrName unitTyCon), [])
+                                   -- See Note [Unit tuples] in HsTypes
     go l _               _   = parseErrorSDoc l (text "Malformed head of type or class declaration:" <+> ppr ty)
 
--- Check that associated type declarations of a class are all kind signatures.
---
-checkKindSigs :: [LTyClDecl RdrName] -> P ()
-checkKindSigs = mapM_ check
-  where
-    check (L l tydecl) 
-      | isFamilyDecl tydecl
-        || isSynDecl tydecl  = return ()
-      | otherwise	     = 
-	parseErrorSDoc l (text "Type declaration in a class must be a kind signature or synonym default:" $$ ppr tydecl)
-
 checkContext :: LHsType RdrName -> P (LHsContext RdrName)
-checkContext (L l t)
-  = check t
+checkContext (L l orig_t)
+  = check orig_t
  where
-  check (HsTupleTy _ ts) 	-- (Eq a, Ord b) shows up as a tuple type
-    = do ctx <- mapM checkPred ts
-	 return (L l ctx)
+  check (HsTupleTy _ ts)        -- (Eq a, Ord b) shows up as a tuple type
+    = return (L l ts)           -- Ditto ()
 
-  check (HsParTy ty)	-- to be sure HsParTy doesn't get into the way
+  check (HsParTy ty)    -- to be sure HsParTy doesn't get into the way
     = check (unLoc ty)
 
-  check (HsTyVar t)	-- Empty context shows up as a unit type ()
-    | t == getRdrName unitTyCon = return (L l [])
-
-  check t 
-    = do p <- checkPred (L l t)
-         return (L l [p])
-
-
-checkPred :: LHsType RdrName -> P (LHsPred RdrName)
--- Watch out.. in ...deriving( Show )... we use checkPred on 
--- the list of partially applied predicates in the deriving,
--- so there can be zero args.
-checkPred (L spn (HsPredTy (HsIParam n ty)))
-  = return (L spn (HsIParam n ty))
-checkPred (L spn ty)
-  = check spn ty []
-  where
-    checkl (L l ty) args = check l ty args
-
-    check _loc (HsPredTy pred@(HsEqualP _ _)) 
-                                       args | null args
-					    = return $ L spn pred
-    check _loc (HsTyVar t)             args | not (isRdrTyVar t) 
-		 		  	    = return (L spn (HsClassP t args))
-    check _loc (HsAppTy l r)           args = checkl l (r:args)
-    check _loc (HsOpTy l (L loc tc) r) args = check loc (HsTyVar tc) (l:r:args)
-    check _loc (HsParTy t)  	       args = checkl t args
-    check loc _                        _    = parseErrorSDoc loc
-                                (text "malformed class assertion:" <+> ppr ty)
+  check _
+    = return (L l [L l orig_t])
 
 -- -------------------------------------------------------------------------
 -- Checking Patterns.
@@ -617,35 +582,39 @@ checkPred (L spn ty)
 -- We parse patterns as expressions and check for valid patterns below,
 -- converting the expression into a pattern at the same time.
 
-checkPattern :: LHsExpr RdrName -> P (LPat RdrName)
-checkPattern e = checkLPat e
+checkPattern :: SDoc -> LHsExpr RdrName -> P (LPat RdrName)
+checkPattern msg e = checkLPat msg e
 
-checkPatterns :: [LHsExpr RdrName] -> P [LPat RdrName]
-checkPatterns es = mapM checkPattern es
+checkPatterns :: SDoc -> [LHsExpr RdrName] -> P [LPat RdrName]
+checkPatterns msg es = mapM (checkPattern msg) es
 
-checkLPat :: LHsExpr RdrName -> P (LPat RdrName)
-checkLPat e@(L l _) = checkPat l e []
+checkLPat :: SDoc -> LHsExpr RdrName -> P (LPat RdrName)
+checkLPat msg e@(L l _) = checkPat msg l e []
 
-checkPat :: SrcSpan -> LHsExpr RdrName -> [LPat RdrName] -> P (LPat RdrName)
-checkPat loc (L l (HsVar c)) args
+checkPat :: SDoc -> SrcSpan -> LHsExpr RdrName -> [LPat RdrName]
+         -> P (LPat RdrName)
+checkPat _ loc (L l (HsVar c)) args
   | isRdrDataCon c = return (L loc (ConPatIn (L l c) (PrefixCon args)))
-checkPat loc e args 	-- OK to let this happen even if bang-patterns
-			-- are not enabled, because there is no valid
-			-- non-bang-pattern parse of (C ! e)
+checkPat msg loc e args     -- OK to let this happen even if bang-patterns
+                        -- are not enabled, because there is no valid
+                        -- non-bang-pattern parse of (C ! e)
   | Just (e', args') <- splitBang e
-  = do	{ args'' <- checkPatterns args'
-	; checkPat loc e' (args'' ++ args) }
-checkPat loc (L _ (HsApp f x)) args
-  = do { x <- checkLPat x; checkPat loc f (x:args) }
-checkPat loc (L _ e) []
-  = do { pState <- getPState
-       ; p <- checkAPat (dflags pState) loc e
-       ; return (L loc p) }
-checkPat loc e _
-  = patFail loc (unLoc e)
+  = do  { args'' <- checkPatterns msg args'
+        ; checkPat msg loc e' (args'' ++ args) }
+checkPat msg loc (L _ (HsApp f e)) args
+  = do p <- checkLPat msg e
+       checkPat msg loc f (p : args)
+checkPat msg loc (L _ e) []
+  = do p <- checkAPat msg loc e
+       return (L loc p)
+checkPat msg loc e _
+  = patFail msg loc (unLoc e)
 
-checkAPat :: DynFlags -> SrcSpan -> HsExpr RdrName -> P (Pat RdrName)
-checkAPat dynflags loc e0 = case e0 of
+checkAPat :: SDoc -> SrcSpan -> HsExpr RdrName -> P (Pat RdrName)
+checkAPat msg loc e0 = do
+ pState <- getPState
+ let dynflags = dflags pState
+ case e0 of
    EWildPat -> return (WildPat placeHolderType)
    HsVar x  -> return (VarPat x)
    HsLit l  -> return (LitPat l)
@@ -654,59 +623,59 @@ checkAPat dynflags loc e0 = case e0 of
    -- Negation is recorded separately, so that the literal is zero or +ve
    -- NB. Negative *primitive* literals are already handled by the lexer
    HsOverLit pos_lit          -> return (mkNPat pos_lit Nothing)
-   NegApp (L _ (HsOverLit pos_lit)) _ 
-			-> return (mkNPat pos_lit (Just noSyntaxExpr))
-   
-   SectionR (L _ (HsVar bang)) e 	-- (! x)
- 	| bang == bang_RDR 
-	-> do { bang_on <- extension bangPatEnabled
-	      ; if bang_on then checkLPat e >>= (return . BangPat)
-		else parseErrorSDoc loc (text "Illegal bang-pattern (use -XBangPatterns):" $$ ppr e0) }
+   NegApp (L _ (HsOverLit pos_lit)) _
+                        -> return (mkNPat pos_lit (Just noSyntaxExpr))
 
-   ELazyPat e	      -> checkLPat e >>= (return . LazyPat)
-   EAsPat n e	      -> checkLPat e >>= (return . AsPat n)
+   SectionR (L _ (HsVar bang)) e        -- (! x)
+        | bang == bang_RDR
+        -> do { bang_on <- extension bangPatEnabled
+              ; if bang_on then checkLPat msg e >>= (return . BangPat)
+                else parseErrorSDoc loc (text "Illegal bang-pattern (use BangPatterns):" $$ ppr e0) }
+
+   ELazyPat e         -> checkLPat msg e >>= (return . LazyPat)
+   EAsPat n e         -> checkLPat msg e >>= (return . AsPat n)
    -- view pattern is well-formed if the pattern is
-   EViewPat expr patE -> checkLPat patE >>= (return . (\p -> ViewPat expr p placeHolderType))
-   ExprWithTySig e t  -> do e <- checkLPat e
+   EViewPat expr patE -> checkLPat msg patE >>= (return . (\p -> ViewPat expr p placeHolderType))
+   ExprWithTySig e t  -> do e <- checkLPat msg e
                             -- Pattern signatures are parsed as sigtypes,
                             -- but they aren't explicit forall points.  Hence
                             -- we have to remove the implicit forall here.
-                            let t' = case t of 
+                            let t' = case t of
                                        L _ (HsForAllTy Implicit _ (L _ []) ty) -> ty
                                        other -> other
-                            return (SigPatIn e t')
-   
+                            return (SigPatIn e (mkHsWithBndrs t'))
+
    -- n+k patterns
-   OpApp (L nloc (HsVar n)) (L _ (HsVar plus)) _ 
-	 (L _ (HsOverLit lit@(OverLit {ol_val = HsIntegral {}})))
-   		      | xopt Opt_NPlusKPatterns dynflags && (plus == plus_RDR)
-   		      -> return (mkNPlusKPat (L nloc n) lit)
-   
-   OpApp l op _fix r  -> do l <- checkLPat l
-                            r <- checkLPat r
+   OpApp (L nloc (HsVar n)) (L _ (HsVar plus)) _
+         (L _ (HsOverLit lit@(OverLit {ol_val = HsIntegral {}})))
+                      | xopt Opt_NPlusKPatterns dynflags && (plus == plus_RDR)
+                      -> return (mkNPlusKPat (L nloc n) lit)
+
+   OpApp l op _fix r  -> do l <- checkLPat msg l
+                            r <- checkLPat msg r
                             case op of
                                L cl (HsVar c) | isDataOcc (rdrNameOcc c)
                                       -> return (ConPatIn (L cl c) (InfixCon l r))
-                               _ -> patFail loc e0
-   
-   HsPar e	      -> checkLPat e >>= (return . ParPat)
-   ExplicitList _ es  -> do ps <- mapM checkLPat es
-                            return (ListPat ps placeHolderType)
-   ExplicitPArr _ es  -> do ps <- mapM checkLPat es
+                               _ -> patFail msg loc e0
+
+   HsPar e            -> checkLPat msg e >>= (return . ParPat)
+   ExplicitList _ _ es  -> do ps <- mapM (checkLPat msg) es
+                              return (ListPat ps placeHolderType Nothing)
+   ExplicitPArr _ es  -> do ps <- mapM (checkLPat msg) es
                             return (PArrPat ps placeHolderType)
-   
-   ExplicitTuple es b 
-     | all tupArgPresent es  -> do ps <- mapM checkLPat [e | Present e <- es]
+
+   ExplicitTuple es b
+     | all tupArgPresent es  -> do ps <- mapM (checkLPat msg) [e | Present e <- es]
                                    return (TuplePat ps b placeHolderType)
      | otherwise -> parseErrorSDoc loc (text "Illegal tuple section in pattern:" $$ ppr e0)
-   
+
    RecordCon c _ (HsRecFields fs dd)
-                      -> do fs <- mapM checkPatField fs
-                            return (ConPatIn c (RecCon (HsRecFields fs dd)))
-   HsQuasiQuoteE q    -> return (QuasiQuotePat q)
--- Generics 
-   HsType ty          -> return (TypePat ty) 
-   _                  -> patFail loc e0
+                        -> do fs <- mapM (checkPatField msg) fs
+                              return (ConPatIn c (RecCon (HsRecFields fs dd)))
+   HsSpliceE is_typed s | not is_typed 
+                        -> return (SplicePat s)
+   HsQuasiQuoteE q      -> return (QuasiQuotePat q)
+   _                    -> patFail msg loc e0
 
 placeHolderPunRhs :: LHsExpr RdrName
 -- The RHS of a punned record field will be filled in by the renamer
@@ -714,87 +683,96 @@ placeHolderPunRhs :: LHsExpr RdrName
 placeHolderPunRhs = noLoc (HsVar pun_RDR)
 
 plus_RDR, bang_RDR, pun_RDR :: RdrName
-plus_RDR = mkUnqual varName (fsLit "+")	-- Hack
-bang_RDR = mkUnqual varName (fsLit "!")	-- Hack
+plus_RDR = mkUnqual varName (fsLit "+") -- Hack
+bang_RDR = mkUnqual varName (fsLit "!") -- Hack
 pun_RDR  = mkUnqual varName (fsLit "pun-right-hand-side")
 
-checkPatField :: HsRecField RdrName (LHsExpr RdrName) -> P (HsRecField RdrName (LPat RdrName))
-checkPatField fld = do	{ p <- checkLPat (hsRecFieldArg fld)
-			; return (fld { hsRecFieldArg = p }) }
+checkPatField :: SDoc -> HsRecField RdrName (LHsExpr RdrName) -> P (HsRecField RdrName (LPat RdrName))
+checkPatField msg fld = do p <- checkLPat msg (hsRecFieldArg fld)
+                           return (fld { hsRecFieldArg = p })
 
-patFail :: SrcSpan -> HsExpr RdrName -> P a
-patFail loc e = parseErrorSDoc loc (text "Parse error in pattern:" <+> ppr e)
+patFail :: SDoc -> SrcSpan -> HsExpr RdrName -> P a
+patFail msg loc e = parseErrorSDoc loc err
+    where err = text "Parse error in pattern:" <+> ppr e
+             $$ msg
 
 
 ---------------------------------------------------------------------------
 -- Check Equation Syntax
 
-checkValDef :: LHsExpr RdrName
-	    -> Maybe (LHsType RdrName)
-	    -> Located (GRHSs RdrName)
-	    -> P (HsBind RdrName)
+checkValDef :: SDoc
+            -> LHsExpr RdrName
+            -> Maybe (LHsType RdrName)
+            -> Located (GRHSs RdrName (LHsExpr RdrName))
+            -> P (HsBind RdrName)
 
-checkValDef lhs (Just sig) grhss
-   	-- x :: ty = rhs  parses as a *pattern* binding
-  = checkPatBind (L (combineLocs lhs sig) (ExprWithTySig lhs sig)) grhss
+checkValDef msg lhs (Just sig) grhss
+        -- x :: ty = rhs  parses as a *pattern* binding
+  = checkPatBind msg (L (combineLocs lhs sig) (ExprWithTySig lhs sig)) grhss
 
-checkValDef lhs opt_sig grhss
-  = do	{ mb_fun <- isFunLhs lhs
-	; case mb_fun of
-	    Just (fun, is_infix, pats) -> checkFunBind (getLoc lhs)
-						fun is_infix pats opt_sig grhss
-	    Nothing -> checkPatBind lhs grhss }
+checkValDef msg lhs opt_sig grhss
+  = do  { mb_fun <- isFunLhs lhs
+        ; case mb_fun of
+            Just (fun, is_infix, pats) -> checkFunBind msg (getLoc lhs)
+                                                fun is_infix pats opt_sig grhss
+            Nothing -> checkPatBind msg lhs grhss }
 
-checkFunBind :: SrcSpan
+checkFunBind :: SDoc
+             -> SrcSpan
              -> Located RdrName
              -> Bool
              -> [LHsExpr RdrName]
              -> Maybe (LHsType RdrName)
-             -> Located (GRHSs RdrName)
+             -> Located (GRHSs RdrName (LHsExpr RdrName))
              -> P (HsBind RdrName)
-checkFunBind lhs_loc fun is_infix pats opt_sig (L rhs_span grhss)
-  = do	ps <- checkPatterns pats
-	let match_span = combineSrcSpans lhs_loc rhs_span
-	return (makeFunBind fun is_infix [L match_span (Match ps opt_sig grhss)])
-	-- The span of the match covers the entire equation.  
-	-- That isn't quite right, but it'll do for now.
+checkFunBind msg lhs_loc fun is_infix pats opt_sig (L rhs_span grhss)
+  = do  ps <- checkPatterns msg pats
+        let match_span = combineSrcSpans lhs_loc rhs_span
+        return (makeFunBind fun is_infix [L match_span (Match ps opt_sig grhss)])
+        -- The span of the match covers the entire equation.
+        -- That isn't quite right, but it'll do for now.
 
-makeFunBind :: Located id -> Bool -> [LMatch id] -> HsBind id
+makeFunBind :: Located id -> Bool -> [LMatch id (LHsExpr id)] -> HsBind id
 -- Like HsUtils.mkFunBind, but we need to be able to set the fixity too
-makeFunBind fn is_infix ms 
+makeFunBind fn is_infix ms
   = FunBind { fun_id = fn, fun_infix = is_infix, fun_matches = mkMatchGroup ms,
-	      fun_co_fn = idHsWrapper, bind_fvs = placeHolderNames, fun_tick = Nothing }
+              fun_co_fn = idHsWrapper, bind_fvs = placeHolderNames, fun_tick = Nothing }
 
-checkPatBind :: LHsExpr RdrName
-             -> Located (GRHSs RdrName)
+checkPatBind :: SDoc
+             -> LHsExpr RdrName
+             -> Located (GRHSs RdrName (LHsExpr RdrName))
              -> P (HsBind RdrName)
-checkPatBind lhs (L _ grhss)
-  = do	{ lhs <- checkPattern lhs
-	; return (PatBind lhs grhss placeHolderType placeHolderNames) }
+checkPatBind msg lhs (L _ grhss)
+  = do  { lhs <- checkPattern msg lhs
+        ; return (PatBind lhs grhss placeHolderType placeHolderNames
+                    (Nothing,[])) }
 
 checkValSig
-	:: LHsExpr RdrName
-	-> LHsType RdrName
-	-> P (Sig RdrName)
-checkValSig (L l (HsVar v)) ty 
+        :: LHsExpr RdrName
+        -> LHsType RdrName
+        -> P (Sig RdrName)
+checkValSig (L l (HsVar v)) ty
   | isUnqual v && not (isDataOcc (rdrNameOcc v))
-  = return (TypeSig (L l v) ty)
+  = return (TypeSig [L l v] ty)
 checkValSig lhs@(L l _) ty
   = parseErrorSDoc l ((text "Invalid type signature:" <+>
                        ppr lhs <+> text "::" <+> ppr ty)
                    $$ text hint)
   where
-    hint = if looks_like_foreign lhs
-           then "Perhaps you meant to use -XForeignFunctionInterface?"
-           else "Should be of form <variable> :: <type>"
+    hint = if foreign_RDR `looks_like` lhs
+           then "Perhaps you meant to use ForeignFunctionInterface?"
+           else if default_RDR `looks_like` lhs
+                then "Perhaps you meant to use DefaultSignatures?"
+                else "Should be of form <variable> :: <type>"
     -- A common error is to forget the ForeignFunctionInterface flag
     -- so check for that, and suggest.  cf Trac #3805
     -- Sadly 'foreign import' still barfs 'parse error' because 'import' is a keyword
-    looks_like_foreign (L _ (HsVar v))     = v == foreign_RDR
-    looks_like_foreign (L _ (HsApp lhs _)) = looks_like_foreign lhs
-    looks_like_foreign _                   = False
+    looks_like s (L _ (HsVar v))     = v == s
+    looks_like s (L _ (HsApp lhs _)) = looks_like s lhs
+    looks_like _ _                   = False
 
     foreign_RDR = mkUnqual varName (fsLit "foreign")
+    default_RDR = mkUnqual varName (fsLit "default")
 
 checkDoAndIfThenElse :: LHsExpr RdrName
                      -> Bool
@@ -809,7 +787,7 @@ checkDoAndIfThenElse guardExpr semiThen thenExpr semiElse elseExpr
              parseErrorSDoc (combineLocs guardExpr elseExpr)
                             (text "Unexpected semi-colons in conditional:"
                           $$ nest 4 expr
-                          $$ text "Perhaps you meant to use -XDoAndIfThenElse?")
+                          $$ text "Perhaps you meant to use DoAndIfThenElse?")
  | otherwise            = return ()
     where pprOptSemi True  = semi
           pprOptSemi False = empty
@@ -820,8 +798,8 @@ checkDoAndIfThenElse guardExpr semiThen thenExpr semiElse elseExpr
 
 
 \begin{code}
-	-- The parser left-associates, so there should 
-	-- not be any OpApps inside the e's
+        -- The parser left-associates, so there should
+        -- not be any OpApps inside the e's
 splitBang :: LHsExpr RdrName -> Maybe (LHsExpr RdrName, [LHsExpr RdrName])
 -- Splits (f ! g a b) into (f, [(! g), a, b])
 splitBang (L loc (OpApp l_arg bang@(L _ (HsVar op)) _ r_arg))
@@ -829,59 +807,59 @@ splitBang (L loc (OpApp l_arg bang@(L _ (HsVar op)) _ r_arg))
   where
     (arg1,argns) = split_bang r_arg []
     split_bang (L _ (HsApp f e)) es = split_bang f (e:es)
-    split_bang e	   	 es = (e,es)
+    split_bang e                 es = (e,es)
 splitBang _ = Nothing
 
-isFunLhs :: LHsExpr RdrName 
-	 -> P (Maybe (Located RdrName, Bool, [LHsExpr RdrName]))
+isFunLhs :: LHsExpr RdrName
+         -> P (Maybe (Located RdrName, Bool, [LHsExpr RdrName]))
 -- A variable binding is parsed as a FunBind.
 -- Just (fun, is_infix, arg_pats) if e is a function LHS
 --
--- The whole LHS is parsed as a single expression.  
+-- The whole LHS is parsed as a single expression.
 -- Any infix operators on the LHS will parse left-associatively
--- E.g. 	f !x y !z
--- 	will parse (rather strangely) as 
---		(f ! x y) ! z
--- 	It's up to isFunLhs to sort out the mess
+-- E.g.         f !x y !z
+--      will parse (rather strangely) as
+--              (f ! x y) ! z
+--      It's up to isFunLhs to sort out the mess
 --
--- a .!. !b 
+-- a .!. !b
 
 isFunLhs e = go e []
  where
-   go (L loc (HsVar f)) es 
-	| not (isRdrDataCon f)	 = return (Just (L loc f, False, es))
-   go (L _ (HsApp f e)) es 	 = go f (e:es)
+   go (L loc (HsVar f)) es
+        | not (isRdrDataCon f)   = return (Just (L loc f, False, es))
+   go (L _ (HsApp f e)) es       = go f (e:es)
    go (L _ (HsPar e))   es@(_:_) = go e es
 
-	-- For infix function defns, there should be only one infix *function*
-	-- (though there may be infix *datacons* involved too).  So we don't
-	-- need fixity info to figure out which function is being defined.
-	--	a `K1` b `op` c `K2` d
-	-- must parse as
-	--	(a `K1` b) `op` (c `K2` d)
-	-- The renamer checks later that the precedences would yield such a parse.
-	-- 
-	-- There is a complication to deal with bang patterns.
-	--
-	-- ToDo: what about this?
-	--		x + 1 `op` y = ...
+        -- For infix function defns, there should be only one infix *function*
+        -- (though there may be infix *datacons* involved too).  So we don't
+        -- need fixity info to figure out which function is being defined.
+        --      a `K1` b `op` c `K2` d
+        -- must parse as
+        --      (a `K1` b) `op` (c `K2` d)
+        -- The renamer checks later that the precedences would yield such a parse.
+        --
+        -- There is a complication to deal with bang patterns.
+        --
+        -- ToDo: what about this?
+        --              x + 1 `op` y = ...
 
    go e@(L loc (OpApp l (L loc' (HsVar op)) fix r)) es
-	| Just (e',es') <- splitBang e
-	= do { bang_on <- extension bangPatEnabled
-	     ; if bang_on then go e' (es' ++ es)
-	       else return (Just (L loc' op, True, (l:r:es))) }
-		-- No bangs; behave just like the next case
-	| not (isRdrDataCon op) 	-- We have found the function!
-	= return (Just (L loc' op, True, (l:r:es)))
-	| otherwise			-- Infix data con; keep going
-	= do { mb_l <- go l es
-	     ; case mb_l of
-		 Just (op', True, j : k : es')
-		    -> return (Just (op', True, j : op_app : es'))
-		    where
-		      op_app = L loc (OpApp k (L loc' (HsVar op)) fix r)
-		 _ -> return Nothing }
+        | Just (e',es') <- splitBang e
+        = do { bang_on <- extension bangPatEnabled
+             ; if bang_on then go e' (es' ++ es)
+               else return (Just (L loc' op, True, (l:r:es))) }
+                -- No bangs; behave just like the next case
+        | not (isRdrDataCon op)         -- We have found the function!
+        = return (Just (L loc' op, True, (l:r:es)))
+        | otherwise                     -- Infix data con; keep going
+        = do { mb_l <- go l es
+             ; case mb_l of
+                 Just (op', True, j : k : es')
+                    -> return (Just (op', True, j : op_app : es'))
+                    where
+                      op_app = L loc (OpApp k (L loc' (HsVar op)) fix r)
+                 _ -> return Nothing }
    go _ _ = return Nothing
 
 
@@ -898,6 +876,94 @@ checkMonadComp = do
                 then MonadComp
                 else ListComp
 
+-- -------------------------------------------------------------------------
+-- Checking arrow syntax.
+
+-- We parse arrow syntax as expressions and check for valid syntax below,
+-- converting the expression into a pattern at the same time.
+
+checkCommand :: LHsExpr RdrName -> P (LHsCmd RdrName)
+checkCommand lc = locMap checkCmd lc
+
+locMap :: (SrcSpan -> a -> P b) -> Located a -> P (Located b)
+locMap f (L l a) = f l a >>= (\b -> return $ L l b)
+
+checkCmd :: SrcSpan -> HsExpr RdrName -> P (HsCmd RdrName)
+checkCmd _ (HsArrApp e1 e2 ptt haat b) = 
+    return $ HsCmdArrApp e1 e2 ptt haat b
+checkCmd _ (HsArrForm e mf args) = 
+    return $ HsCmdArrForm e mf args
+checkCmd _ (HsApp e1 e2) = 
+    checkCommand e1 >>= (\c -> return $ HsCmdApp c e2)
+checkCmd _ (HsLam mg) = 
+    checkCmdMatchGroup mg >>= (\mg' -> return $ HsCmdLam mg')
+checkCmd _ (HsPar e) = 
+    checkCommand e >>= (\c -> return $ HsCmdPar c)
+checkCmd _ (HsCase e mg) = 
+    checkCmdMatchGroup mg >>= (\mg' -> return $ HsCmdCase e mg')
+checkCmd _ (HsIf cf ep et ee) = do
+    pt <- checkCommand et
+    pe <- checkCommand ee
+    return $ HsCmdIf cf ep pt pe
+checkCmd _ (HsLet lb e) = 
+    checkCommand e >>= (\c -> return $ HsCmdLet lb c)
+checkCmd _ (HsDo DoExpr stmts ty) = 
+    mapM checkCmdLStmt stmts >>= (\ss -> return $ HsCmdDo ss ty)
+
+checkCmd _ (OpApp eLeft op fixity eRight) = do
+    -- OpApp becomes a HsCmdArrForm with a (Just fixity) in it
+    c1 <- checkCommand eLeft
+    c2 <- checkCommand eRight
+    let arg1 = L (getLoc c1) $ HsCmdTop c1 placeHolderType placeHolderType []
+        arg2 = L (getLoc c2) $ HsCmdTop c2 placeHolderType placeHolderType []
+    return $ HsCmdArrForm op (Just fixity) [arg1, arg2]
+
+checkCmd l e = cmdFail l e
+
+checkCmdLStmt :: ExprLStmt RdrName -> P (CmdLStmt RdrName)
+checkCmdLStmt = locMap checkCmdStmt
+
+checkCmdStmt :: SrcSpan -> ExprStmt RdrName -> P (CmdStmt RdrName)
+checkCmdStmt _ (LastStmt e r) = 
+    checkCommand e >>= (\c -> return $ LastStmt c r)
+checkCmdStmt _ (BindStmt pat e b f) = 
+    checkCommand e >>= (\c -> return $ BindStmt pat c b f)
+checkCmdStmt _ (BodyStmt e t g ty) = 
+    checkCommand e >>= (\c -> return $ BodyStmt c t g ty)
+checkCmdStmt _ (LetStmt bnds) = return $ LetStmt bnds
+checkCmdStmt _ stmt@(RecStmt { recS_stmts = stmts }) = do
+    ss <- mapM checkCmdLStmt stmts
+    return $ stmt { recS_stmts = ss }
+checkCmdStmt l stmt = cmdStmtFail l stmt
+
+checkCmdMatchGroup :: MatchGroup RdrName (LHsExpr RdrName) -> P (MatchGroup RdrName (LHsCmd RdrName))
+checkCmdMatchGroup mg@(MG { mg_alts = ms }) = do
+    ms' <- mapM (locMap $ const convert) ms
+    return $ mg { mg_alts = ms' }
+    where convert (Match pat mty grhss) = do
+            grhss' <- checkCmdGRHSs grhss
+            return $ Match pat mty grhss'
+
+checkCmdGRHSs :: GRHSs RdrName (LHsExpr RdrName) -> P (GRHSs RdrName (LHsCmd RdrName))
+checkCmdGRHSs (GRHSs grhss binds) = do
+    grhss' <- mapM checkCmdGRHS grhss
+    return $ GRHSs grhss' binds
+
+checkCmdGRHS :: LGRHS RdrName (LHsExpr RdrName) -> P (LGRHS RdrName (LHsCmd RdrName))
+checkCmdGRHS = locMap $ const convert
+  where 
+    convert (GRHS stmts e) = do
+        c <- checkCommand e
+--        cmdStmts <- mapM checkCmdLStmt stmts
+        return $ GRHS {- cmdStmts -} stmts c
+
+
+cmdFail :: SrcSpan -> HsExpr RdrName -> P a
+cmdFail loc e = parseErrorSDoc loc (text "Parse error in command:" <+> ppr e)
+cmdStmtFail :: SrcSpan -> Stmt RdrName (LHsExpr RdrName) -> P a
+cmdStmtFail loc e = parseErrorSDoc loc 
+                    (text "Parse error in command statement:" <+> ppr e)
+
 ---------------------------------------------------------------------------
 -- Miscellaneous utilities
 
@@ -907,11 +973,11 @@ checkPrecP (L l i)
  | otherwise
     = parseErrorSDoc l (text ("Precedence out of range: " ++ show i))
 
-mkRecConstrOrUpdate 
-	:: LHsExpr RdrName 
-	-> SrcSpan
-	-> ([HsRecField RdrName (LHsExpr RdrName)], Bool)
-	-> P (HsExpr RdrName)
+mkRecConstrOrUpdate
+        :: LHsExpr RdrName
+        -> SrcSpan
+        -> ([HsRecField RdrName (LHsExpr RdrName)], Bool)
+        -> P (HsExpr RdrName)
 
 mkRecConstrOrUpdate (L l (HsVar c)) _ (fs,dd) | isRdrDataCon c
   = return (RecordCon (L l c) noPostTcExpr (mk_rec_fields fs dd))
@@ -924,7 +990,8 @@ mk_rec_fields fs False = HsRecFields { rec_flds = fs, rec_dotdot = Nothing }
 mk_rec_fields fs True  = HsRecFields { rec_flds = fs, rec_dotdot = Just (length fs) }
 
 mkInlinePragma :: (InlineSpec, RuleMatchInfo) -> Maybe Activation -> InlinePragma
--- The Maybe is because the user can omit the activation spec (and usually does)
+-- The (Maybe Activation) is because the user can omit 
+-- the activation spec (and usually does)
 mkInlinePragma (inl, match_info) mb_act
   = InlinePragma { inl_inline = inl
                  , inl_sat    = Nothing
@@ -944,19 +1011,22 @@ mkInlinePragma (inl, match_info) mb_act
 -- construct a foreign import declaration
 --
 mkImport :: CCallConv
-	 -> Safety 
-	 -> (Located FastString, Located RdrName, LHsType RdrName) 
-	 -> P (HsDecl RdrName)
+         -> Safety
+         -> (Located FastString, Located RdrName, LHsType RdrName)
+         -> P (HsDecl RdrName)
 mkImport cconv safety (L loc entity, v, ty)
   | cconv == PrimCallConv                      = do
-  let funcTarget = CFunction (StaticTarget entity Nothing)
-      importSpec = CImport PrimCallConv safety nilFS funcTarget
-  return (ForD (ForeignImport v ty importSpec))
-
+  let funcTarget = CFunction (StaticTarget entity Nothing True)
+      importSpec = CImport PrimCallConv safety Nothing funcTarget
+  return (ForD (ForeignImport v ty noForeignImportCoercionYet importSpec))
+  | cconv == JavaScriptCallConv = do
+  let funcTarget = CFunction (StaticTarget entity Nothing True)
+      importSpec = CImport JavaScriptCallConv safety Nothing funcTarget
+  return (ForD (ForeignImport v ty noForeignImportCoercionYet importSpec))
   | otherwise = do
     case parseCImport cconv safety (mkExtName (unLoc v)) (unpackFS entity) of
       Nothing         -> parseErrorSDoc loc (text "Malformed entity string")
-      Just importSpec -> return (ForD (ForeignImport v ty importSpec))
+      Just importSpec -> return (ForD (ForeignImport v ty noForeignImportCoercionYet importSpec))
 
 -- the string "foo" is ambigous: either a header or a C identifier.  The
 -- C identifier case comes first in the alternatives below, so we pick
@@ -964,33 +1034,51 @@ mkImport cconv safety (L loc entity, v, ty)
 parseCImport :: CCallConv -> Safety -> FastString -> String
              -> Maybe ForeignImport
 parseCImport cconv safety nm str =
- listToMaybe $ map fst $ filter (null.snd) $ 
+ listToMaybe $ map fst $ filter (null.snd) $
      readP_to_S parse str
  where
    parse = do
        skipSpaces
        r <- choice [
-          string "dynamic" >> return (mk nilFS (CFunction DynamicTarget)),
-          string "wrapper" >> return (mk nilFS CWrapper),
-          optional (string "static" >> skipSpaces) >> 
-           (mk nilFS <$> cimp nm) +++
-           (do h <- munch1 hdr_char; skipSpaces; mk (mkFastString h) <$> cimp nm)
+          string "dynamic" >> return (mk Nothing (CFunction DynamicTarget)),
+          string "wrapper" >> return (mk Nothing CWrapper),
+          do optional (token "static" >> skipSpaces)
+             ((mk Nothing <$> cimp nm) +++
+              (do h <- munch1 hdr_char
+                  skipSpaces
+                  mk (Just (Header (mkFastString h))) <$> cimp nm))
          ]
        skipSpaces
        return r
+
+   token str = do _ <- string str
+                  toks <- look
+                  case toks of
+                      c : _
+                       | id_char c -> pfail
+                      _            -> return ()
 
    mk = CImport cconv safety
 
    hdr_char c = not (isSpace c) -- header files are filenames, which can contain
                                 -- pretty much any char (depending on the platform),
                                 -- so just accept any non-space character
-   id_char  c = isAlphaNum c || c == '_'
+   id_first_char c = isAlpha    c || c == '_'
+   id_char       c = isAlphaNum c || c == '_'
 
    cimp nm = (ReadP.char '&' >> skipSpaces >> CLabel <$> cid)
-             +++ ((\c -> CFunction (StaticTarget c Nothing)) <$> cid)
-          where 
+             +++ (do isFun <- case cconv of
+                              CApiConv ->
+                                  option True
+                                         (do token "value"
+                                             skipSpaces
+                                             return False)
+                              _ -> return True
+                     cid' <- cid
+                     return (CFunction (StaticTarget cid' Nothing isFun)))
+          where
             cid = return nm +++
-                  (do c  <- satisfy (\c -> isAlpha c || c == '_')
+                  (do c  <- satisfy id_first_char
                       cs <-  many (satisfy id_char)
                       return (mkFastString (c:cs)))
 
@@ -998,13 +1086,13 @@ parseCImport cconv safety nm str =
 -- construct a foreign export declaration
 --
 mkExport :: CCallConv
-         -> (Located FastString, Located RdrName, LHsType RdrName) 
-	 -> P (HsDecl RdrName)
+         -> (Located FastString, Located RdrName, LHsType RdrName)
+         -> P (HsDecl RdrName)
 mkExport cconv (L _ entity, v, ty) = return $
-  ForD (ForeignExport v ty (CExport (CExportStatic entity' cconv)))
+  ForD (ForeignExport v ty noForeignExportCoercionYet (CExport (CExportStatic entity' cconv)))
   where
     entity' | nullFS entity = mkExtName (unLoc v)
-	    | otherwise     = entity
+            | otherwise     = entity
 
 -- Supplying the ext_name in a foreign decl is optional; if it
 -- isn't there, the Haskell name is assumed. Note that no transformation
@@ -1016,14 +1104,37 @@ mkExtName :: RdrName -> CLabelString
 mkExtName rdrNm = mkFastString (occNameString (rdrNameOcc rdrNm))
 \end{code}
 
+--------------------------------------------------------------------------------
+-- Help with module system imports/exports
+
+\begin{code}
+data ImpExpSubSpec = ImpExpAbs | ImpExpAll | ImpExpList [ RdrName ]
+
+mkModuleImpExp :: RdrName -> ImpExpSubSpec -> IE RdrName
+mkModuleImpExp name subs =
+  case subs of
+    ImpExpAbs 
+      | isVarNameSpace (rdrNameSpace name) -> IEVar       name
+      | otherwise                          -> IEThingAbs  nameT
+    ImpExpAll                              -> IEThingAll  nameT
+    ImpExpList xs                          -> IEThingWith nameT xs
+
+  where
+    nameT = setRdrNameSpace name tcClsName
+
+mkTypeImpExp :: Located RdrName -> P (Located RdrName)
+mkTypeImpExp name =
+  do allowed <- extension explicitNamespacesEnabled
+     if allowed
+       then return (fmap (`setRdrNameSpace` tcClsName) name)
+       else parseErrorSDoc (getLoc name)
+              (text "Illegal keyword 'type' (use ExplicitNamespaces to enable)")
+\end{code}
 
 -----------------------------------------------------------------------------
 -- Misc utils
 
 \begin{code}
-parseError :: SrcSpan -> String -> P a
-parseError span s = parseErrorSDoc span (text s)
-
 parseErrorSDoc :: SrcSpan -> SDoc -> P a
 parseErrorSDoc span s = failSpanMsgP span s
 \end{code}

@@ -80,7 +80,7 @@ typedef struct {
 typedef struct StgClosure_ {
     StgHeader   header;
     struct StgClosure_ *payload[FLEXIBLE_ARRAY];
-} *StgClosurePtr; // StgClosure defined in Rts.h
+} *StgClosurePtr; // StgClosure defined in rts/Types.h
 
 typedef struct {
     StgThunkHeader  header;
@@ -135,11 +135,18 @@ typedef struct StgBlockingQueue_ {
     struct MessageBlackHole_ *queue;
 } StgBlockingQueue;
 
+/* This struct should be called StgArrBytes rather than StgArrWords.
+ *
+ * One might be very tempted to store the number of words in the bytes field,
+ * but the garbage collector will erase your data then.
+ *
+ * It's name is for historical reasons, see #3800
+ */
 typedef struct {
     StgHeader  header;
     StgWord    bytes;
     StgWord    payload[FLEXIBLE_ARRAY];
-} StgArrWords;
+} StgArrWords; // TODO: s/StgArrWords/StgArrBytes (#8552)
 
 typedef struct {
     StgHeader   header;
@@ -191,17 +198,21 @@ typedef struct _StgStableName {
 
 typedef struct _StgWeak {	/* Weak v */
   StgHeader header;
-  StgClosure *cfinalizer;
+  StgClosure *cfinalizers;
   StgClosure *key;
   StgClosure *value;		/* v */
   StgClosure *finalizer;
   struct _StgWeak *link;
 } StgWeak;
 
-typedef struct _StgDeadWeak {	/* Weak v */
+typedef struct _StgCFinalizerList {
   StgHeader header;
-  struct _StgWeak *link;
-} StgDeadWeak;
+  StgClosure *link;
+  void (*fptr)(void);
+  void *ptr;
+  void *eptr;
+  StgWord flag; /* has environment (0 or 1) */
+} StgCFinalizerList;
 
 /* Byte code objects.  These are fixed size objects with pointers to
  * four arrays, designed so that a BCO can be easily "re-linked" to
@@ -239,60 +250,6 @@ typedef struct {
 #define BCO_BITMAP_BITS(bco) (BCO_BITMAP(bco)->bitmap)
 #define BCO_BITMAP_SIZEW(bco) ((BCO_BITMAP_SIZE(bco) + BITS_IN(StgWord) - 1) \
 			        / BITS_IN(StgWord))
-
-/* -----------------------------------------------------------------------------
-   Dynamic stack frames for generic heap checks.
-
-   These generic heap checks are slow, but have the advantage of being
-   usable in a variety of situations.
-
-   The one restriction is that any relevant SRTs must already be pointed
-   to from the stack.  The return address doesn't need to have an info
-   table attached: hence it can be any old code pointer.
-
-   The liveness mask contains a 1 at bit n, if register Rn contains a
-   non-pointer.  The contents of all 8 vanilla registers are always saved
-   on the stack; the liveness mask tells the GC which ones contain
-   pointers.
-
-   Good places to use a generic heap check: 
-
-        - case alternatives (the return address with an SRT is already
-	  on the stack).
-
-	- primitives (no SRT required).
-
-   The stack frame layout for a RET_DYN is like this:
-
-          some pointers         |-- RET_DYN_PTRS(liveness) words
-          some nonpointers      |-- RET_DYN_NONPTRS(liveness) words
-			       
-	  L1                    \
-          D1-2                  |-- RET_DYN_NONPTR_REGS_SIZE words
-	  F1-4                  /
-			       
-	  R1-8                  |-- RET_DYN_BITMAP_SIZE words
-			       
-	  return address        \
-	  liveness mask         |-- StgRetDyn structure
-	  stg_gen_chk_info      /
-
-   we assume that the size of a double is always 2 pointers (wasting a
-   word when it is only one pointer, but avoiding lots of #ifdefs).
-
-   See Liveness.h for the macros (RET_DYN_PTRS() etc.).
-
-   NOTE: if you change the layout of RET_DYN stack frames, then you
-   might also need to adjust the value of RESERVED_STACK_WORDS in
-   Constants.h.
-   -------------------------------------------------------------------------- */
-
-typedef struct {
-    const StgInfoTable* info;
-    StgWord        liveness;
-    StgWord        ret_addr;
-    StgClosure *   payload[FLEXIBLE_ARRAY];
-} StgRetDyn;
 
 /* A function return stack frame: used when saving the state for a
  * garbage collection at a function entry point.  The function
@@ -360,9 +317,7 @@ typedef struct {
   StgHeader                  header;
   StgClosure                *volatile current_value;
   StgTVarWatchQueue         *volatile first_watch_queue_entry;
-#if defined(THREADED_RTS)
   StgInt                     volatile num_updates;
-#endif
 } StgTVar;
 
 typedef struct {
@@ -430,7 +385,7 @@ typedef struct {
 
 typedef struct {
   StgHeader      header;
-  StgBool        running_alt_code;
+  StgWord        running_alt_code;
   StgClosure    *first_code;
   StgClosure    *alt_code;
 } StgCatchRetryFrame;

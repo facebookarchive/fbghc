@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- | Hard wired things related to registers.
 --	This is module is preventing the native code generator being able to 
 --	emit code for non-host architectures.
@@ -14,7 +21,6 @@ module TargetReg (
 	targetRealRegSqueeze,
 	targetClassOfRealReg,
 	targetMkVirtualReg,
-	targetWordSize,
 	targetRegDotColor,
 	targetClassOfReg
 )
@@ -27,70 +33,99 @@ import Reg
 import RegClass
 import Size
 
-import CmmType	(wordWidth)
 import Outputable
 import Unique
 import FastTypes
+import Platform
+
+import qualified X86.Regs       as X86
+import qualified X86.RegInfo    as X86
+
+import qualified PPC.Regs       as PPC
+
+import qualified SPARC.Regs     as SPARC
+
+targetVirtualRegSqueeze :: Platform -> RegClass -> VirtualReg -> FastInt
+targetVirtualRegSqueeze platform
+    = case platformArch platform of
+      ArchX86       -> X86.virtualRegSqueeze
+      ArchX86_64    -> X86.virtualRegSqueeze
+      ArchPPC       -> PPC.virtualRegSqueeze
+      ArchSPARC     -> SPARC.virtualRegSqueeze
+      ArchPPC_64    -> panic "targetVirtualRegSqueeze ArchPPC_64"
+      ArchARM _ _ _ -> panic "targetVirtualRegSqueeze ArchARM"
+      ArchAlpha     -> panic "targetVirtualRegSqueeze ArchAlpha"
+      ArchMipseb    -> panic "targetVirtualRegSqueeze ArchMipseb"
+      ArchMipsel    -> panic "targetVirtualRegSqueeze ArchMipsel"
+      ArchJavaScript-> panic "targetVirtualRegSqueeze ArchJavaScript"
+      ArchUnknown   -> panic "targetVirtualRegSqueeze ArchUnknown"
 
 
-#if i386_TARGET_ARCH || x86_64_TARGET_ARCH
-import qualified X86.Regs	as X86
-import qualified X86.RegInfo	as X86
+targetRealRegSqueeze :: Platform -> RegClass -> RealReg -> FastInt
+targetRealRegSqueeze platform
+    = case platformArch platform of
+      ArchX86       -> X86.realRegSqueeze
+      ArchX86_64    -> X86.realRegSqueeze
+      ArchPPC       -> PPC.realRegSqueeze
+      ArchSPARC     -> SPARC.realRegSqueeze
+      ArchPPC_64    -> panic "targetRealRegSqueeze ArchPPC_64"
+      ArchARM _ _ _ -> panic "targetRealRegSqueeze ArchARM"
+      ArchAlpha     -> panic "targetRealRegSqueeze ArchAlpha"
+      ArchMipseb    -> panic "targetRealRegSqueeze ArchMipseb"
+      ArchMipsel    -> panic "targetRealRegSqueeze ArchMipsel"
+      ArchJavaScript-> panic "targetRealRegSqueeze ArchJavaScript"
+      ArchUnknown   -> panic "targetRealRegSqueeze ArchUnknown"
 
-#elif powerpc_TARGET_ARCH
-import qualified PPC.Regs	as PPC
+targetClassOfRealReg :: Platform -> RealReg -> RegClass
+targetClassOfRealReg platform
+    = case platformArch platform of
+      ArchX86       -> X86.classOfRealReg platform
+      ArchX86_64    -> X86.classOfRealReg platform
+      ArchPPC       -> PPC.classOfRealReg
+      ArchSPARC     -> SPARC.classOfRealReg
+      ArchPPC_64    -> panic "targetClassOfRealReg ArchPPC_64"
+      ArchARM _ _ _ -> panic "targetClassOfRealReg ArchARM"
+      ArchAlpha     -> panic "targetClassOfRealReg ArchAlpha"
+      ArchMipseb    -> panic "targetClassOfRealReg ArchMipseb"
+      ArchMipsel    -> panic "targetClassOfRealReg ArchMipsel"
+      ArchJavaScript-> panic "targetClassOfRealReg ArchJavaScript"
+      ArchUnknown   -> panic "targetClassOfRealReg ArchUnknown"
 
-#elif sparc_TARGET_ARCH	
-import qualified SPARC.Regs	as SPARC
+targetMkVirtualReg :: Platform -> Unique -> Size -> VirtualReg
+targetMkVirtualReg platform
+    = case platformArch platform of
+      ArchX86       -> X86.mkVirtualReg
+      ArchX86_64    -> X86.mkVirtualReg
+      ArchPPC       -> PPC.mkVirtualReg
+      ArchSPARC     -> SPARC.mkVirtualReg
+      ArchPPC_64    -> panic "targetMkVirtualReg ArchPPC_64"
+      ArchARM _ _ _ -> panic "targetMkVirtualReg ArchARM"
+      ArchAlpha     -> panic "targetMkVirtualReg ArchAlpha"
+      ArchMipseb    -> panic "targetMkVirtualReg ArchMipseb"
+      ArchMipsel    -> panic "targetMkVirtualReg ArchMipsel"
+      ArchJavaScript-> panic "targetMkVirtualReg ArchJavaScript"
+      ArchUnknown   -> panic "targetMkVirtualReg ArchUnknown"
 
-#else
-#error "RegAlloc.Graph.TargetReg: not defined"
-#endif
-
-targetVirtualRegSqueeze :: RegClass -> VirtualReg -> FastInt
-targetRealRegSqueeze 	:: RegClass -> RealReg -> FastInt
-targetClassOfRealReg 	:: RealReg -> RegClass
-targetWordSize 		:: Size
-targetMkVirtualReg 	:: Unique -> Size -> VirtualReg
-targetRegDotColor 	:: RealReg -> SDoc
-
--- x86 -------------------------------------------------------------------------
-#if i386_TARGET_ARCH || x86_64_TARGET_ARCH
-targetVirtualRegSqueeze = X86.virtualRegSqueeze
-targetRealRegSqueeze 	= X86.realRegSqueeze
-targetClassOfRealReg 	= X86.classOfRealReg
-targetWordSize 		= intSize wordWidth
-targetMkVirtualReg 	= X86.mkVirtualReg
-targetRegDotColor 	= X86.regDotColor
-
--- ppc -------------------------------------------------------------------------
-#elif powerpc_TARGET_ARCH
-targetVirtualRegSqueeze = PPC.virtualRegSqueeze
-targetRealRegSqueeze 	= PPC.realRegSqueeze
-targetClassOfRealReg 	= PPC.classOfRealReg
-targetWordSize 		= intSize wordWidth
-targetMkVirtualReg 	= PPC.mkVirtualReg
-targetRegDotColor 	= PPC.regDotColor
-
--- sparc -----------------------------------------------------------------------
-#elif sparc_TARGET_ARCH
-targetVirtualRegSqueeze = SPARC.virtualRegSqueeze
-targetRealRegSqueeze 	= SPARC.realRegSqueeze
-targetClassOfRealReg 	= SPARC.classOfRealReg
-targetWordSize 		= intSize wordWidth
-targetMkVirtualReg 	= SPARC.mkVirtualReg
-targetRegDotColor 	= SPARC.regDotColor
-
---------------------------------------------------------------------------------
-#else
-#error "RegAlloc.Graph.TargetReg: not defined"
-#endif
+targetRegDotColor :: Platform -> RealReg -> SDoc
+targetRegDotColor platform
+    = case platformArch platform of
+      ArchX86       -> X86.regDotColor platform
+      ArchX86_64    -> X86.regDotColor platform
+      ArchPPC       -> PPC.regDotColor
+      ArchSPARC     -> SPARC.regDotColor
+      ArchPPC_64    -> panic "targetRegDotColor ArchPPC_64"
+      ArchARM _ _ _ -> panic "targetRegDotColor ArchARM"
+      ArchAlpha     -> panic "targetRegDotColor ArchAlpha"
+      ArchMipseb    -> panic "targetRegDotColor ArchMipseb"
+      ArchMipsel    -> panic "targetRegDotColor ArchMipsel"
+      ArchJavaScript-> panic "targetRegDotColor ArchJavaScript"
+      ArchUnknown   -> panic "targetRegDotColor ArchUnknown"
 
 
-targetClassOfReg :: Reg -> RegClass
-targetClassOfReg reg
+targetClassOfReg :: Platform -> Reg -> RegClass
+targetClassOfReg platform reg
  = case reg of
- 	RegVirtual vr	-> classOfVirtualReg vr
-	RegReal rr	-> targetClassOfRealReg rr
+   RegVirtual vr -> classOfVirtualReg vr
+   RegReal rr -> targetClassOfRealReg platform rr
 
 

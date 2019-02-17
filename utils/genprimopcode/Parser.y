@@ -1,11 +1,10 @@
-
 {
 {-# LANGUAGE BangPatterns #-} -- required for versions of Happy before 1.18.6
 {-# OPTIONS -w -Wwarn #-}
 -- The above warning supression flag is a temporary kludge.
 -- While working on this module you are encouraged to remove it and fix
 -- any warnings in the module. See
---     http://hackage.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#Warnings
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#Warnings
 -- for details
 
 module Parser (parse) where
@@ -24,6 +23,7 @@ import Syntax
 
 %token
     '->'            { TArrow }
+    '=>'            { TDArrow }
     '='             { TEquals }
     ','             { TComma }
     '('             { TOpenParen }
@@ -32,10 +32,15 @@ import Syntax
     '#)'            { THashCloseParen }
     '{'             { TOpenBrace }
     '}'             { TCloseBrace }
+    '['             { TOpenBracket }
+    ']'             { TCloseBracket }
+    '<'             { TOpenAngle }
+    '>'             { TCloseAngle }
     section         { TSection }
     primop          { TPrimop }
     pseudoop        { TPseudoop }
     primtype        { TPrimtype }
+    primclass       { TPrimclass }
     with            { TWith }
     defaults        { TDefaults }
     true            { TTrue }
@@ -44,10 +49,20 @@ import Syntax
     monadic         { TMonadic }
     compare         { TCompare }
     genprimop       { TGenPrimOp }
+    fixity          { TFixity }
+    infix           { TInfixN }
+    infixl          { TInfixL }
+    infixr          { TInfixR }
+    nothing         { TNothing }
+    vector          { TVector }
+    SCALAR          { TSCALAR }
+    VECTOR          { TVECTOR }
+    VECTUPLE        { TVECTUPLE }
     thats_all_folks { TThatsAllFolks }
     lowerName       { TLowerName $$ }
     upperName       { TUpperName $$ }
     string          { TString $$ }
+    integer         { TInteger $$ }
     noBraces        { TNoBraces $$ }
 
 %%
@@ -66,6 +81,16 @@ pOption :: { Option }
 pOption : lowerName '=' false               { OptionFalse  $1 }
         | lowerName '=' true                { OptionTrue   $1 }
         | lowerName '=' pStuffBetweenBraces { OptionString $1 $3 }
+        | lowerName '=' integer             { OptionInteger $1 $3 }
+        | vector    '=' pVectorTemplate     { OptionVector $3 }
+        | fixity    '=' pInfix              { OptionFixity $3 }
+
+pInfix :: { Maybe Fixity }
+pInfix : infix  integer { Just $ Fixity $2 InfixN }
+       | infixl integer { Just $ Fixity $2 InfixL }
+       | infixr integer { Just $ Fixity $2 InfixR }
+       | nothing        { Nothing }
+
 
 pEntries :: { [Entry] }
 pEntries : pEntry pEntries { $1 : $2 }
@@ -74,6 +99,7 @@ pEntries : pEntry pEntries { $1 : $2 }
 pEntry :: { Entry }
 pEntry : pPrimOpSpec   { $1 }
        | pPrimTypeSpec { $1 }
+       | pPrimClassSpec { $1 }
        | pPseudoOpSpec { $1 }
        | pSection      { $1 }
 
@@ -93,6 +119,10 @@ pPrimOpSpec : primop upperName string pCategory pType
 pPrimTypeSpec :: { Entry }
 pPrimTypeSpec : primtype pType pDesc pWithOptions
                 { PrimTypeSpec { ty = $2, desc = $3, opts = $4 } }
+
+pPrimClassSpec :: { Entry }
+pPrimClassSpec : primclass pType pDesc pWithOptions
+                { PrimClassSpec { cls = $2, desc = $3, opts = $4 } }
 
 pPseudoOpSpec :: { Entry }
 pPseudoOpSpec : pseudoop string pType pDesc pWithOptions
@@ -126,8 +156,20 @@ pInside :: { String }
 pInside : '{' pInsides '}' { "{" ++ $2 ++ "}" }
         | noBraces         { $1 }
 
+pVectorTemplate :: { [(String, String, Int)] }
+pVectorTemplate : '[' pVectors ']' { $2 }
+
+pVectors :: { [(String, String, Int)] }
+pVectors : pVector ',' pVectors { [$1] ++ $3 }
+         | pVector              { [$1] }
+         | {- empty -}          { [] }
+
+pVector :: { (String, String, Int) }
+pVector : '<' upperName ',' upperName ',' integer '>' { ($2, $4, $6) }
+ 
 pType :: { Ty }
 pType : paT '->' pType { TyF $1 $3 }
+      | paT '=>' pType { TyC $1 $3 }
       | paT            { $1 }
 
 -- Atomic types
@@ -153,9 +195,12 @@ ppT :: { Ty }
 ppT : lowerName { TyVar $1 }
     | pTycon    { TyApp $1 [] }
 
-pTycon :: { String }
-pTycon : upperName { $1 }
-       | '(' ')'   { "()" }
+pTycon :: { TyCon }
+pTycon : upperName { TyCon $1 }
+       | '(' ')'   { TyCon "()" }
+       | SCALAR    { SCALAR }
+       | VECTOR    { VECTOR }
+       | VECTUPLE  { VECTUPLE }
 
 {
 parse :: String -> Either String Info

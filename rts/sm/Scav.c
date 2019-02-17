@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  * 
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
 
@@ -53,7 +53,7 @@ scavengeTSO (StgTSO *tso)
 
     debugTrace(DEBUG_gc,"scavenging thread %d",(int)tso->id);
 
-    // update the pointer from the Task.
+    // update the pointer from the InCall.
     if (tso->bound != NULL) {
         tso->bound->tso = tso;
     }
@@ -71,6 +71,7 @@ scavengeTSO (StgTSO *tso)
 
     evacuate((StgClosure **)&tso->_link);
     if (   tso->why_blocked == BlockedOnMVar
+        || tso->why_blocked == BlockedOnMVarRead
 	|| tso->why_blocked == BlockedOnBlackHole
 	|| tso->why_blocked == BlockedOnMsgThrowTo
         || tso->why_blocked == NotBlocked
@@ -98,7 +99,7 @@ scavengeTSO (StgTSO *tso)
 
 static StgPtr scavenge_mut_arr_ptrs (StgMutArrPtrs *a)
 {
-    lnat m;
+    W_ m;
     rtsBool any_failed;
     StgPtr p, q;
 
@@ -140,7 +141,7 @@ static StgPtr scavenge_mut_arr_ptrs (StgMutArrPtrs *a)
 // scavenge only the marked areas of a MUT_ARR_PTRS
 static StgPtr scavenge_mut_arr_ptrs_marked (StgMutArrPtrs *a)
 {
-    lnat m;
+    W_ m;
     StgPtr p, q;
     rtsBool any_failed;
 
@@ -313,7 +314,7 @@ scavenge_srt (StgClosure **srt, nat srt_bitmap)
 
   while (bitmap != 0) {
       if ((bitmap & 1) != 0) {
-#if defined(__PIC__) && defined(mingw32_HOST_OS)
+#if defined(COMPILING_WINDOWS_DLL)
 	  // Special-case to handle references to closures hiding out in DLLs, since
 	  // double indirections required to get at those. The code generator knows
 	  // which is which when generating the SRT, so it stores the (indirect)
@@ -322,8 +323,8 @@ scavenge_srt (StgClosure **srt, nat srt_bitmap)
 	  // 
 	  // If the SRT entry hasn't got bit 0 set, the SRT entry points to a
 	  // closure that's fixed at link-time, and no extra magic is required.
-	  if ( (unsigned long)(*srt) & 0x1 ) {
-	      evacuate( (StgClosure**) ((unsigned long) (*srt) & ~0x1));
+	  if ( (W_)(*srt) & 0x1 ) {
+	      evacuate( (StgClosure**) ((W_) (*srt) & ~0x1));
 	  } else {
 	      evacuate(p);
 	  }
@@ -421,6 +422,23 @@ scavenge_block (bdescr *bd)
 	    mvar->header.info = &stg_MVAR_CLEAN_info;
 	}
 	p += sizeofW(StgMVar);
+	break;
+    }
+
+    case TVAR:
+    {
+	StgTVar *tvar = ((StgTVar *)p);
+	gct->eager_promotion = rtsFalse;
+        evacuate((StgClosure **)&tvar->current_value);
+        evacuate((StgClosure **)&tvar->first_watch_queue_entry);
+	gct->eager_promotion = saved_eager_promotion;
+
+	if (gct->failed_to_evac) {
+	    tvar->header.info = &stg_TVAR_DIRTY_info;
+	} else {
+	    tvar->header.info = &stg_TVAR_CLEAN_info;
+	}
+	p += sizeofW(StgTVar);
 	break;
     }
 
@@ -783,6 +801,22 @@ scavenge_mark_stack(void)
             break;
         }
 
+        case TVAR:
+        {
+            StgTVar *tvar = ((StgTVar *)p);
+            gct->eager_promotion = rtsFalse;
+            evacuate((StgClosure **)&tvar->current_value);
+            evacuate((StgClosure **)&tvar->first_watch_queue_entry);
+            gct->eager_promotion = saved_eager_promotion;
+
+            if (gct->failed_to_evac) {
+                tvar->header.info = &stg_TVAR_DIRTY_info;
+            } else {
+                tvar->header.info = &stg_TVAR_CLEAN_info;
+            }
+            break;
+        }
+
 	case FUN_2_0:
 	    scavenge_fun_srt(info);
 	    evacuate(&((StgClosure *)p)->payload[1]);
@@ -1088,6 +1122,22 @@ scavenge_one(StgPtr p)
 	break;
     }
 
+    case TVAR:
+    {
+	StgTVar *tvar = ((StgTVar *)p);
+	gct->eager_promotion = rtsFalse;
+        evacuate((StgClosure **)&tvar->current_value);
+        evacuate((StgClosure **)&tvar->first_watch_queue_entry);
+	gct->eager_promotion = saved_eager_promotion;
+
+	if (gct->failed_to_evac) {
+	    tvar->header.info = &stg_TVAR_DIRTY_info;
+	} else {
+	    tvar->header.info = &stg_TVAR_CLEAN_info;
+	}
+        break;
+    }
+
     case THUNK:
     case THUNK_1_0:
     case THUNK_0_1:
@@ -1363,17 +1413,33 @@ scavenge_mutable_list(bdescr *bd, generation *gen)
 	    case MVAR_CLEAN:
 		barf("MVAR_CLEAN on mutable list");
 	    case MVAR_DIRTY:
-		mutlist_MVARS++; break;
-	    default:
-		mutlist_OTHERS++; break;
-	    }
+                mutlist_MVARS++; break;
+            case TVAR:
+                mutlist_TVAR++; break;
+            case TREC_CHUNK:
+                mutlist_TREC_CHUNK++; break;
+            case MUT_PRIM:
+                if (((StgClosure*)p)->header.info == &stg_TVAR_WATCH_QUEUE_info)
+                    mutlist_TVAR_WATCH_QUEUE++;
+                else if (((StgClosure*)p)->header.info == &stg_TREC_HEADER_info)
+                    mutlist_TREC_HEADER++;
+                else if (((StgClosure*)p)->header.info == &stg_ATOMIC_INVARIANT_info)
+                    mutlist_ATOMIC_INVARIANT++;
+                else if (((StgClosure*)p)->header.info == &stg_INVARIANT_CHECK_QUEUE_info)
+                    mutlist_INVARIANT_CHECK_QUEUE++;
+                else
+                    mutlist_OTHERS++;
+                break;
+            default:
+                mutlist_OTHERS++; break;
+            }
 #endif
 
 	    // Check whether this object is "clean", that is it
 	    // definitely doesn't point into a young generation.
 	    // Clean objects don't need to be scavenged.  Some clean
 	    // objects (MUT_VAR_CLEAN) are not kept on the mutable
-	    // list at all; others, such as TSO
+	    // list at all; others, such as MUT_ARR_PTRS
 	    // are always on the mutable list.
 	    //
 	    switch (get_itbl((StgClosure *)p)->type) {
@@ -1683,32 +1749,6 @@ scavenge_stack(StgPtr p, StgPtr stack_end)
 	p += size;
 	// and don't forget to follow the SRT 
 	goto follow_srt;
-    }
-
-      // Dynamic bitmap: the mask is stored on the stack, and
-      // there are a number of non-pointers followed by a number
-      // of pointers above the bitmapped area.  (see StgMacros.h,
-      // HEAP_CHK_GEN).
-    case RET_DYN:
-    {
-	StgWord dyn;
-	dyn = ((StgRetDyn *)p)->liveness;
-
-	// traverse the bitmap first
-	bitmap = RET_DYN_LIVENESS(dyn);
-	p      = (P_)&((StgRetDyn *)p)->payload[0];
-	size   = RET_DYN_BITMAP_SIZE;
-	p = scavenge_small_bitmap(p, size, bitmap);
-
-	// skip over the non-ptr words
-	p += RET_DYN_NONPTRS(dyn) + RET_DYN_NONPTR_REGS_SIZE;
-	
-	// follow the ptr words
-	for (size = RET_DYN_PTRS(dyn); size > 0; size--) {
-	    evacuate((StgClosure **)p);
-	    p++;
-	}
-	continue;
     }
 
     case RET_FUN:

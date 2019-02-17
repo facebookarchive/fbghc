@@ -3,17 +3,28 @@
 %
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
+{-# LANGUAGE ScopedTypeVariables #-}
 module Digraph(
         Graph, graphFromVerticesAndAdjacency, graphFromEdgedVertices,
 
-        SCC(..), flattenSCC, flattenSCCs,
-        stronglyConnCompG, topologicalSortG, 
+        SCC(..), Node, flattenSCC, flattenSCCs,
+        stronglyConnCompG, stronglyConnCompFromG,
+        topologicalSortG, dfsTopSortG,
         verticesG, edgesG, hasVertexG,
         reachableG, transposeG,
         outdegreeG, indegreeG,
         vertexGroupsG, emptyG,
         componentsG,
 
+        findCycle,
+  
         -- For backwards compatability with the simpler version of Digraph
         stronglyConnCompFromEdgedVertices, stronglyConnCompFromEdgedVerticesR,
 
@@ -37,7 +48,7 @@ module Digraph(
 ------------------------------------------------------------------------------
 
 
-import Util        ( sortLe )
+import Util        ( minWith, count )
 import Outputable
 import Maybes      ( expectJust )
 import MonadUtils  ( allM )
@@ -49,8 +60,11 @@ import Control.Monad.ST
 -- std interfaces
 import Data.Maybe
 import Data.Array
-import Data.List   ( (\\) )
+import Data.List hiding (transpose)
+import Data.Ord
 import Data.Array.ST
+import qualified Data.Map as Map
+import qualified Data.Set as Set
 \end{code}
 
 %************************************************************************
@@ -78,6 +92,13 @@ data Graph node = Graph {
 
 data Edge node = Edge node node
 
+type Node key payload = (payload, key, [key])	
+     -- The payload is user data, just carried around in this module
+     -- The keys are ordered
+     -- The [key] are the dependencies of the node; 
+     --    it's ok to have extra keys in the dependencies that
+     --	   are not the key of any Node in the graph
+
 emptyGraph :: Graph a
 emptyGraph = Graph (array (1, 0) []) (error "emptyGraph") (const Nothing)
 
@@ -101,10 +122,10 @@ graphFromVerticesAndAdjacency vertices edges = Graph graph vertex_node (key_vert
 
 graphFromEdgedVertices
         :: Ord key
-        => [(node, key, [key])]         -- The graph; its ok for the
+        => [Node key payload]           -- The graph; its ok for the
                                         -- out-list to contain keys which arent
                                         -- a vertex key, they are ignored
-        -> Graph (node, key, [key])
+        -> Graph (Node key payload)
 graphFromEdgedVertices []             = emptyGraph
 graphFromEdgedVertices edged_vertices = Graph graph vertex_fn (key_vertex . key_extractor)
   where key_extractor (_, k, _) = k
@@ -121,8 +142,7 @@ reduceNodesIntoVertices nodes key_extractor = (bounds, (!) vertex_map, key_verte
     max_v           = length nodes - 1
     bounds          = (0, max_v) :: (Vertex, Vertex)
 
-    sorted_nodes    = let n1 `le` n2 = (key_extractor n1 `compare` key_extractor n2) /= GT
-                      in sortLe le nodes
+    sorted_nodes    = sortBy (comparing key_extractor) nodes
     numbered_nodes  = zipWith (,) [0..] sorted_nodes
 
     key_map         = array bounds [(i, key_extractor node) | (i, node) <- numbered_nodes]
@@ -138,6 +158,63 @@ reduceNodesIntoVertices nodes key_extractor = (bounds, (!) vertex_map, key_verte
                                     LT -> find a (mid - 1)
                                     EQ -> Just mid
                                     GT -> find (mid + 1) b
+\end{code}
+
+%************************************************************************
+%*                                                                      *
+%*      SCC
+%*                                                                      *
+%************************************************************************
+
+\begin{code}
+type WorkItem key payload
+  = (Node key payload,	-- Tip of the path
+     [payload])	  	-- Rest of the path; 
+     			--  [a,b,c] means c depends on b, b depends on a
+
+-- | Find a reasonably short cycle a->b->c->a, in a strongly
+-- connected component.  The input nodes are presumed to be
+-- a SCC, so you can start anywhere.
+findCycle :: forall payload key. Ord key 
+          => [Node key payload]     -- The nodes.  The dependencies can
+	     	     	  	    -- contain extra keys, which are ignored
+	  -> Maybe [payload]        -- A cycle, starting with node
+	     			    -- so each depends on the next
+findCycle graph
+  = go Set.empty (new_work root_deps []) []
+  where
+    env :: Map.Map key (Node key payload)
+    env = Map.fromList [ (key, node) | node@(_, key, _) <- graph ]
+
+    -- Find the node with fewest dependencies among the SCC modules
+    -- This is just a heuristic to find some plausible root module
+    root :: Node key payload
+    root = fst (minWith snd [ (node, count (`Map.member` env) deps) 
+                            | node@(_,_,deps) <- graph ])
+    (root_payload,root_key,root_deps) = root
+
+
+    -- 'go' implements Dijkstra's algorithm, more or less
+    go :: Set.Set key	-- Visited
+       -> [WorkItem key payload]	-- Work list, items length n
+       -> [WorkItem key payload]	-- Work list, items length n+1
+       -> Maybe [payload]		-- Returned cycle
+       -- Invariant: in a call (go visited ps qs),
+       --            visited = union (map tail (ps ++ qs))
+
+    go _       [] [] = Nothing	-- No cycles
+    go visited [] qs = go visited qs []
+    go visited (((payload,key,deps), path) : ps) qs 
+       | key == root_key           = Just (root_payload : reverse path)
+       | key `Set.member` visited  = go visited ps qs
+       | key `Map.notMember` env   = go visited ps qs
+       | otherwise                 = go (Set.insert key visited)
+                                        ps (new_qs ++ qs)
+       where
+	 new_qs = new_work deps (payload : path)
+
+    new_work :: [key] -> [payload] -> [WorkItem key payload]
+    new_work deps path = [ (n, path) | Just n <- map (`Map.lookup` env) deps ]
 \end{code}
 
 %************************************************************************
@@ -178,9 +255,21 @@ edges going from them to earlier ones.
 
 \begin{code}
 stronglyConnCompG :: Graph node -> [SCC node]
-stronglyConnCompG (Graph { gr_int_graph = graph, gr_vertex_to_node = vertex_fn }) = map decode forest
+stronglyConnCompG graph = decodeSccs graph forest
+  where forest = {-# SCC "Digraph.scc" #-} scc (gr_int_graph graph)
+
+-- Find the set of strongly connected components starting from the
+-- given roots.  This is a good way to discard unreachable nodes at
+-- the same time as computing SCCs.
+stronglyConnCompFromG :: Graph node -> [node] -> [SCC node]
+stronglyConnCompFromG graph roots = decodeSccs graph forest
+  where forest = {-# SCC "Digraph.scc" #-} sccFrom (gr_int_graph graph) vs
+        vs = [ v | Just v <- map (gr_node_to_vertex graph) roots ]
+
+decodeSccs :: Graph node -> Forest Vertex -> [SCC node]
+decodeSccs Graph { gr_int_graph = graph, gr_vertex_to_node = vertex_fn } forest
+  = map decode forest
   where
-    forest             = {-# SCC "Digraph.scc" #-} scc graph
     decode (Node v []) | mentions_itself v = CyclicSCC [vertex_fn v]
                        | otherwise         = AcyclicSCC (vertex_fn v)
     decode other = CyclicSCC (dec other [])
@@ -191,17 +280,18 @@ stronglyConnCompG (Graph { gr_int_graph = graph, gr_vertex_to_node = vertex_fn }
 -- The following two versions are provided for backwards compatability:
 stronglyConnCompFromEdgedVertices
         :: Ord key
-        => [(node, key, [key])]
-        -> [SCC node]
-stronglyConnCompFromEdgedVertices = map (fmap get_node) . stronglyConnCompFromEdgedVerticesR
+        => [Node key payload]
+        -> [SCC payload]
+stronglyConnCompFromEdgedVertices
+  = map (fmap get_node) . stronglyConnCompFromEdgedVerticesR
   where get_node (n, _, _) = n
 
 -- The "R" interface is used when you expect to apply SCC to
--- the (some of) the result of SCC, so you dont want to lose the dependency info
+-- (some of) the result of SCC, so you dont want to lose the dependency info
 stronglyConnCompFromEdgedVerticesR
         :: Ord key
-        => [(node, key, [key])]
-        -> [SCC (node, key, [key])]
+        => [Node key payload]
+        -> [SCC (Node key payload)]
 stronglyConnCompFromEdgedVerticesR = stronglyConnCompG . graphFromEdgedVertices
 \end{code}
 
@@ -215,6 +305,12 @@ stronglyConnCompFromEdgedVerticesR = stronglyConnCompG . graphFromEdgedVertices
 topologicalSortG :: Graph node -> [node]
 topologicalSortG graph = map (gr_vertex_to_node graph) result
   where result = {-# SCC "Digraph.topSort" #-} topSort (gr_int_graph graph)
+
+dfsTopSortG :: Graph node -> [[node]]
+dfsTopSortG graph =
+  map (map (gr_vertex_to_node graph) . flattenTree) $ dfs g (topSort g)
+  where
+    g = gr_int_graph graph
 
 reachableG :: Graph node -> node -> [node]
 reachableG graph from = map (gr_vertex_to_node graph) result
@@ -344,12 +440,6 @@ instance Show a => Show (Tree a) where
 showTree :: Show a => Tree a -> String
 showTree  = drawTree . mapTree show
 
-instance Show a => Show (Forest a) where
-  showsPrec _ f s = showForest f ++ s
-
-showForest :: Show a => Forest a -> String
-showForest  = unlines . map showTree
-
 drawTree        :: Tree String -> String
 drawTree         = unlines . draw
 
@@ -458,6 +548,9 @@ postorderF ts = foldr (.) id $ map postorder ts
 postOrd :: IntGraph -> [Vertex]
 postOrd g = postorderF (dff g) []
 
+postOrdFrom :: IntGraph -> [Vertex] -> [Vertex]
+postOrdFrom g vs = postorderF (dfs g vs) []
+
 topSort :: IntGraph -> [Vertex]
 topSort = reverse . postOrd
 \end{code}
@@ -481,6 +574,9 @@ undirected g  = buildG (bounds g) (edges g ++ reverseE g)
 \begin{code}
 scc  :: IntGraph -> Forest Vertex
 scc g = dfs g (reverse (postOrd (transpose g)))
+
+sccFrom  :: IntGraph -> [Vertex] -> Forest Vertex
+sccFrom g vs = reverse (dfs (transpose g) (reverse (postOrdFrom g vs)))
 \end{code}
 
 ------------------------------------------------------------

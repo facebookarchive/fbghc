@@ -4,6 +4,13 @@
 \section[PrelInfo]{The @PrelInfo@ interface to the compiler's prelude knowledge}
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module PrelInfo (
         wiredInIds, ghcPrimIds,
         primOpRules, builtinRules,
@@ -22,22 +29,20 @@ module PrelInfo (
 
 #include "HsVersions.h"
 
-import PrelNames        ( basicKnownKeyNames,
-                          hasKey, charDataConKey, intDataConKey,
-                          numericClassKeys, standardClassKeys )
+import PrelNames
 import PrelRules
-import PrimOp		( PrimOp, allThePrimOps, primOpOcc, primOpTag, maxPrimOpTag )
-import DataCon		( DataCon )
-import Id		( Id, idName )
-import MkId		-- All of it, for re-export
-import Name		( nameOccName )
-import TysPrim		( primTyCons )
-import TysWiredIn	( wiredInTyCons )
-import HscTypes 	( TyThing(..), implicitTyThings, GenAvailInfo(..), RdrAvailInfo )
-import Class	 	( Class, classKey )
-import Type		( funTyCon )
-import TyCon		( tyConName )
-import Util		( isIn )
+import Avail
+import PrimOp
+import DataCon
+import Id
+import MkId
+import TysPrim
+import TysWiredIn
+import HscTypes
+import Class
+import TyCon
+import Util
+import {-# SOURCE #-} TcTypeNats ( typeNatTyCons )
 
 import Data.Array
 \end{code}
@@ -71,7 +76,7 @@ Notes about wired in things
 wiredInThings :: [TyThing]
 -- This list is used only to initialise HscMain.knownKeyNames
 -- to ensure that when you say "Prelude.map" in your source code, you
--- get a Name with the correct known key
+-- get a Name with the correct known key (See Note [Known-key names])
 wiredInThings		
   = concat
     [		-- Wired in TyCons and their implicit Ids
@@ -82,10 +87,11 @@ wiredInThings
 	, map AnId wiredInIds
 
 		-- PrimOps
-	, map (AnId . mkPrimOpId) allThePrimOps
+	, map (AnId . primOpId) allThePrimOps
     ]
   where
-    tycon_things = map ATyCon ([funTyCon] ++ primTyCons ++ wiredInTyCons)
+    tycon_things = map ATyCon ([funTyCon] ++ primTyCons ++ wiredInTyCons
+                                    ++ typeNatTyCons)
 \end{code}
 
 We let a lot of "non-standard" values be visible, so that we can make
@@ -99,9 +105,10 @@ sense of them in interface pragmas. It's cool, though they all have
 %************************************************************************
 
 \begin{code}
-primOpIds :: Array Int Id	-- Indexed by PrimOp tag
+primOpIds :: Array Int Id	
+-- A cache of the PrimOp Ids, indexed by PrimOp tag
 primOpIds = array (1,maxPrimOpTag) [ (primOpTag op, mkPrimOpId op) 
-				   | op <- allThePrimOps]
+				   | op <- allThePrimOps ]
 
 primOpId :: PrimOp -> Id
 primOpId op = primOpIds ! primOpTag op
@@ -118,13 +125,12 @@ GHC.Prim "exports" all the primops and primitive types, some
 wired-in Ids.
 
 \begin{code}
-ghcPrimExports :: [RdrAvailInfo]
+ghcPrimExports :: [IfaceExport]
 ghcPrimExports
- = map (Avail . nameOccName . idName) ghcPrimIds ++
-   map (Avail . primOpOcc) allThePrimOps ++
-   [ AvailTC occ [occ] |
-     n <- funTyCon : primTyCons, let occ = nameOccName (tyConName n) 
-   ]
+ = map (Avail . idName) ghcPrimIds ++
+   map (Avail . idName . primOpId) allThePrimOps ++
+   [ AvailTC n [n] 
+   | tc <- funTyCon : coercibleTyCon : primTyCons, let n = tyConName tc  ]
 \end{code}
 
 

@@ -26,28 +26,28 @@
 /* huh? */
 #define BIG_STRING_LEN              512
 
-#define TICK_TO_DBL(t) ((double)(t) / TICKS_PER_SECOND)
+#define TimeToSecondsDbl(t) ((double)(t) / TIME_RESOLUTION)
 
-static Ticks
+static Time
     start_init_cpu, start_init_elapsed,
     end_init_cpu,   end_init_elapsed,
     start_exit_cpu, start_exit_elapsed,
     end_exit_cpu,   end_exit_elapsed;
 
-static Ticks GC_tot_cpu  = 0;
+static Time GC_tot_cpu  = 0;
 
 static StgWord64 GC_tot_alloc      = 0;
 static StgWord64 GC_tot_copied     = 0;
 
 static StgWord64 GC_par_max_copied = 0;
-static StgWord64 GC_par_avg_copied = 0;
+static StgWord64 GC_par_tot_copied = 0;
 
 #ifdef PROFILING
-static Ticks RP_start_time  = 0, RP_tot_time  = 0;  // retainer prof user time
-static Ticks RPe_start_time = 0, RPe_tot_time = 0;  // retainer prof elap time
+static Time RP_start_time  = 0, RP_tot_time  = 0;  // retainer prof user time
+static Time RPe_start_time = 0, RPe_tot_time = 0;  // retainer prof elap time
 
-static Ticks HC_start_time, HC_tot_time = 0;     // heap census prof user time
-static Ticks HCe_start_time, HCe_tot_time = 0;   // heap census prof elap time
+static Time HC_start_time, HC_tot_time = 0;     // heap census prof user time
+static Time HCe_start_time, HCe_tot_time = 0;   // heap census prof elap time
 #endif
 
 #ifdef PROFILING
@@ -56,16 +56,19 @@ static Ticks HCe_start_time, HCe_tot_time = 0;   // heap census prof elap time
 #define PROF_VAL(x)   0
 #endif
 
-static lnat max_residency     = 0; // in words; for stats only
-static lnat avg_residency     = 0;
-static lnat residency_samples = 0; // for stats only
-static lnat max_slop          = 0;
+// current = current as of last GC
+static W_ current_residency = 0; // in words; for stats only
+static W_ max_residency     = 0;
+static W_ cumulative_residency = 0;
+static W_ residency_samples = 0; // for stats only
+static W_ current_slop      = 0;
+static W_ max_slop          = 0;
 
-static lnat GC_end_faults = 0;
+static W_ GC_end_faults = 0;
 
-static Ticks *GC_coll_cpu = NULL;
-static Ticks *GC_coll_elapsed = NULL;
-static Ticks *GC_coll_max_pause = NULL;
+static Time *GC_coll_cpu = NULL;
+static Time *GC_coll_elapsed = NULL;
+static Time *GC_coll_max_pause = NULL;
 
 static void statsFlush( void );
 static void statsClose( void );
@@ -74,7 +77,7 @@ static void statsClose( void );
    Current elapsed time
    ------------------------------------------------------------------------- */
 
-Ticks stat_getElapsedTime(void)
+Time stat_getElapsedTime(void)
 {
     return getProcessElapsedTime() - start_init_elapsed;
 }
@@ -84,11 +87,19 @@ Ticks stat_getElapsedTime(void)
    ------------------------------------------------------------------------ */
 
 double
+mut_user_time_until( Time t )
+{
+    return TimeToSecondsDbl(t - GC_tot_cpu);
+    // heapCensus() time is included in GC_tot_cpu, so we don't need
+    // to subtract it here.
+}
+
+double
 mut_user_time( void )
 {
-    Ticks cpu;
+    Time cpu;
     cpu = getProcessCPUTime();
-    return TICK_TO_DBL(cpu - GC_tot_cpu - PROF_VAL(RP_tot_time + HC_tot_time));
+    return mut_user_time_until(cpu);
 }
 
 #ifdef PROFILING
@@ -99,13 +110,13 @@ mut_user_time( void )
 double
 mut_user_time_during_RP( void )
 {
-  return TICK_TO_DBL(RP_start_time - GC_tot_cpu - RP_tot_time - HC_tot_time);
+    return TimeToSecondsDbl(RP_start_time - GC_tot_cpu - RP_tot_time);
 }
 
 double
 mut_user_time_during_heap_census( void )
 {
-  return TICK_TO_DBL(HC_start_time - GC_tot_cpu - RP_tot_time - HC_tot_time);
+    return TimeToSecondsDbl(HC_start_time - GC_tot_cpu - RP_tot_time);
 }
 #endif /* PROFILING */
 
@@ -129,7 +140,7 @@ initStats0(void)
     GC_tot_alloc     = 0;
     GC_tot_copied    = 0;
     GC_par_max_copied = 0;
-    GC_par_avg_copied = 0;
+    GC_par_tot_copied = 0;
     GC_tot_cpu  = 0;
 
 #ifdef PROFILING
@@ -145,7 +156,7 @@ initStats0(void)
 #endif
 
     max_residency = 0;
-    avg_residency = 0;
+    cumulative_residency = 0;
     residency_samples = 0;
     max_slop = 0;
 
@@ -166,16 +177,16 @@ initStats1 (void)
 	statsPrintf("    bytes     bytes     bytes  user  elap    user    elap\n");
     }
     GC_coll_cpu = 
-	(Ticks *)stgMallocBytes(
-            sizeof(Ticks)*RtsFlags.GcFlags.generations,
+	(Time *)stgMallocBytes(
+            sizeof(Time)*RtsFlags.GcFlags.generations,
 	    "initStats");
     GC_coll_elapsed = 
-	(Ticks *)stgMallocBytes(
-	    sizeof(Ticks)*RtsFlags.GcFlags.generations,
+	(Time *)stgMallocBytes(
+	    sizeof(Time)*RtsFlags.GcFlags.generations,
 	    "initStats");
     GC_coll_max_pause =
-	(Ticks *)stgMallocBytes(
-	    sizeof(Ticks)*RtsFlags.GcFlags.generations,
+	(Time *)stgMallocBytes(
+	    sizeof(Time)*RtsFlags.GcFlags.generations,
 	    "initStats");
     for (i = 0; i < RtsFlags.GcFlags.generations; i++) {
 	GC_coll_cpu[i] = 0;
@@ -245,7 +256,7 @@ stat_endExit(void)
 static nat rub_bell = 0;
 
 void
-stat_startGC (gc_thread *gct)
+stat_startGC (Capability *cap, gc_thread *gct)
 {
     nat bell = RtsFlags.GcFlags.ringBell;
 
@@ -267,7 +278,16 @@ stat_startGC (gc_thread *gct)
 #endif
 
     getProcessTimes(&gct->gc_start_cpu, &gct->gc_start_elapsed);
-    gct->gc_start_thread_cpu  = getThreadCPUTime();
+
+    // Post EVENT_GC_START with the same timestamp as used for stats
+    // (though converted from Time=StgInt64 to EventTimestamp=StgWord64).
+    // Here, as opposed to other places, the event is emitted on the cap
+    // that initiates the GC and external tools expect it to have the same
+    // timestamp as used in +RTS -s calculcations.
+    traceEventGcStartAtT(cap,
+                         TimeToNS(gct->gc_start_elapsed - start_init_elapsed));
+
+    gct->gc_start_thread_cpu = getThreadCPUTime();
 
     if (RtsFlags.GcFlags.giveStats != NO_GC_STATS)
     {
@@ -276,19 +296,30 @@ stat_startGC (gc_thread *gct)
 }
 
 void
-stat_gcWorkerThreadStart (gc_thread *gct)
+stat_gcWorkerThreadStart (gc_thread *gct STG_UNUSED)
 {
+#if 0
+    /*
+     * We dont' collect per-thread GC stats any more, but this code
+     * could be used to do that if we want to in the future:
+     */
     if (RtsFlags.GcFlags.giveStats != NO_GC_STATS)
     {
         getProcessTimes(&gct->gc_start_cpu, &gct->gc_start_elapsed);
         gct->gc_start_thread_cpu  = getThreadCPUTime();
     }
+#endif
 }
 
 void
-stat_gcWorkerThreadDone (gc_thread *gct)
+stat_gcWorkerThreadDone (gc_thread *gct STG_UNUSED)
 {
-    Ticks thread_cpu, elapsed, gc_cpu, gc_elapsed;
+#if 0
+    /*
+     * We dont' collect per-thread GC stats any more, but this code
+     * could be used to do that if we want to in the future:
+     */
+    Time thread_cpu, elapsed, gc_cpu, gc_elapsed;
 
     if (RtsFlags.GcFlags.giveStats != NO_GC_STATS)
     {
@@ -300,6 +331,28 @@ stat_gcWorkerThreadDone (gc_thread *gct)
     
         taskDoneGC(gct->cap->running_task, gc_cpu, gc_elapsed);
     }
+#endif
+}
+
+/* -----------------------------------------------------------------------------
+ * Calculate the total allocated memory since the start of the
+ * program.  Also emits events reporting the per-cap allocation
+ * totals.
+ * -------------------------------------------------------------------------- */
+
+static StgWord
+calcTotalAllocated(void)
+{
+    W_ tot_alloc = 0;
+    W_ n;
+    for (n = 0; n < n_capabilities; n++) {
+        tot_alloc += capabilities[n]->total_allocated;
+        traceEventHeapAllocated(capabilities[n],
+                                CAPSET_HEAP_DEFAULT,
+                                capabilities[n]->total_allocated * sizeof(W_));
+    }
+
+    return tot_alloc;
 }
 
 /* -----------------------------------------------------------------------------
@@ -307,36 +360,72 @@ stat_gcWorkerThreadDone (gc_thread *gct)
    -------------------------------------------------------------------------- */
 
 void
-stat_endGC (gc_thread *gct,
-            lnat alloc, lnat live, lnat copied, nat gen,
-            lnat max_copied, lnat avg_copied, lnat slop)
+stat_endGC (Capability *cap, gc_thread *gct,
+            W_ live, W_ copied, W_ slop, nat gen,
+            nat par_n_threads, W_ par_max_copied, W_ par_tot_copied)
 {
+    W_ tot_alloc;
+    W_ alloc;
+
     if (RtsFlags.GcFlags.giveStats != NO_GC_STATS ||
         RtsFlags.ProfFlags.doHeapProfile)
         // heap profiling needs GC_tot_time
     {
-        Ticks cpu, elapsed, thread_gc_cpu, gc_cpu, gc_elapsed;
+        Time cpu, elapsed, gc_cpu, gc_elapsed;
+
+        // Has to be emitted while all caps stopped for GC, but before GC_END.
+        // See trac.haskell.org/ThreadScope/wiki/RTSsummaryEvents
+        // for a detailed design rationale of the current setup
+        // of GC eventlog events.
+        traceEventGcGlobalSync(cap);
 	
+        // Emitted before GC_END on all caps, which simplifies tools code.
+        traceEventGcStats(cap,
+                          CAPSET_HEAP_DEFAULT,
+                          gen,
+                          copied * sizeof(W_),
+                          slop   * sizeof(W_),
+                          /* current loss due to fragmentation */
+                          (mblocks_allocated * BLOCKS_PER_MBLOCK - n_alloc_blocks)
+                                 * BLOCK_SIZE_W * sizeof(W_),
+                          par_n_threads,
+                          par_max_copied * sizeof(W_),
+                          par_tot_copied * sizeof(W_));
+
         getProcessTimes(&cpu, &elapsed);
-        gc_elapsed    = elapsed - gct->gc_start_elapsed;
 
-        thread_gc_cpu = getThreadCPUTime() - gct->gc_start_thread_cpu;
+        // Post EVENT_GC_END with the same timestamp as used for stats
+        // (though converted from Time=StgInt64 to EventTimestamp=StgWord64).
+        // Here, as opposed to other places, the event is emitted on the cap
+        // that initiates the GC and external tools expect it to have the same
+        // timestamp as used in +RTS -s calculcations.
+        traceEventGcEndAtT(cap, TimeToNS(elapsed - start_init_elapsed));
 
+        gc_elapsed = elapsed - gct->gc_start_elapsed;
         gc_cpu = cpu - gct->gc_start_cpu;
 
-        taskDoneGC(gct->cap->running_task, thread_gc_cpu, gc_elapsed);
+        /* For the moment we calculate both per-HEC and total allocation.
+	 * There is thus redundancy here, but for the moment we will calculate
+	 * it both the old and new way and assert they're the same.
+	 * When we're sure it's working OK then we can simplify things.
+         */
+        tot_alloc = calcTotalAllocated();
+
+        // allocated since the last GC
+        alloc = tot_alloc - GC_tot_alloc;
+        GC_tot_alloc = tot_alloc;
 
         if (RtsFlags.GcFlags.giveStats == VERBOSE_GC_STATS) {
-	    nat faults = getPageFaults();
+	    W_ faults = getPageFaults();
 	    
-	    statsPrintf("%9ld %9ld %9ld",
+	    statsPrintf("%9" FMT_SizeT " %9" FMT_SizeT " %9" FMT_SizeT,
 		    alloc*sizeof(W_), copied*sizeof(W_), 
 			live*sizeof(W_));
-            statsPrintf(" %5.2f %5.2f %7.2f %7.2f %4ld %4ld  (Gen: %2d)\n",
-                    TICK_TO_DBL(gc_cpu),
-		    TICK_TO_DBL(gc_elapsed),
-		    TICK_TO_DBL(cpu),
-		    TICK_TO_DBL(elapsed - start_init_elapsed),
+            statsPrintf(" %5.2f %5.2f %7.2f %7.2f %4" FMT_Word " %4" FMT_Word "  (Gen: %2d)\n",
+                    TimeToSecondsDbl(gc_cpu),
+		    TimeToSecondsDbl(gc_elapsed),
+		    TimeToSecondsDbl(cpu),
+		    TimeToSecondsDbl(elapsed - start_init_elapsed),
 		    faults - gct->gc_start_faults,
                         gct->gc_start_faults - GC_end_faults,
                     gen);
@@ -352,17 +441,24 @@ stat_endGC (gc_thread *gct,
         }
 
 	GC_tot_copied += (StgWord64) copied;
-	GC_tot_alloc  += (StgWord64) alloc;
-        GC_par_max_copied += (StgWord64) max_copied;
-        GC_par_avg_copied += (StgWord64) avg_copied;
+        GC_par_max_copied += (StgWord64) par_max_copied;
+        GC_par_tot_copied += (StgWord64) par_tot_copied;
 	GC_tot_cpu   += gc_cpu;
+        
+        traceEventHeapSize(cap,
+	                   CAPSET_HEAP_DEFAULT,
+			   mblocks_allocated * MBLOCK_SIZE_W * sizeof(W_));
 
 	if (gen == RtsFlags.GcFlags.generations-1) { /* major GC? */
 	    if (live > max_residency) {
 		max_residency = live;
 	    }
+            current_residency = live;
 	    residency_samples++;
-	    avg_residency += live;
+	    cumulative_residency += live;
+	    traceEventHeapLive(cap, 
+    	    	    	       CAPSET_HEAP_DEFAULT,
+	                       live * sizeof(W_));
 	}
 
         if (slop > max_slop) max_slop = slop;
@@ -393,7 +489,7 @@ stat_endGC (gc_thread *gct,
 void
 stat_startRP(void)
 {
-    Ticks user, elapsed;
+    Time user, elapsed;
     getProcessTimes( &user, &elapsed );
 
     RP_start_time = user;
@@ -415,7 +511,7 @@ stat_endRP(
 #endif
   double averageNumVisit)
 {
-    Ticks user, elapsed;
+    Time user, elapsed;
     getProcessTimes( &user, &elapsed );
 
     RP_tot_time += user - RP_start_time;
@@ -438,7 +534,7 @@ stat_endRP(
 void
 stat_startHeapCensus(void)
 {
-    Ticks user, elapsed;
+    Time user, elapsed;
     getProcessTimes( &user, &elapsed );
 
     HC_start_time = user;
@@ -453,7 +549,7 @@ stat_startHeapCensus(void)
 void
 stat_endHeapCensus(void) 
 {
-    Ticks user, elapsed;
+    Time user, elapsed;
     getProcessTimes( &user, &elapsed );
 
     HC_tot_time += user - HC_start_time;
@@ -504,30 +600,40 @@ StgInt TOTAL_CALLS=1;
   statsPrintf("  (SLOW_CALLS_" #arity ") %% of (TOTAL_CALLS) : %.1f%%\n", \
 	      SLOW_CALLS_##arity * 100.0/TOTAL_CALLS)
 
+static inline Time get_init_cpu(void) { return end_init_cpu - start_init_cpu; }
+static inline Time get_init_elapsed(void) { return end_init_elapsed - start_init_elapsed; }
+
+
 void
-stat_exit(int alloc)
+stat_exit (void)
 {
     generation *gen;
-    Ticks gc_cpu = 0;
-    Ticks gc_elapsed = 0;
-    Ticks init_cpu = 0;
-    Ticks init_elapsed = 0;
-    Ticks mut_cpu = 0;
-    Ticks mut_elapsed = 0;
-    Ticks exit_cpu = 0;
-    Ticks exit_elapsed = 0;
+    Time gc_cpu = 0;
+    Time gc_elapsed = 0;
+    Time init_cpu = 0;
+    Time init_elapsed = 0;
+    Time mut_cpu = 0;
+    Time mut_elapsed = 0;
+    Time exit_cpu = 0;
+    Time exit_elapsed = 0;
+    W_ tot_alloc;
+    W_ alloc;
 
     if (RtsFlags.GcFlags.giveStats != NO_GC_STATS) {
 
 	char temp[BIG_STRING_LEN];
-	Ticks tot_cpu;
-	Ticks tot_elapsed;
+	Time tot_cpu;
+	Time tot_elapsed;
 	nat i, g, total_collections = 0;
 
 	getProcessTimes( &tot_cpu, &tot_elapsed );
 	tot_elapsed -= start_init_elapsed;
 
-	GC_tot_alloc += alloc;
+        tot_alloc = calcTotalAllocated();
+
+        // allocated since the last GC
+        alloc = tot_alloc - GC_tot_alloc;
+        GC_tot_alloc = tot_alloc;
 
 	/* Count total garbage collections */
 	for (g = 0; g < RtsFlags.GcFlags.generations; g++)
@@ -538,7 +644,7 @@ stat_exit(int alloc)
 	if (tot_elapsed == 0.0) tot_elapsed = 1;
 	
 	if (RtsFlags.GcFlags.giveStats >= VERBOSE_GC_STATS) {
-	    statsPrintf("%9ld %9.9s %9.9s", (lnat)alloc*sizeof(W_), "", "");
+	    statsPrintf("%9" FMT_SizeT " %9.9s %9.9s", (W_)alloc*sizeof(W_), "", "");
 	    statsPrintf(" %5.2f %5.2f\n\n", 0.0, 0.0);
 	}
 
@@ -546,6 +652,24 @@ stat_exit(int alloc)
             gc_cpu     += GC_coll_cpu[i];
             gc_elapsed += GC_coll_elapsed[i];
         }
+
+        // heapCensus() is called by the GC, so RP and HC time are
+        // included in the GC stats.  We therefore subtract them to
+        // obtain the actual GC cpu time.
+        gc_cpu     -= PROF_VAL(RP_tot_time + HC_tot_time);
+        gc_elapsed -= PROF_VAL(RPe_tot_time + HCe_tot_time);
+
+        init_cpu     = get_init_cpu();
+        init_elapsed = get_init_elapsed();
+
+        exit_cpu     = end_exit_cpu - start_exit_cpu;
+        exit_elapsed = end_exit_elapsed - start_exit_elapsed;
+
+        mut_elapsed = start_exit_elapsed - end_init_elapsed - gc_elapsed;
+
+        mut_cpu = start_exit_cpu - end_init_cpu - gc_cpu
+            - PROF_VAL(RP_tot_time + HC_tot_time);
+        if (mut_cpu < 0) { mut_cpu = 0; }
 
 	if (RtsFlags.GcFlags.giveStats >= SUMMARY_GC_STATS) {
 	    showStgWord64(GC_tot_alloc*sizeof(W_), 
@@ -559,16 +683,16 @@ stat_exit(int alloc)
             if ( residency_samples > 0 ) {
 		showStgWord64(max_residency*sizeof(W_), 
 				     temp, rtsTrue/*commas*/);
-		statsPrintf("%16s bytes maximum residency (%ld sample(s))\n",
+		statsPrintf("%16s bytes maximum residency (%" FMT_Word " sample(s))\n",
 			temp, residency_samples);
 	    }
 
 	    showStgWord64(max_slop*sizeof(W_), temp, rtsTrue/*commas*/);
 	    statsPrintf("%16s bytes maximum slop\n", temp);
 
-	    statsPrintf("%16ld MB total memory in use (%ld MB lost due to fragmentation)\n\n", 
-                        peak_mblocks_allocated * MBLOCK_SIZE_W / (1024 * 1024 / sizeof(W_)),
-                        (peak_mblocks_allocated * BLOCKS_PER_MBLOCK * BLOCK_SIZE_W - hw_alloc_blocks * BLOCK_SIZE_W) / (1024 * 1024 / sizeof(W_)));
+	    statsPrintf("%16" FMT_SizeT " MB total memory in use (%" FMT_SizeT " MB lost due to fragmentation)\n\n", 
+                        (size_t)(peak_mblocks_allocated * MBLOCK_SIZE_W) / (1024 * 1024 / sizeof(W_)),
+                        (size_t)(peak_mblocks_allocated * BLOCKS_PER_MBLOCK * BLOCK_SIZE_W - hw_alloc_blocks * BLOCK_SIZE_W) / (1024 * 1024 / sizeof(W_)));
 
 	    /* Print garbage collections in each gen */
             statsPrintf("                                    Tot time (elapsed)  Avg pause  Max pause\n");
@@ -578,117 +702,90 @@ stat_exit(int alloc)
                             gen->no,
                             gen->collections,
                             gen->par_collections,
-                            TICK_TO_DBL(GC_coll_cpu[g]),
-                            TICK_TO_DBL(GC_coll_elapsed[g]),
-                            gen->collections == 0 ? 0 : TICK_TO_DBL(GC_coll_elapsed[g] / gen->collections),
-                            TICK_TO_DBL(GC_coll_max_pause[g]));
+                            TimeToSecondsDbl(GC_coll_cpu[g]),
+                            TimeToSecondsDbl(GC_coll_elapsed[g]),
+                            gen->collections == 0 ? 0 : TimeToSecondsDbl(GC_coll_elapsed[g] / gen->collections),
+                            TimeToSecondsDbl(GC_coll_max_pause[g]));
             }
 
 #if defined(THREADED_RTS)
-            if (RtsFlags.ParFlags.parGcEnabled) {
-                statsPrintf("\n  Parallel GC work balance: %.2f (%ld / %ld, ideal %d)\n", 
-                            (double)GC_par_avg_copied / (double)GC_par_max_copied,
-                            (lnat)GC_par_avg_copied, (lnat)GC_par_max_copied,
-                            RtsFlags.ParFlags.nNodes
+            if (RtsFlags.ParFlags.parGcEnabled && n_capabilities > 1) {
+                statsPrintf("\n  Parallel GC work balance: %.2f%% (serial 0%%, perfect 100%%)\n", 
+                            100 * (((double)GC_par_tot_copied / (double)GC_par_max_copied) - 1)
+                                / (n_capabilities - 1)
                     );
             }
 #endif
             statsPrintf("\n");
 
 #if defined(THREADED_RTS)
-	    {
-		nat i;
-		Task *task;
-                statsPrintf("                        MUT time (elapsed)       GC time  (elapsed)\n");
-		for (i = 0, task = all_tasks; 
-		     task != NULL; 
-		     i++, task = task->all_link) {
-		    statsPrintf("  Task %2d %-8s :  %6.2fs    (%6.2fs)     %6.2fs    (%6.2fs)\n",
-				i,
-				(task->worker) ? "(worker)" : "(bound)",
-				TICK_TO_DBL(task->mut_time),
-				TICK_TO_DBL(task->mut_etime),
-				TICK_TO_DBL(task->gc_time),
-				TICK_TO_DBL(task->gc_etime));
-		}
-	    }
+            statsPrintf("  TASKS: %d (%d bound, %d peak workers (%d total), using -N%d)\n",
+                        taskCount, taskCount - workerCount,
+                        peakWorkerCount, workerCount,
+                        n_capabilities);
 
 	    statsPrintf("\n");
 
             {
                 nat i;
-                lnat sparks_created   = 0;
-                lnat sparks_dud       = 0;
-                lnat sparks_converted = 0;
-                lnat sparks_gcd       = 0;
-                lnat sparks_fizzled   = 0;
+                SparkCounters sparks = { 0, 0, 0, 0, 0, 0};
                 for (i = 0; i < n_capabilities; i++) {
-                    sparks_created   += capabilities[i].sparks_created;
-                    sparks_dud       += capabilities[i].sparks_dud;
-                    sparks_converted += capabilities[i].sparks_converted;
-                    sparks_gcd       += capabilities[i].sparks_gcd;
-                    sparks_fizzled   += capabilities[i].sparks_fizzled;
+                    sparks.created   += capabilities[i]->spark_stats.created;
+                    sparks.dud       += capabilities[i]->spark_stats.dud;
+                    sparks.overflowed+= capabilities[i]->spark_stats.overflowed;
+                    sparks.converted += capabilities[i]->spark_stats.converted;
+                    sparks.gcd       += capabilities[i]->spark_stats.gcd;
+                    sparks.fizzled   += capabilities[i]->spark_stats.fizzled;
                 }
 
-                statsPrintf("  SPARKS: %ld (%ld converted, %ld dud, %ld GC'd, %ld fizzled)\n\n",
-                            sparks_created + sparks_dud, sparks_converted, sparks_dud, sparks_gcd, sparks_fizzled);
+                statsPrintf("  SPARKS: %" FMT_Word " (%" FMT_Word " converted, %" FMT_Word " overflowed, %" FMT_Word " dud, %" FMT_Word " GC'd, %" FMT_Word " fizzled)\n\n",
+                            sparks.created + sparks.dud + sparks.overflowed,
+                            sparks.converted, sparks.overflowed, sparks.dud,
+                            sparks.gcd, sparks.fizzled);
             }
 #endif
 
-            init_cpu     = end_init_cpu - start_init_cpu;
-            init_elapsed = end_init_elapsed - start_init_elapsed;
-
-            exit_cpu     = end_exit_cpu - start_exit_cpu;
-            exit_elapsed = end_exit_elapsed - start_exit_elapsed;
-
 	    statsPrintf("  INIT    time  %6.2fs  (%6.2fs elapsed)\n",
-                        TICK_TO_DBL(init_cpu), TICK_TO_DBL(init_elapsed));
-
-            mut_elapsed = start_exit_elapsed - end_init_elapsed - gc_elapsed;
-
-            mut_cpu = start_exit_cpu - end_init_cpu - gc_cpu
-                - PROF_VAL(RP_tot_time + HC_tot_time);
-            if (mut_cpu < 0) { mut_cpu = 0; }
+                        TimeToSecondsDbl(init_cpu), TimeToSecondsDbl(init_elapsed));
 
             statsPrintf("  MUT     time  %6.2fs  (%6.2fs elapsed)\n",
-                        TICK_TO_DBL(mut_cpu), TICK_TO_DBL(mut_elapsed));
+                        TimeToSecondsDbl(mut_cpu), TimeToSecondsDbl(mut_elapsed));
             statsPrintf("  GC      time  %6.2fs  (%6.2fs elapsed)\n",
-                        TICK_TO_DBL(gc_cpu), TICK_TO_DBL(gc_elapsed));
+                        TimeToSecondsDbl(gc_cpu), TimeToSecondsDbl(gc_elapsed));
 
 #ifdef PROFILING
 	    statsPrintf("  RP      time  %6.2fs  (%6.2fs elapsed)\n",
-		    TICK_TO_DBL(RP_tot_time), TICK_TO_DBL(RPe_tot_time));
+		    TimeToSecondsDbl(RP_tot_time), TimeToSecondsDbl(RPe_tot_time));
 	    statsPrintf("  PROF    time  %6.2fs  (%6.2fs elapsed)\n",
-		    TICK_TO_DBL(HC_tot_time), TICK_TO_DBL(HCe_tot_time));
+		    TimeToSecondsDbl(HC_tot_time), TimeToSecondsDbl(HCe_tot_time));
 #endif 
 	    statsPrintf("  EXIT    time  %6.2fs  (%6.2fs elapsed)\n",
-		    TICK_TO_DBL(exit_cpu), TICK_TO_DBL(exit_elapsed));
+		    TimeToSecondsDbl(exit_cpu), TimeToSecondsDbl(exit_elapsed));
 	    statsPrintf("  Total   time  %6.2fs  (%6.2fs elapsed)\n\n",
-		    TICK_TO_DBL(tot_cpu), TICK_TO_DBL(tot_elapsed));
+		    TimeToSecondsDbl(tot_cpu), TimeToSecondsDbl(tot_elapsed));
 #ifndef THREADED_RTS
 	    statsPrintf("  %%GC     time     %5.1f%%  (%.1f%% elapsed)\n\n",
-		    TICK_TO_DBL(gc_cpu)*100/TICK_TO_DBL(tot_cpu),
-		    TICK_TO_DBL(gc_elapsed)*100/TICK_TO_DBL(tot_elapsed));
+		    TimeToSecondsDbl(gc_cpu)*100/TimeToSecondsDbl(tot_cpu),
+		    TimeToSecondsDbl(gc_elapsed)*100/TimeToSecondsDbl(tot_elapsed));
 #endif
 
-	    if (tot_cpu - GC_tot_cpu - PROF_VAL(RP_tot_time + HC_tot_time) == 0)
+            if (mut_cpu == 0) {
 		showStgWord64(0, temp, rtsTrue/*commas*/);
-	    else
+            } else {
 		showStgWord64(
-		    (StgWord64)((GC_tot_alloc*sizeof(W_))/
-			     TICK_TO_DBL(tot_cpu - GC_tot_cpu - 
-					 PROF_VAL(RP_tot_time + HC_tot_time))),
-		    temp, rtsTrue/*commas*/);
-	    
+                    (StgWord64)((GC_tot_alloc*sizeof(W_)) / TimeToSecondsDbl(mut_cpu)),
+                    temp, rtsTrue/*commas*/);
+            }
+
 	    statsPrintf("  Alloc rate    %s bytes per MUT second\n\n", temp);
 	
 	    statsPrintf("  Productivity %5.1f%% of total user, %.1f%% of total elapsed\n\n",
-		    TICK_TO_DBL(tot_cpu - GC_tot_cpu - 
+                    TimeToSecondsDbl(tot_cpu - gc_cpu -
 				PROF_VAL(RP_tot_time + HC_tot_time) - init_cpu) * 100 
-		    / TICK_TO_DBL(tot_cpu), 
-		    TICK_TO_DBL(tot_cpu - GC_tot_cpu - 
-				PROF_VAL(RP_tot_time + HC_tot_time) - init_cpu) * 100 
-		    / TICK_TO_DBL(tot_elapsed));
+		    / TimeToSecondsDbl(tot_cpu), 
+                    TimeToSecondsDbl(tot_cpu - gc_cpu -
+                                PROF_VAL(RP_tot_time + HC_tot_time) - init_cpu) * 100
+                    / TimeToSecondsDbl(tot_elapsed));
 
             /*
             TICK_PRINT(1);
@@ -740,13 +837,13 @@ stat_exit(int alloc)
 	  statsPrintf(fmt2,
 		    total_collections,
 		    residency_samples == 0 ? 0 : 
-		        avg_residency*sizeof(W_)/residency_samples, 
+		        cumulative_residency*sizeof(W_)/residency_samples, 
 		    max_residency*sizeof(W_), 
 		    residency_samples,
 		    (unsigned long)(peak_mblocks_allocated * MBLOCK_SIZE / (1024L * 1024L)),
-		    TICK_TO_DBL(init_cpu), TICK_TO_DBL(init_elapsed),
-		    TICK_TO_DBL(mut_cpu), TICK_TO_DBL(mut_elapsed),
-		    TICK_TO_DBL(gc_cpu), TICK_TO_DBL(gc_elapsed));
+		    TimeToSecondsDbl(init_cpu), TimeToSecondsDbl(init_elapsed),
+		    TimeToSecondsDbl(mut_cpu), TimeToSecondsDbl(mut_elapsed),
+		    TimeToSecondsDbl(gc_cpu), TimeToSecondsDbl(gc_elapsed));
 	}
 
 	statsFlush();
@@ -776,9 +873,9 @@ void
 statDescribeGens(void)
 {
   nat g, mut, lge, i;
-  lnat gen_slop;
-  lnat tot_live, tot_slop;
-  lnat gen_live, gen_blocks;
+  W_ gen_slop;
+  W_ tot_live, tot_slop;
+  W_ gen_live, gen_blocks;
   bdescr *bd;
   generation *gen;
   
@@ -803,31 +900,31 @@ statDescribeGens(void)
 
       mut = 0;
       for (i = 0; i < n_capabilities; i++) {
-          mut += countOccupied(capabilities[i].mut_lists[g]);
+          mut += countOccupied(capabilities[i]->mut_lists[g]);
 
           // Add the pinned object block.
-          bd = capabilities[i].pinned_object_block;
+          bd = capabilities[i]->pinned_object_block;
           if (bd != NULL) {
               gen_live   += bd->free - bd->start;
               gen_blocks += bd->blocks;
           }
 
           gen_live   += gcThreadLiveWords(i,g);
-          gen_live   += gcThreadLiveWords(i,g);
           gen_blocks += gcThreadLiveBlocks(i,g);
       }
 
-      debugBelch("%5d %7d %9d", g, gen->max_blocks, mut);
+      debugBelch("%5d %7" FMT_Word " %9d", g, (W_)gen->max_blocks, mut);
 
       gen_slop = gen_blocks * BLOCK_SIZE_W - gen_live;
 
-      debugBelch("%8ld %8d %8ld %8ld\n", gen_blocks, lge,
-                 gen_live*sizeof(W_), gen_slop*sizeof(W_));
+      debugBelch("%8" FMT_Word " %8d %8" FMT_Word " %8" FMT_Word "\n", gen_blocks, lge,
+                 gen_live*(W_)sizeof(W_), gen_slop*(W_)sizeof(W_));
       tot_live += gen_live;
       tot_slop += gen_slop;
   }
   debugBelch("----------------------------------------------------------\n");
-  debugBelch("%41s%8ld %8ld\n","",tot_live*sizeof(W_),tot_slop*sizeof(W_));
+  debugBelch("%41s%8" FMT_SizeT " %8" FMT_SizeT "\n",
+             "",tot_live*sizeof(W_),tot_slop*sizeof(W_));
   debugBelch("----------------------------------------------------------\n");
   debugBelch("\n");
 }
@@ -839,6 +936,78 @@ statDescribeGens(void)
 
 extern HsInt64 getAllocations( void ) 
 { return (HsInt64)GC_tot_alloc * sizeof(W_); }
+
+/* EZY: I'm not convinced I got all the casting right. */
+
+extern rtsBool getGCStatsEnabled( void )
+{
+    return RtsFlags.GcFlags.giveStats != NO_GC_STATS;
+}
+
+extern void getGCStats( GCStats *s )
+{
+    nat total_collections = 0;
+    nat g;
+    Time gc_cpu = 0;
+    Time gc_elapsed = 0;
+    Time current_elapsed = 0;
+    Time current_cpu = 0;
+
+    getProcessTimes(&current_cpu, &current_elapsed);
+
+    /* EZY: static inline'ify these */
+    for (g = 0; g < RtsFlags.GcFlags.generations; g++)
+        total_collections += generations[g].collections;
+
+    for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
+        gc_cpu     += GC_coll_cpu[g];
+        gc_elapsed += GC_coll_elapsed[g];
+    }
+
+    s->bytes_allocated = GC_tot_alloc*(StgWord64)sizeof(W_);
+    s->num_gcs = total_collections;
+    s->num_byte_usage_samples = residency_samples;
+    s->max_bytes_used = max_residency*sizeof(W_);
+    s->cumulative_bytes_used = cumulative_residency*(StgWord64)sizeof(W_);
+    s->peak_megabytes_allocated = (StgWord64)(peak_mblocks_allocated * MBLOCK_SIZE / (1024L * 1024L));
+    s->bytes_copied = GC_tot_copied*(StgWord64)sizeof(W_);
+    s->max_bytes_slop = max_slop*(StgWord64)sizeof(W_);
+    s->current_bytes_used = current_residency*(StgWord64)sizeof(W_);
+    s->current_bytes_slop = current_slop*(StgWord64)sizeof(W_);
+    /*
+    s->init_cpu_seconds = TimeToSecondsDbl(get_init_cpu());
+    s->init_wall_seconds = TimeToSecondsDbl(get_init_elapsed());
+    */
+    s->mutator_cpu_seconds = TimeToSecondsDbl(current_cpu - end_init_cpu - gc_cpu - PROF_VAL(RP_tot_time + HC_tot_time));
+    s->mutator_wall_seconds = TimeToSecondsDbl(current_elapsed- end_init_elapsed - gc_elapsed);
+    s->gc_cpu_seconds = TimeToSecondsDbl(gc_cpu);
+    s->gc_wall_seconds = TimeToSecondsDbl(gc_elapsed);
+    /* EZY: Being consistent with incremental output, but maybe should also discount init */
+    s->cpu_seconds = TimeToSecondsDbl(current_cpu);
+    s->wall_seconds = TimeToSecondsDbl(current_elapsed - end_init_elapsed);
+    s->par_tot_bytes_copied = GC_par_tot_copied*(StgWord64)sizeof(W_);
+    s->par_max_bytes_copied = GC_par_max_copied*(StgWord64)sizeof(W_);
+}
+// extern void getTaskStats( TaskStats **s ) {}
+#if 0
+extern void getSparkStats( SparkCounters *s ) {
+    nat i;
+    s->created = 0;
+    s->dud = 0;
+    s->overflowed = 0;
+    s->converted = 0;
+    s->gcd = 0;
+    s->fizzled = 0;
+    for (i = 0; i < n_capabilities; i++) {
+        s->created   += capabilities[i]->spark_stats.created;
+        s->dud       += capabilities[i]->spark_stats.dud;
+        s->overflowed+= capabilities[i]->spark_stats.overflowed;
+        s->converted += capabilities[i]->spark_stats.converted;
+        s->gcd       += capabilities[i]->spark_stats.gcd;
+        s->fizzled   += capabilities[i]->spark_stats.fizzled;
+    }
+}
+#endif
 
 /* -----------------------------------------------------------------------------
    Dumping stuff in the stats file, or via the debug message interface

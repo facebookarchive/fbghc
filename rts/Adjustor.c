@@ -47,7 +47,7 @@ Haskell side.
 #include <string.h>
 #endif
 
-#if defined(i386_HOST_ARCH) && defined(darwin_HOST_OS)
+#if defined(i386_HOST_ARCH)
 extern void adjustorCode(void);
 #elif defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH)
 // from AdjustorAsm.s
@@ -57,16 +57,57 @@ extern void *adjustorCode;
 #endif
 
 #if defined(USE_LIBFFI_FOR_ADJUSTORS)
+/* There are subtle differences between how libffi adjustors work on
+ * different platforms, and the situation is a little complex.
+ * 
+ * HOW ADJUSTORS/CLOSURES WORK ON LIBFFI:
+ * libffi's ffi_closure_alloc() function gives you two pointers to a closure,
+ * 1. the writable pointer, and 2. the executable pointer. You write the
+ * closure into the writable pointer (and ffi_prep_closure_loc() will do this
+ * for you) and you execute it at the executable pointer.
+ *
+ * THE PROBLEM:
+ * The RTS deals only with the executable pointer, but when it comes time to
+ * free the closure, libffi wants the writable pointer back that it gave you
+ * when you allocated it.
+ *
+ * On Linux we solve this problem by storing the address of the writable
+ * mapping into itself, then returning both writable and executable pointers
+ * plus 1 machine word for preparing the closure for use by the RTS (see the
+ * Linux version of allocateExec() in rts/sm/Storage.c). When we want to
+ * recover the writable address, we subtract 1 word from the executable
+ * address and fetch. This works because Linux kernel magic gives us two
+ * pointers with different addresses that refer to the same memory. Whatever
+ * you write into the writeable address can be read back at the executable
+ * address. This method is very efficient.
+ *
+ * On iOS this breaks for two reasons: 1. the two pointers do not refer to
+ * the same memory (so we can't retrieve anything stored into the writable
+ * pointer if we only have the exec pointer), and 2. libffi's
+ * ffi_closure_alloc() assumes the pointer it has returned you is a
+ * ffi_closure structure and treats it as such: It uses that memory to
+ * communicate with ffi_prep_closure_loc(). On Linux by contrast
+ * ffi_closure_alloc() is viewed simply as a memory allocation, and only
+ * ffi_prep_closure_loc() deals in ffi_closure structures. Each of these
+ * differences is enough make the efficient way used on Linux not work on iOS.
+ * Instead on iOS we use hash tables to recover the writable address from the
+ * executable one. This method is conservative and would almost certainly work
+ * on any platform, but on Linux it makes sense to use the faster method.
+ */
 void
 freeHaskellFunctionPtr(void* ptr)
 {
     ffi_closure *cl;
 
+#if defined(ios_HOST_OS)
+    cl = execToWritable(ptr);
+#else
     cl = (ffi_closure*)ptr;
+#endif
     freeStablePtr(cl->user_data);
     stgFree(cl->cif->arg_types);
     stgFree(cl->cif);
-    freeExec(cl);
+    freeExec(ptr);
 }
 
 static ffi_type * char_to_ffi_type(char c)
@@ -111,7 +152,7 @@ createAdjustor (int cconv,
         arg_types[i] = char_to_ffi_type(typeString[i+1]);
     }
     switch (cconv) {
-#ifdef mingw32_HOST_OS
+#if defined(mingw32_HOST_OS) && defined(i386_HOST_ARCH)
     case 0: /* stdcall */
         abi = FFI_STDCALL;
         break;
@@ -131,8 +172,8 @@ createAdjustor (int cconv,
         barf("createAdjustor: failed to allocate memory");
     }
 
-    r = ffi_prep_closure(cl, cif, (void*)wptr, hptr/*userdata*/);
-    if (r != FFI_OK) barf("ffi_prep_closure failed: %d", r);
+    r = ffi_prep_closure_loc(cl, cif, (void*)wptr, hptr/*userdata*/, code);
+    if (r != FFI_OK) barf("ffi_prep_closure_loc failed: %d", r);
 
     return (void*)code;
 }
@@ -152,7 +193,8 @@ createAdjustor (int cconv,
 #else 
 #define UNDERSCORE ""
 #endif
-#if defined(i386_HOST_ARCH) && !defined(darwin_HOST_OS)
+
+#if defined(x86_64_HOST_ARCH)
 /* 
   Now here's something obscure for you:
 
@@ -170,26 +212,18 @@ createAdjustor (int cconv,
   returning in some static piece of memory and arrange
   to return to it before tail jumping from the adjustor thunk.
 */
-static void  GNUC3_ATTRIBUTE(used) obscure_ccall_wrapper(void)
-{
-  __asm__ (
-     ".globl " UNDERSCORE "obscure_ccall_ret_code\n"
-     UNDERSCORE "obscure_ccall_ret_code:\n\t"
-     "addl $0x4, %esp\n\t"
-     "ret"
-   );
-}
-extern void obscure_ccall_ret_code(void);
-
-#endif
-
-#if defined(x86_64_HOST_ARCH)
 static void GNUC3_ATTRIBUTE(used) obscure_ccall_wrapper(void)
 {
   __asm__ (
    ".globl " UNDERSCORE "obscure_ccall_ret_code\n"
    UNDERSCORE "obscure_ccall_ret_code:\n\t"
    "addq $0x8, %rsp\n\t"
+#if defined(mingw32_HOST_OS)
+   /* On Win64, we had to put the original return address after the
+      arg 1-4 spill slots, ro now we have to move it back */
+   "movq 0x20(%rsp), %rcx\n"
+   "movq %rcx, (%rsp)\n"
+#endif
    "ret"
   );
 }
@@ -288,7 +322,7 @@ typedef struct AdjustorStub {
 #endif
 #endif
 
-#if defined(i386_HOST_ARCH) && defined(darwin_HOST_OS)
+#if defined(i386_HOST_ARCH)
 
 /* !!! !!! WARNING: !!! !!!
  * This structure is accessed from AdjustorAsm.s
@@ -304,7 +338,7 @@ typedef struct AdjustorStub {
 } AdjustorStub;
 #endif
 
-#if (defined(i386_HOST_ARCH) && defined(darwin_HOST_OS)) || defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH)
+#if defined(i386_HOST_ARCH) || defined(powerpc_HOST_ARCH) || defined(powerpc64_HOST_ARCH)
 static int totalArgumentSize(char *typeString)
 {
     int sz = 0;
@@ -334,15 +368,15 @@ static int totalArgumentSize(char *typeString)
 
 void*
 createAdjustor(int cconv, StgStablePtr hptr,
-	       StgFunPtr wptr,
-	       char *typeString
+               StgFunPtr wptr,
+               char *typeString
 #if !defined(powerpc_HOST_ARCH) && !defined(powerpc64_HOST_ARCH) && !defined(x86_64_HOST_ARCH)
-	          STG_UNUSED
+                  STG_UNUSED
 #endif
               )
 {
   void *adjustor = NULL;
-  void *code;
+  void *code = NULL;
 
   switch (cconv)
   {
@@ -352,82 +386,42 @@ createAdjustor(int cconv, StgStablePtr hptr,
        the following assembly language snippet
        (offset and machine code prefixed):
 
-     <0>:	58	          popl   %eax              # temp. remove ret addr..
-     <1>:	68 fd fc fe fa    pushl  0xfafefcfd  	   # constant is large enough to
-        			   	           	   # hold a StgStablePtr
-     <6>:	50	          pushl  %eax		   # put back ret. addr
-     <7>:	b8 fa ef ff 00	  movl   $0x00ffeffa, %eax # load up wptr
-     <c>: 	ff e0             jmp    %eax        	   # and jump to it.
-		# the callee cleans up the stack
+     <0>:       58                popl   %eax              # temp. remove ret addr..
+     <1>:       68 fd fc fe fa    pushl  0xfafefcfd        # constant is large enough to
+                                                           # hold a StgStablePtr
+     <6>:       50                pushl  %eax              # put back ret. addr
+     <7>:       b8 fa ef ff 00    movl   $0x00ffeffa, %eax # load up wptr
+     <c>:       ff e0             jmp    %eax              # and jump to it.
+                # the callee cleans up the stack
     */
     adjustor = allocateExec(14,&code);
     {
-	unsigned char *const adj_code = (unsigned char *)adjustor;
-	adj_code[0x00] = (unsigned char)0x58;  /* popl %eax  */
+        unsigned char *const adj_code = (unsigned char *)adjustor;
+        adj_code[0x00] = (unsigned char)0x58;  /* popl %eax  */
 
-	adj_code[0x01] = (unsigned char)0x68;  /* pushl hptr (which is a dword immediate ) */
-	*((StgStablePtr*)(adj_code + 0x02)) = (StgStablePtr)hptr;
+        adj_code[0x01] = (unsigned char)0x68;  /* pushl hptr (which is a dword immediate ) */
+        *((StgStablePtr*)(adj_code + 0x02)) = (StgStablePtr)hptr;
 
-	adj_code[0x06] = (unsigned char)0x50; /* pushl %eax */
+        adj_code[0x06] = (unsigned char)0x50; /* pushl %eax */
 
-	adj_code[0x07] = (unsigned char)0xb8; /* movl  $wptr, %eax */
-	*((StgFunPtr*)(adj_code + 0x08)) = (StgFunPtr)wptr;
+        adj_code[0x07] = (unsigned char)0xb8; /* movl  $wptr, %eax */
+        *((StgFunPtr*)(adj_code + 0x08)) = (StgFunPtr)wptr;
 
-	adj_code[0x0c] = (unsigned char)0xff; /* jmp %eax */
-	adj_code[0x0d] = (unsigned char)0xe0;
+        adj_code[0x0c] = (unsigned char)0xff; /* jmp %eax */
+        adj_code[0x0d] = (unsigned char)0xe0;
     }
 #endif
     break;
 
   case 1: /* _ccall */
-#if defined(i386_HOST_ARCH) && !defined(darwin_HOST_OS)
-  /* Magic constant computed by inspecting the code length of
-     the following assembly language snippet
-     (offset and machine code prefixed):
-
-  <00>: 68 ef be ad de     pushl  $0xdeadbeef  	   # constant is large enough to
-        			   	           # hold a StgStablePtr
-  <05>:	b8 fa ef ff 00	   movl   $0x00ffeffa, %eax # load up wptr
-  <0a>: 68 ef be ad de     pushl  $obscure_ccall_ret_code # push the return address
-  <0f>: ff e0              jmp    *%eax            # jump to wptr
-
-    The ccall'ing version is a tad different, passing in the return
-    address of the caller to the auto-generated C stub (which enters
-    via the stable pointer.) (The auto-generated C stub is in on this
-    game, don't worry :-)
-
-    See the comment next to obscure_ccall_ret_code why we need to
-    perform a tail jump instead of a call, followed by some C stack
-    fixup.
-
-    Note: The adjustor makes the assumption that any return value
-    coming back from the C stub is not stored on the stack.
-    That's (thankfully) the case here with the restricted set of 
-    return types that we support.
-  */
-    adjustor = allocateExec(17,&code);
-    {
-	unsigned char *const adj_code = (unsigned char *)adjustor;
-
-	adj_code[0x00] = (unsigned char)0x68;  /* pushl hptr (which is a dword immediate ) */
-	*((StgStablePtr*)(adj_code+0x01)) = (StgStablePtr)hptr;
-
-	adj_code[0x05] = (unsigned char)0xb8;  /* movl  $wptr, %eax */
-	*((StgFunPtr*)(adj_code + 0x06)) = (StgFunPtr)wptr;
-
-	adj_code[0x0a] = (unsigned char)0x68;  /* pushl obscure_ccall_ret_code */
-	*((StgFunPtr*)(adj_code + 0x0b)) = 
-			(StgFunPtr)obscure_ccall_ret_code;
-
-	adj_code[0x0f] = (unsigned char)0xff; /* jmp *%eax */
-	adj_code[0x10] = (unsigned char)0xe0; 
-    }
-#elif defined(i386_HOST_ARCH) && defined(darwin_HOST_OS)
+#if defined(i386_HOST_ARCH)
     {
         /*
-          What's special about Darwin/Mac OS X on i386?
-          It wants the stack to stay 16-byte aligned.
-          
+          Most of the trickiness here is due to the need to keep the
+          stack pointer 16-byte aligned (see #5250).  That means we
+          can't just push another argument on the stack and call the
+          wrapper, we may have to shuffle the whole argument block.
+
           We offload most of the work to AdjustorAsm.S.
         */
         AdjustorStub *adjustorStub = allocateExec(sizeof(AdjustorStub),&code);
@@ -436,7 +430,7 @@ createAdjustor(int cconv, StgStablePtr hptr,
         int sz = totalArgumentSize(typeString);
         
         adjustorStub->call[0] = 0xe8;
-        *(long*)&adjustorStub->call[1] = ((char*)&adjustorCode) - ((char*)adjustorStub + 5);
+        *(long*)&adjustorStub->call[1] = ((char*)&adjustorCode) - ((char*)code + 5);
         adjustorStub->hptr = hptr;
         adjustorStub->wptr = wptr;
         
@@ -458,13 +452,149 @@ createAdjustor(int cconv, StgStablePtr hptr,
     }
     
 #elif defined(x86_64_HOST_ARCH)
+
+# if defined(mingw32_HOST_OS)
     /*
       stack at call:
                argn
-	       ...
-	       arg7
+               ...
+               arg5
                return address
-	       %rdi,%rsi,%rdx,%rcx,%r8,%r9 = arg0..arg6
+               %rcx,%rdx,%r8,%r9 = arg1..arg4
+
+      if there are <4 integer args, then we can just push the
+      StablePtr into %rcx and shuffle the other args up.
+
+      If there are >=4 integer args, then we have to flush one arg
+      to the stack, and arrange to adjust the stack ptr on return.
+      The stack will be rearranged to this:
+
+             argn
+             ...
+             arg5
+             return address  *** <-- dummy arg in stub fn.
+             arg4
+             obscure_ccall_ret_code
+
+      This unfortunately means that the type of the stub function
+      must have a dummy argument for the original return address
+      pointer inserted just after the 4th integer argument.
+
+      Code for the simple case:
+
+   0:   4d 89 c1                mov    %r8,%r9
+   3:   49 89 d0                mov    %rdx,%r8
+   6:   48 89 ca                mov    %rcx,%rdx
+   9:   f2 0f 10 da             movsd  %xmm2,%xmm3
+   d:   f2 0f 10 d1             movsd  %xmm1,%xmm2
+  11:   f2 0f 10 c8             movsd  %xmm0,%xmm1
+  15:   48 8b 0d 0c 00 00 00    mov    0xc(%rip),%rcx    # 28 <.text+0x28>
+  1c:   ff 25 0e 00 00 00       jmpq   *0xe(%rip)        # 30 <.text+0x30>
+  22:   90                      nop
+  [...]
+
+
+  And the version for >=4 integer arguments:
+
+[we want to push the 4th argument (either %r9 or %xmm3, depending on
+ whether it is a floating arg or not) and the return address onto the
+ stack. However, slots 1-4 are reserved for code we call to spill its
+ args 1-4 into, so we can't just push them onto the bottom of the stack.
+ So first put the 4th argument onto the stack, above what will be the
+ spill slots.]
+   0:   48 83 ec 08             sub    $0x8,%rsp
+[if non-floating arg, then do this:]
+   4:   90                      nop
+   5:   4c 89 4c 24 20          mov    %r9,0x20(%rsp)
+[else if floating arg then do this:]
+   4:   f2 0f 11 5c 24 20       movsd  %xmm3,0x20(%rsp)
+[end if]
+[Now push the new return address onto the stack]
+   a:   ff 35 30 00 00 00       pushq  0x30(%rip)        # 40 <.text+0x40>
+[But the old return address has been moved up into a spill slot, so
+ we need to move it above them]
+  10:   4c 8b 4c 24 10          mov    0x10(%rsp),%r9
+  15:   4c 89 4c 24 30          mov    %r9,0x30(%rsp)
+[Now we do the normal register shuffle-up etc]
+  1a:   4d 89 c1                mov    %r8,%r9
+  1d:   49 89 d0                mov    %rdx,%r8
+  20:   48 89 ca                mov    %rcx,%rdx
+  23:   f2 0f 10 da             movsd  %xmm2,%xmm3
+  27:   f2 0f 10 d1             movsd  %xmm1,%xmm2
+  2b:   f2 0f 10 c8             movsd  %xmm0,%xmm1
+  2f:   48 8b 0d 12 00 00 00    mov    0x12(%rip),%rcx        # 48 <.text+0x48>
+  36:   ff 25 14 00 00 00       jmpq   *0x14(%rip)        # 50 <.text+0x50>
+  3c:   90                      nop
+  3d:   90                      nop
+  3e:   90                      nop
+  3f:   90                      nop
+  [...]
+
+    */
+    {  
+        StgWord8 *adj_code;
+
+        // determine whether we have 4 or more integer arguments,
+        // and therefore need to flush one to the stack.
+        if ((typeString[0] == '\0') ||
+            (typeString[1] == '\0') ||
+            (typeString[2] == '\0') ||
+            (typeString[3] == '\0')) {
+
+            adjustor = allocateExec(0x38,&code);
+            adj_code = (StgWord8*)adjustor;
+
+            *(StgInt32 *)adj_code        = 0x49c1894d;
+            *(StgInt32 *)(adj_code+0x4)  = 0x8948d089;
+            *(StgInt32 *)(adj_code+0x8)  = 0x100ff2ca;
+            *(StgInt32 *)(adj_code+0xc)  = 0x100ff2da;
+            *(StgInt32 *)(adj_code+0x10) = 0x100ff2d1;
+            *(StgInt32 *)(adj_code+0x14) = 0x0d8b48c8;
+            *(StgInt32 *)(adj_code+0x18) = 0x0000000c;
+
+            *(StgInt32 *)(adj_code+0x1c) = 0x000e25ff;
+            *(StgInt32 *)(adj_code+0x20) = 0x00000000;
+            *(StgInt64 *)(adj_code+0x28) = (StgInt64)hptr;
+            *(StgInt64 *)(adj_code+0x30) = (StgInt64)wptr;
+        }
+        else
+        {
+            int fourthFloating;
+
+            fourthFloating = (typeString[3] == 'f' || typeString[3] == 'd');
+            adjustor = allocateExec(0x58,&code);
+            adj_code = (StgWord8*)adjustor;
+            *(StgInt32 *)adj_code        = 0x08ec8348;
+            *(StgInt32 *)(adj_code+0x4)  = fourthFloating ? 0x5c110ff2
+                                                          : 0x4c894c90;
+            *(StgInt32 *)(adj_code+0x8)  = 0x35ff2024;
+            *(StgInt32 *)(adj_code+0xc)  = 0x00000030;
+            *(StgInt32 *)(adj_code+0x10) = 0x244c8b4c;
+            *(StgInt32 *)(adj_code+0x14) = 0x4c894c10;
+            *(StgInt32 *)(adj_code+0x18) = 0x894d3024;
+            *(StgInt32 *)(adj_code+0x1c) = 0xd08949c1;
+            *(StgInt32 *)(adj_code+0x20) = 0xf2ca8948;
+            *(StgInt32 *)(adj_code+0x24) = 0xf2da100f;
+            *(StgInt32 *)(adj_code+0x28) = 0xf2d1100f;
+            *(StgInt32 *)(adj_code+0x2c) = 0x48c8100f;
+            *(StgInt32 *)(adj_code+0x30) = 0x00120d8b;
+            *(StgInt32 *)(adj_code+0x34) = 0x25ff0000;
+            *(StgInt32 *)(adj_code+0x38) = 0x00000014;
+            *(StgInt32 *)(adj_code+0x3c) = 0x90909090;
+            *(StgInt64 *)(adj_code+0x40) = (StgInt64)obscure_ccall_ret_code;
+            *(StgInt64 *)(adj_code+0x48) = (StgInt64)hptr;
+            *(StgInt64 *)(adj_code+0x50) = (StgInt64)wptr;
+        }
+    }
+
+# else
+    /*
+      stack at call:
+               argn
+               ...
+               arg7
+               return address
+               %rdi,%rsi,%rdx,%rcx,%r8,%r9 = arg1..arg6
 
       if there are <6 integer args, then we can just push the
       StablePtr into %edi and shuffle the other args up.
@@ -474,11 +604,11 @@ createAdjustor(int cconv, StgStablePtr hptr,
       The stack will be rearranged to this:
 
              argn
-	     ...
-	     arg7
-	     return address  *** <-- dummy arg in stub fn.
-	     arg6
-	     obscure_ccall_ret_code
+             ...
+             arg7
+             return address  *** <-- dummy arg in stub fn.
+             arg6
+             obscure_ccall_ret_code
 
       This unfortunately means that the type of the stub function
       must have a dummy argument for the original return address
@@ -516,51 +646,54 @@ createAdjustor(int cconv, StgStablePtr hptr,
     */
 
     {  
-	int i = 0;
-	char *c;
-	StgWord8 *adj_code;
+        int i = 0;
+        char *c;
+        StgWord8 *adj_code;
 
-	// determine whether we have 6 or more integer arguments,
-	// and therefore need to flush one to the stack.
-	for (c = typeString; *c != '\0'; c++) {
-	    if (*c != 'f' && *c != 'd') i++;
-	    if (i == 6) break;
-	}
+        // determine whether we have 6 or more integer arguments,
+        // and therefore need to flush one to the stack.
+        for (c = typeString; *c != '\0'; c++) {
+            if (*c != 'f' && *c != 'd') i++;
+            if (i == 6) break;
+        }
 
-	if (i < 6) {
-	    adjustor = allocateExec(0x30,&code);
+        if (i < 6) {
+            adjustor = allocateExec(0x30,&code);
             adj_code = (StgWord8*)adjustor;
 
-	    *(StgInt32 *)adj_code        = 0x49c1894d;
-	    *(StgInt32 *)(adj_code+0x4)  = 0x8948c889;
-	    *(StgInt32 *)(adj_code+0x8)  = 0xf28948d1;
-	    *(StgInt32 *)(adj_code+0xc)  = 0x48fe8948;
-	    *(StgInt32 *)(adj_code+0x10) = 0x000a3d8b;
-	    *(StgInt32 *)(adj_code+0x14) = 0x25ff0000;
-	    *(StgInt32 *)(adj_code+0x18) = 0x0000000c;
-	    *(StgInt64 *)(adj_code+0x20) = (StgInt64)hptr;
-	    *(StgInt64 *)(adj_code+0x28) = (StgInt64)wptr;
-	}
-	else
-	{
-	    adjustor = allocateExec(0x40,&code);
+            *(StgInt32 *)adj_code        = 0x49c1894d;
+            *(StgInt32 *)(adj_code+0x4)  = 0x8948c889;
+            *(StgInt32 *)(adj_code+0x8)  = 0xf28948d1;
+            *(StgInt32 *)(adj_code+0xc)  = 0x48fe8948;
+            *(StgInt32 *)(adj_code+0x10) = 0x000a3d8b;
+            *(StgInt32 *)(adj_code+0x14) = 0x25ff0000;
+            *(StgInt32 *)(adj_code+0x18) = 0x0000000c;
+            *(StgInt64 *)(adj_code+0x20) = (StgInt64)hptr;
+            *(StgInt64 *)(adj_code+0x28) = (StgInt64)wptr;
+        }
+        else
+        {
+            adjustor = allocateExec(0x40,&code);
             adj_code = (StgWord8*)adjustor;
 
-	    *(StgInt32 *)adj_code        = 0x35ff5141;
-	    *(StgInt32 *)(adj_code+0x4)  = 0x00000020;
-	    *(StgInt32 *)(adj_code+0x8)  = 0x49c1894d;
-	    *(StgInt32 *)(adj_code+0xc)  = 0x8948c889;
-	    *(StgInt32 *)(adj_code+0x10) = 0xf28948d1;
-	    *(StgInt32 *)(adj_code+0x14) = 0x48fe8948;
-	    *(StgInt32 *)(adj_code+0x18) = 0x00123d8b;
-	    *(StgInt32 *)(adj_code+0x1c) = 0x25ff0000;
-	    *(StgInt32 *)(adj_code+0x20) = 0x00000014;
-	    
-	    *(StgInt64 *)(adj_code+0x28) = (StgInt64)obscure_ccall_ret_code;
-	    *(StgInt64 *)(adj_code+0x30) = (StgInt64)hptr;
-	    *(StgInt64 *)(adj_code+0x38) = (StgInt64)wptr;
-	}
+            *(StgInt32 *)adj_code        = 0x35ff5141;
+            *(StgInt32 *)(adj_code+0x4)  = 0x00000020;
+            *(StgInt32 *)(adj_code+0x8)  = 0x49c1894d;
+            *(StgInt32 *)(adj_code+0xc)  = 0x8948c889;
+            *(StgInt32 *)(adj_code+0x10) = 0xf28948d1;
+            *(StgInt32 *)(adj_code+0x14) = 0x48fe8948;
+            *(StgInt32 *)(adj_code+0x18) = 0x00123d8b;
+            *(StgInt32 *)(adj_code+0x1c) = 0x25ff0000;
+            *(StgInt32 *)(adj_code+0x20) = 0x00000014;
+            
+            *(StgInt64 *)(adj_code+0x28) = (StgInt64)obscure_ccall_ret_code;
+            *(StgInt64 *)(adj_code+0x30) = (StgInt64)hptr;
+            *(StgInt64 *)(adj_code+0x38) = (StgInt64)wptr;
+        }
     }
+# endif
+
+
 #elif defined(sparc_HOST_ARCH)
   /* Magic constant computed by inspecting the code length of the following
      assembly language snippet (offset and machine code prefixed):
@@ -632,14 +765,14 @@ createAdjustor(int cconv, StgStablePtr hptr,
      (offset and machine code prefixed; note that the machine code
      shown is longwords stored in little-endian order):
 
-  <00>: 46520414	mov	a2, a4
-  <04>: 46100412	mov	a0, a2
-  <08>: a61b0020	ldq     a0, 0x20(pv)	# load up hptr
-  <0c>: 46730415	mov	a3, a5
-  <10>: a77b0028	ldq     pv, 0x28(pv)	# load up wptr
-  <14>: 46310413	mov	a1, a3
-  <18>: 6bfb----	jmp     (pv), <hint>	# jump to wptr (with hint)
-  <1c>: 00000000				# padding for alignment
+  <00>: 46520414        mov     a2, a4
+  <04>: 46100412        mov     a0, a2
+  <08>: a61b0020        ldq     a0, 0x20(pv)    # load up hptr
+  <0c>: 46730415        mov     a3, a5
+  <10>: a77b0028        ldq     pv, 0x28(pv)    # load up wptr
+  <14>: 46310413        mov     a1, a3
+  <18>: 6bfb----        jmp     (pv), <hint>    # jump to wptr (with hint)
+  <1c>: 00000000                                # padding for alignment
   <20>: [8 bytes for hptr quadword]
   <28>: [8 bytes for wptr quadword]
 
@@ -670,19 +803,19 @@ TODO: Depending on how much allocation overhead stgMallocBytes uses for
     ASSERT(((StgWord64)wptr & 3) == 0);
     adjustor = allocateExec(48,&code);
     {
-	StgWord64 *const code = (StgWord64 *)adjustor;
+        StgWord64 *const code = (StgWord64 *)adjustor;
 
-	code[0] = 0x4610041246520414L;
-	code[1] = 0x46730415a61b0020L;
-	code[2] = 0x46310413a77b0028L;
-	code[3] = 0x000000006bfb0000L
-		| (((StgWord32*)(wptr) - (StgWord32*)(code) - 3) & 0x3fff);
+        code[0] = 0x4610041246520414L;
+        code[1] = 0x46730415a61b0020L;
+        code[2] = 0x46310413a77b0028L;
+        code[3] = 0x000000006bfb0000L
+                | (((StgWord32*)(wptr) - (StgWord32*)(code) - 3) & 0x3fff);
 
-	code[4] = (StgWord64)hptr;
-	code[5] = (StgWord64)wptr;
+        code[4] = (StgWord64)hptr;
+        code[5] = (StgWord64)wptr;
 
-	/* Ensure that instruction cache is consistent with our new code */
-	__asm__ volatile("call_pal %0" : : "i" (PAL_imb));
+        /* Ensure that instruction cache is consistent with our new code */
+        __asm__ volatile("call_pal %0" : : "i" (PAL_imb));
     }
 #elif defined(powerpc_HOST_ARCH) && defined(linux_HOST_OS)
 
@@ -1012,82 +1145,82 @@ TODO: Depending on how much allocation overhead stgMallocBytes uses for
     The function descriptor we create contains the gp of the target function
     so gp is already loaded correctly.
 
-	[MLX]       alloc r16=ar.pfs,10,2,0
-		    movl r17=wptr
-	[MII]       st8.spill [r12]=r38,8		// spill in6 (out4)
-		    mov r41=r37				// out7 = in5 (out3)
-		    mov r40=r36;;			// out6 = in4 (out2)
-	[MII]       st8.spill [r12]=r39			// spill in7 (out5)
-		    mov.sptk b6=r17,50
-		    mov r38=r34;;			// out4 = in2 (out0)
-	[MII]       mov r39=r35				// out5 = in3 (out1)
-		    mov r37=r33				// out3 = in1 (loc1)
-		    mov r36=r32				// out2 = in0 (loc0)
-	[MLX]       adds r12=-24,r12			// update sp
-		    movl r34=hptr;;			// out0 = hptr
-	[MIB]       mov r33=r16				// loc1 = ar.pfs
-		    mov r32=b0				// loc0 = retaddr
-		    br.call.sptk.many b0=b6;;
+        [MLX]       alloc r16=ar.pfs,10,2,0
+                    movl r17=wptr
+        [MII]       st8.spill [r12]=r38,8               // spill in6 (out4)
+                    mov r41=r37                         // out7 = in5 (out3)
+                    mov r40=r36;;                       // out6 = in4 (out2)
+        [MII]       st8.spill [r12]=r39                 // spill in7 (out5)
+                    mov.sptk b6=r17,50
+                    mov r38=r34;;                       // out4 = in2 (out0)
+        [MII]       mov r39=r35                         // out5 = in3 (out1)
+                    mov r37=r33                         // out3 = in1 (loc1)
+                    mov r36=r32                         // out2 = in0 (loc0)
+        [MLX]       adds r12=-24,r12                    // update sp
+                    movl r34=hptr;;                     // out0 = hptr
+        [MIB]       mov r33=r16                         // loc1 = ar.pfs
+                    mov r32=b0                          // loc0 = retaddr
+                    br.call.sptk.many b0=b6;;
 
-	[MII]       adds r12=-16,r12
-		    mov b0=r32
-		    mov.i ar.pfs=r33
-	[MFB]       nop.m 0x0
-		    nop.f 0x0
-		    br.ret.sptk.many b0;;
+        [MII]       adds r12=-16,r12
+                    mov b0=r32
+                    mov.i ar.pfs=r33
+        [MFB]       nop.m 0x0
+                    nop.f 0x0
+                    br.ret.sptk.many b0;;
 */
 
 /* These macros distribute a long constant into the two words of an MLX bundle */
-#define BITS(val,start,count)	(((val) >> (start)) & ((1 << (count))-1))
-#define MOVL_LOWORD(val)	(BITS(val,22,18) << 46)
-#define MOVL_HIWORD(val)	( (BITS(val,0,7)    << 36)	\
-				| (BITS(val,7,9)    << 50)	\
-				| (BITS(val,16,5)   << 45)	\
-				| (BITS(val,21,1)   << 44)	\
-				| (BITS(val,40,23))		\
-				| (BITS(val,63,1)    << 59))
+#define BITS(val,start,count)   (((val) >> (start)) & ((1 << (count))-1))
+#define MOVL_LOWORD(val)        (BITS(val,22,18) << 46)
+#define MOVL_HIWORD(val)        ( (BITS(val,0,7)    << 36)      \
+                                | (BITS(val,7,9)    << 50)      \
+                                | (BITS(val,16,5)   << 45)      \
+                                | (BITS(val,21,1)   << 44)      \
+                                | (BITS(val,40,23))             \
+                                | (BITS(val,63,1)    << 59))
 
     {
-	StgStablePtr stable;
-	IA64FunDesc *wdesc = (IA64FunDesc *)wptr;
-	StgWord64 wcode = wdesc->ip;
-	IA64FunDesc *fdesc;
-	StgWord64 *code;
+        StgStablePtr stable;
+        IA64FunDesc *wdesc = (IA64FunDesc *)wptr;
+        StgWord64 wcode = wdesc->ip;
+        IA64FunDesc *fdesc;
+        StgWord64 *code;
 
-	/* we allocate on the Haskell heap since malloc'd memory isn't
-	 * executable - argh */
-	/* Allocated memory is word-aligned (8 bytes) but functions on ia64
-	 * must be aligned to 16 bytes.  We allocate an extra 8 bytes of
-	 * wiggle room so that we can put the code on a 16 byte boundary. */
-	adjustor = stgAllocStable(sizeof(IA64FunDesc)+18*8+8, &stable);
+        /* we allocate on the Haskell heap since malloc'd memory isn't
+         * executable - argh */
+        /* Allocated memory is word-aligned (8 bytes) but functions on ia64
+         * must be aligned to 16 bytes.  We allocate an extra 8 bytes of
+         * wiggle room so that we can put the code on a 16 byte boundary. */
+        adjustor = stgAllocStable(sizeof(IA64FunDesc)+18*8+8, &stable);
 
-	fdesc = (IA64FunDesc *)adjustor;
-	code = (StgWord64 *)(fdesc + 1);
-	/* add 8 bytes to code if needed to align to a 16-byte boundary */
-	if ((StgWord64)code & 15) code++;
-	fdesc->ip = (StgWord64)code;
-	fdesc->gp = wdesc->gp;
+        fdesc = (IA64FunDesc *)adjustor;
+        code = (StgWord64 *)(fdesc + 1);
+        /* add 8 bytes to code if needed to align to a 16-byte boundary */
+        if ((StgWord64)code & 15) code++;
+        fdesc->ip = (StgWord64)code;
+        fdesc->gp = wdesc->gp;
 
-	code[0]  = 0x0000058004288004 | MOVL_LOWORD(wcode);
-	code[1]  = 0x6000000220000000 | MOVL_HIWORD(wcode);
-	code[2]  = 0x029015d818984001;
-	code[3]  = 0x8401200500420094;
-	code[4]  = 0x886011d8189c0001;
-	code[5]  = 0x84011004c00380c0;
-	code[6]  = 0x0250210046013800;
-	code[7]  = 0x8401000480420084;
-	code[8]  = 0x0000233f19a06005 | MOVL_LOWORD((StgWord64)hptr);
-	code[9]  = 0x6000000440000000 | MOVL_HIWORD((StgWord64)hptr);
-	code[10] = 0x0200210020010811;
-	code[11] = 0x1080006800006200;
-	code[12] = 0x0000210018406000;
-	code[13] = 0x00aa021000038005;
-	code[14] = 0x000000010000001d;
-	code[15] = 0x0084000880000200;
+        code[0]  = 0x0000058004288004 | MOVL_LOWORD(wcode);
+        code[1]  = 0x6000000220000000 | MOVL_HIWORD(wcode);
+        code[2]  = 0x029015d818984001;
+        code[3]  = 0x8401200500420094;
+        code[4]  = 0x886011d8189c0001;
+        code[5]  = 0x84011004c00380c0;
+        code[6]  = 0x0250210046013800;
+        code[7]  = 0x8401000480420084;
+        code[8]  = 0x0000233f19a06005 | MOVL_LOWORD((StgWord64)hptr);
+        code[9]  = 0x6000000440000000 | MOVL_HIWORD((StgWord64)hptr);
+        code[10] = 0x0200210020010811;
+        code[11] = 0x1080006800006200;
+        code[12] = 0x0000210018406000;
+        code[13] = 0x00aa021000038005;
+        code[14] = 0x000000010000001d;
+        code[15] = 0x0084000880000200;
 
-	/* save stable pointers in convenient form */
-	code[16] = (StgWord64)hptr;
-	code[17] = (StgWord64)stable;
+        /* save stable pointers in convenient form */
+        code[16] = (StgWord64)hptr;
+        code[17] = (StgWord64)stable;
     }
 #else
     barf("adjustor creation not supported on this platform");
@@ -1107,30 +1240,34 @@ TODO: Depending on how much allocation overhead stgMallocBytes uses for
 void
 freeHaskellFunctionPtr(void* ptr)
 {
-#if defined(i386_HOST_ARCH) && !defined(darwin_HOST_OS)
- if ( *(unsigned char*)ptr != 0x68 &&
+#if defined(i386_HOST_ARCH)
+ if ( *(unsigned char*)ptr != 0xe8 &&
       *(unsigned char*)ptr != 0x58 ) {
    errorBelch("freeHaskellFunctionPtr: not for me, guv! %p\n", ptr);
    return;
  }
-
- /* Free the stable pointer first..*/
- if (*(unsigned char*)ptr == 0x68) { /* Aha, a ccall adjustor! */
-    freeStablePtr(*((StgStablePtr*)((unsigned char*)ptr + 0x01)));
+ if (*(unsigned char*)ptr == 0xe8) { /* Aha, a ccall adjustor! */
+     freeStablePtr(((AdjustorStub*)ptr)->hptr);
  } else {
     freeStablePtr(*((StgStablePtr*)((unsigned char*)ptr + 0x02)));
  }
-#elif defined(i386_HOST_ARCH) && defined(darwin_HOST_OS)
-if ( *(unsigned char*)ptr != 0xe8 ) {
-   errorBelch("freeHaskellFunctionPtr: not for me, guv! %p\n", ptr);
-   return;
- }
- freeStablePtr(((AdjustorStub*)ptr)->hptr);
 #elif defined(x86_64_HOST_ARCH)
  if ( *(StgWord16 *)ptr == 0x894d ) {
-     freeStablePtr(*(StgStablePtr*)((StgWord8*)ptr+0x20));
+     freeStablePtr(*(StgStablePtr*)((StgWord8*)ptr+
+#if defined(mingw32_HOST_OS)
+                                                   0x28
+#else
+                                                   0x20
+#endif
+                                                       ));
+#if !defined(mingw32_HOST_OS)
  } else if ( *(StgWord16 *)ptr == 0x5141 ) {
      freeStablePtr(*(StgStablePtr*)((StgWord8*)ptr+0x30));
+#endif
+#if defined(mingw32_HOST_OS)
+ } else if ( *(StgWord16 *)ptr == 0x8348 ) {
+     freeStablePtr(*(StgStablePtr*)((StgWord8*)ptr+0x48));
+#endif
  } else {
    errorBelch("freeHaskellFunctionPtr: not for me, guv! %p\n", ptr);
    return;

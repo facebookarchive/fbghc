@@ -4,7 +4,7 @@ Using the GHC build system
 
 For a "Getting Started" guide, see:
 
-  http://hackage.haskell.org/trac/ghc/wiki/Building/Hacking
+  http://ghc.haskell.org/trac/ghc/wiki/Building/Hacking
 
 Common commands:
 
@@ -24,12 +24,6 @@ Common commands:
   cd <dir>; make help
 
      Shows the targets available in <dir>
-
-  make html
-  make pdf
-  make ps
-
-     Make documentation
 
   make install
 

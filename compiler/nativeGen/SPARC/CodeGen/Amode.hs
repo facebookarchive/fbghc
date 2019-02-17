@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module SPARC.CodeGen.Amode (
 	getAmode
 )
@@ -15,7 +22,7 @@ import SPARC.Base
 import NCGMonad
 import Size
 
-import OldCmm
+import Cmm
 
 import OrdList
 
@@ -26,7 +33,8 @@ getAmode
 	-> NatM Amode
 
 getAmode tree@(CmmRegOff _ _) 
-	= getAmode (mangleIndexTree tree)
+    = do dflags <- getDynFlags
+         getAmode (mangleIndexTree dflags tree)
 
 getAmode (CmmMachOp (MO_Sub _) [x, CmmLit (CmmInt i _)])
   | fits13Bits (-i)

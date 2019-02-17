@@ -17,44 +17,44 @@ Haskell).
 
 \begin{code}
 {-# LANGUAGE BangPatterns #-}
+
 module Unique (
         -- * Main data types
-	Unique, Uniquable(..), 
-	
-	-- ** Constructors, desctructors and operations on 'Unique's
-	hasKey,
+        Unique, Uniquable(..),
 
-	pprUnique, 
+        -- ** Constructors, desctructors and operations on 'Unique's
+        hasKey,
 
-	mkUniqueGrimily,		-- Used in UniqSupply only!
-	getKey, getKeyFastInt,		-- Used in Var, UniqFM, Name only!
+        pprUnique,
 
-	incrUnique,			-- Used for renumbering
-	deriveUnique,			-- Ditto
-	newTagUnique,			-- Used in CgCase
-	initTyVarUnique,
+        mkUniqueGrimily,                -- Used in UniqSupply only!
+        getKey, getKeyFastInt,          -- Used in Var, UniqFM, Name only!
+        mkUnique, unpkUnique,           -- Used in BinIface only
 
-	isTupleKey, 
+        incrUnique,                     -- Used for renumbering
+        deriveUnique,                   -- Ditto
+        newTagUnique,                   -- Used in CgCase
+        initTyVarUnique,
 
         -- ** Making built-in uniques
 
-	-- now all the built-in Uniques (and functions to make them)
-	-- [the Oh-So-Wonderful Haskell module system wins again...]
-	mkAlphaTyVarUnique,
-	mkPrimOpIdUnique,
-	mkTupleTyConUnique, mkTupleDataConUnique,
-	mkPreludeMiscIdUnique, mkPreludeDataConUnique,
-	mkPreludeTyConUnique, mkPreludeClassUnique,
-	mkPArrDataConUnique,
+        -- now all the built-in Uniques (and functions to make them)
+        -- [the Oh-So-Wonderful Haskell module system wins again...]
+        mkAlphaTyVarUnique,
+        mkPrimOpIdUnique,
+        mkTupleTyConUnique, mkTupleDataConUnique,
+        mkPreludeMiscIdUnique, mkPreludeDataConUnique,
+        mkPreludeTyConUnique, mkPreludeClassUnique,
+        mkPArrDataConUnique,
 
-        mkVarOccUnique, mkDataOccUnique, mkTvOccUnique, mkTcOccUnique,
+    mkVarOccUnique, mkDataOccUnique, mkTvOccUnique, mkTcOccUnique,
         mkRegSingleUnique, mkRegPairUnique, mkRegClassUnique, mkRegSubUnique,
+        mkCostCentreUnique,
 
-	mkBuiltinUnique,
-	mkPseudoUniqueC,
-	mkPseudoUniqueD,
-	mkPseudoUniqueE,
-	mkPseudoUniqueH
+        mkBuiltinUnique,
+        mkPseudoUniqueD,
+        mkPseudoUniqueE,
+        mkPseudoUniqueH
     ) where
 
 #include "HsVersions.h"
@@ -64,6 +64,7 @@ import FastTypes
 import FastString
 import Outputable
 -- import StaticFlags
+import Util
 
 #if defined(__GLASGOW_HASKELL__)
 --just for implementing a fast [0,61) -> Char function
@@ -71,13 +72,13 @@ import GHC.Exts (indexCharOffAddr#, Char(..))
 #else
 import Data.Array
 #endif
-import Data.Char	( chr, ord )
+import Data.Char        ( chr, ord )
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[Unique-type]{@Unique@ type and operations}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 The @Chars@ are ``tag letters'' that identify the @UniqueSupply@.
@@ -96,17 +97,15 @@ Now come the functions which construct uniques from their pieces, and vice versa
 The stuff about unique *supplies* is handled further down this module.
 
 \begin{code}
-unpkUnique	:: Unique -> (Char, Int)	-- The reverse
+unpkUnique      :: Unique -> (Char, Int)        -- The reverse
 
-mkUniqueGrimily :: Int -> Unique		-- A trap-door for UniqSupply
-getKey		:: Unique -> Int		-- for Var
-getKeyFastInt	:: Unique -> FastInt		-- for Var
+mkUniqueGrimily :: Int -> Unique                -- A trap-door for UniqSupply
+getKey          :: Unique -> Int                -- for Var
+getKeyFastInt   :: Unique -> FastInt            -- for Var
 
-incrUnique	:: Unique -> Unique
-deriveUnique	:: Unique -> Int -> Unique
-newTagUnique	:: Unique -> Char -> Unique
-
-isTupleKey	:: Unique -> Bool
+incrUnique      :: Unique -> Unique
+deriveUnique    :: Unique -> Int -> Unique
+newTagUnique    :: Unique -> Char -> Unique
 \end{code}
 
 
@@ -133,8 +132,8 @@ newTagUnique u c = mkUnique c i where (_,i) = unpkUnique u
 
 -- and as long as the Char fits in 8 bits, which we assume anyway!
 
-mkUnique :: Char -> Int -> Unique	-- Builds a unique from pieces
--- NOT EXPORTED, so that we can see all the Chars that 
+mkUnique :: Char -> Int -> Unique       -- Builds a unique from pieces
+-- NOT EXPORTED, so that we can see all the Chars that
 --               are used in this one module
 mkUnique c i
   = MkUnique (tag `bitOrFastInt` bits)
@@ -144,10 +143,10 @@ mkUnique c i
 
 unpkUnique (MkUnique u)
   = let
-	-- as long as the Char may have its eighth bit set, we
-	-- really do need the logical right-shift here!
-	tag = cBox (fastChr (u `shiftRLFastInt` _ILIT(24)))
-	i   = iBox (u `bitAndFastInt` _ILIT(16777215){-``0x00ffffff''-})
+        -- as long as the Char may have its eighth bit set, we
+        -- really do need the logical right-shift here!
+        tag = cBox (fastChr (u `shiftRLFastInt` _ILIT(24)))
+        i   = iBox (u `bitAndFastInt` _ILIT(16777215){-``0x00ffffff''-})
     in
     (tag, i)
 \end{code}
@@ -155,9 +154,9 @@ unpkUnique (MkUnique u)
 
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[Uniquable-class]{The @Uniquable@ class}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 \begin{code}
@@ -165,8 +164,8 @@ unpkUnique (MkUnique u)
 class Uniquable a where
     getUnique :: a -> Unique
 
-hasKey		:: Uniquable a => a -> Unique -> Bool
-x `hasKey` k	= getUnique x == k
+hasKey          :: Uniquable a => a -> Unique -> Bool
+x `hasKey` k    = getUnique x == k
 
 instance Uniquable FastString where
  getUnique fs = mkUniqueGrimily (iBox (uniqueOfFS fs))
@@ -177,9 +176,9 @@ instance Uniquable Int where
 
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[Unique-instances]{Instance declarations for @Unique@}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 And the whole point (besides uniqueness) is fast equality.  We don't
@@ -214,39 +213,32 @@ instance Uniquable Unique where
 
 We do sometimes make strings with @Uniques@ in them:
 \begin{code}
+showUnique :: Unique -> String
+showUnique uniq
+  = case unpkUnique uniq of
+      (tag, u) -> finish_show tag u (iToBase62 u)
+
+finish_show :: Char -> Int -> String -> String
+finish_show 't' u _pp_u | u < 26
+  = -- Special case to make v common tyvars, t1, t2, ...
+    -- come out as a, b, ... (shorter, easier to read)
+    [chr (ord 'a' + u)]
+finish_show tag _ pp_u = tag : pp_u
+
 pprUnique :: Unique -> SDoc
-pprUnique uniq
---   | opt_SuppressUniques
---  = empty	-- Used exclusively to suppress uniques so you 
---  | otherwise	-- can compare output easily
-  = case unpkUnique uniq of
-      (tag, u) -> finish_ppr tag u (text (iToBase62 u))
-
-#ifdef UNUSED
-pprUnique10 :: Unique -> SDoc
-pprUnique10 uniq	-- in base-10, dudes
-  = case unpkUnique uniq of
-      (tag, u) -> finish_ppr tag u (int u)
-#endif
-
-finish_ppr :: Char -> Int -> SDoc -> SDoc
-finish_ppr 't' u _pp_u | u < 26
-  =	-- Special case to make v common tyvars, t1, t2, ...
-	-- come out as a, b, ... (shorter, easier to read)
-    char (chr (ord 'a' + u))
-finish_ppr tag _ pp_u = char tag <> pp_u
+pprUnique u = text (showUnique u)
 
 instance Outputable Unique where
-    ppr u = pprUnique u
+    ppr = pprUnique
 
 instance Show Unique where
-    showsPrec p uniq = showsPrecSDoc p (pprUnique uniq)
+    show uniq = showUnique uniq
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[Utils-base62]{Base-62 numbers}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 A character-stingy way to read/write numbers (notably Uniques).
@@ -259,12 +251,12 @@ iToBase62 n_
   = ASSERT(n_ >= 0) go (iUnbox n_) ""
   where
     go n cs | n <# _ILIT(62)
-	     = case chooseChar62 n of { c -> c `seq` (c : cs) }
-	     | otherwise
-	     =	case (quotRem (iBox n) 62) of { (q_, r_) ->
+             = case chooseChar62 n of { c -> c `seq` (c : cs) }
+             | otherwise
+             =  case (quotRem (iBox n) 62) of { (q_, r_) ->
                 case iUnbox q_ of { q -> case iUnbox r_ of { r ->
-		case (chooseChar62 r) of { c -> c `seq`
-		(go q (c : cs)) }}}}
+                case (chooseChar62 r) of { c -> c `seq`
+                (go q (c : cs)) }}}}
 
     chooseChar62 :: FastInt -> Char
     {-# INLINE chooseChar62 #-}
@@ -280,37 +272,37 @@ iToBase62 n_
 \end{code}
 
 %************************************************************************
-%*									*
+%*                                                                      *
 \subsection[Uniques-prelude]{@Uniques@ for wired-in Prelude things}
-%*									*
+%*                                                                      *
 %************************************************************************
 
 Allocation of unique supply characters:
-	v,t,u : for renumbering value-, type- and usage- vars.
-	B:   builtin
-	C-E: pseudo uniques	(used in native-code generator)
-	X:   uniques derived by deriveUnique
-	_:   unifiable tyvars   (above)
-	0-9: prelude things below
-	     (no numbers left any more..)
-	::   (prelude) parallel array data constructors
+        v,t,u : for renumbering value-, type- and usage- vars.
+        B:   builtin
+        C-E: pseudo uniques     (used in native-code generator)
+        X:   uniques derived by deriveUnique
+        _:   unifiable tyvars   (above)
+        0-9: prelude things below
+             (no numbers left any more..)
+        ::   (prelude) parallel array data constructors
 
-	other a-z: lower case chars for unique supplies.  Used so far:
+        other a-z: lower case chars for unique supplies.  Used so far:
 
-	d	desugarer
-	f	AbsC flattener
-	g	SimplStg
-	n	Native codegen
-	r	Hsc name cache
-	s	simplifier
+        d       desugarer
+        f       AbsC flattener
+        g       SimplStg
+        n       Native codegen
+        r       Hsc name cache
+        s       simplifier
 
 \begin{code}
 mkAlphaTyVarUnique     :: Int -> Unique
 mkPreludeClassUnique   :: Int -> Unique
 mkPreludeTyConUnique   :: Int -> Unique
-mkTupleTyConUnique     :: Boxity -> Int -> Unique
+mkTupleTyConUnique     :: TupleSort -> Int -> Unique
 mkPreludeDataConUnique :: Int -> Unique
-mkTupleDataConUnique   :: Boxity -> Int -> Unique
+mkTupleDataConUnique   :: TupleSort -> Int -> Unique
 mkPrimOpIdUnique       :: Int -> Unique
 mkPreludeMiscIdUnique  :: Int -> Unique
 mkPArrDataConUnique    :: Int -> Unique
@@ -323,9 +315,10 @@ mkPreludeClassUnique i          = mkUnique '2' i
 -- The first is for the tycon itself; the latter two
 -- are for the generic to/from Ids.  See TysWiredIn.mk_tc_gen_info.
 
-mkPreludeTyConUnique i		= mkUnique '3' (3*i)
-mkTupleTyConUnique Boxed   a	= mkUnique '4' (3*a)
-mkTupleTyConUnique Unboxed a	= mkUnique '5' (3*a)
+mkPreludeTyConUnique i          = mkUnique '3' (3*i)
+mkTupleTyConUnique BoxedTuple   a       = mkUnique '4' (3*a)
+mkTupleTyConUnique UnboxedTuple a       = mkUnique '5' (3*a)
+mkTupleTyConUnique ConstraintTuple a    = mkUnique 'k' (3*a)
 
 -- Data constructor keys occupy *two* slots.  The first is used for the
 -- data constructor itself and its wrapper function (the function that
@@ -333,20 +326,16 @@ mkTupleTyConUnique Unboxed a	= mkUnique '5' (3*a)
 -- used for the worker function (the function that builds the constructor
 -- representation).
 
-mkPreludeDataConUnique i	= mkUnique '6' (2*i)	-- Must be alphabetic
-mkTupleDataConUnique Boxed a	= mkUnique '7' (2*a)	-- ditto (*may* be used in C labels)
-mkTupleDataConUnique Unboxed a	= mkUnique '8' (2*a)
-
--- This one is used for a tiresome reason
--- to improve a consistency-checking error check in the renamer
-isTupleKey u = case unpkUnique u of
-		(tag,_) -> tag == '4' || tag == '5' || tag == '7' || tag == '8'
+mkPreludeDataConUnique i        = mkUnique '6' (2*i)    -- Must be alphabetic
+mkTupleDataConUnique BoxedTuple   a = mkUnique '7' (2*a)        -- ditto (*may* be used in C labels)
+mkTupleDataConUnique UnboxedTuple    a = mkUnique '8' (2*a)
+mkTupleDataConUnique ConstraintTuple a = mkUnique 'h' (2*a)
 
 mkPrimOpIdUnique op         = mkUnique '9' op
 mkPreludeMiscIdUnique  i    = mkUnique '0' i
 
--- No numbers left anymore, so I pick something different for the character tag 
-mkPArrDataConUnique a	        = mkUnique ':' (2*a)
+-- No numbers left anymore, so I pick something different for the character tag
+mkPArrDataConUnique a           = mkUnique ':' (2*a)
 
 -- The "tyvar uniques" print specially nicely: a, b, c, etc.
 -- See pprUnique for details
@@ -354,11 +343,10 @@ mkPArrDataConUnique a	        = mkUnique ':' (2*a)
 initTyVarUnique :: Unique
 initTyVarUnique = mkUnique 't' 0
 
-mkPseudoUniqueC, mkPseudoUniqueD, mkPseudoUniqueE, mkPseudoUniqueH,
+mkPseudoUniqueD, mkPseudoUniqueE, mkPseudoUniqueH,
    mkBuiltinUnique :: Int -> Unique
 
 mkBuiltinUnique i = mkUnique 'B' i
-mkPseudoUniqueC i = mkUnique 'C' i -- used for getUnique on Regs
 mkPseudoUniqueD i = mkUnique 'D' i -- used in NCG for getUnique on RealRegs
 mkPseudoUniqueE i = mkUnique 'E' i -- used in NCG spiller to create spill VirtualRegs
 mkPseudoUniqueH i = mkUnique 'H' i -- used in NCG spiller to create spill VirtualRegs
@@ -369,11 +357,14 @@ mkRegSubUnique    = mkUnique 'S'
 mkRegPairUnique   = mkUnique 'P'
 mkRegClassUnique  = mkUnique 'L'
 
+mkCostCentreUnique :: Int -> Unique
+mkCostCentreUnique = mkUnique 'C'
+
 mkVarOccUnique, mkDataOccUnique, mkTvOccUnique, mkTcOccUnique :: FastString -> Unique
 -- See Note [The Unique of an OccName] in OccName
 mkVarOccUnique  fs = mkUnique 'i' (iBox (uniqueOfFS fs))
 mkDataOccUnique fs = mkUnique 'd' (iBox (uniqueOfFS fs))
-mkTvOccUnique 	fs = mkUnique 'v' (iBox (uniqueOfFS fs))
-mkTcOccUnique 	fs = mkUnique 'c' (iBox (uniqueOfFS fs))
+mkTvOccUnique   fs = mkUnique 'v' (iBox (uniqueOfFS fs))
+mkTcOccUnique   fs = mkUnique 'c' (iBox (uniqueOfFS fs))
 \end{code}
 

@@ -255,7 +255,7 @@ of certain types of closures and their layout.
 When building the runtime system, the @gcc@ compiler correctly figures out
 the size of every structure on its own.
 However, 
-GHC simply reads @includes/Constants.h@ to to determine the size of 
+GHC simply reads @includes/Constants.h@ to determine the size of 
 closures assumed by the runtime system.
 Thus, we must change the constants used by the GHC itself (as opposed to
 the runtime system). They are all found in @includes/Constants.h@.
@@ -793,7 +793,7 @@ live static closure to a correct null value before its destruction.
 This is done by invoking the function 
 @resetStaticObjectForRetainerProfiling()@.
 
-\textbf{To do:} In the current implemenation, if a static closure has no child
+\textbf{To do:} In the current implementation, if a static closure has no child
 (e.g., @CONSTR_NOCAF_STATIC@, @THUNK_STATIC@ with an empty SRT, and
 @FUN_STATIC@ with an empty SRT), we do not compute its retainer set (because
 there is no need to do). This slight optimization allows us to render 
@@ -1029,7 +1029,7 @@ execution of retainer profiling.
 \label{fig-cacheprof}
 \end{figure}
 
-\section{Comparision with nhc}
+\section{Comparison with nhc}
 
 \section{Files}
 

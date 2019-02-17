@@ -23,6 +23,19 @@
 
 #include "Rts.h"
 
+#if defined(linux_HOST_OS)
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/syscall.h>
+#endif
+
+#if defined(HAVE_PTHREAD_H)
+#include <pthread.h>
+#if defined(freebsd_HOST_OS)
+#include <pthread_np.h>
+#endif
+#endif
+
 #if defined(THREADED_RTS)
 #include "RtsUtils.h"
 #include "Task.h"
@@ -44,8 +57,10 @@
 #include <sched.h>
 #endif
 
-#if defined(HAVE_SYS_CPUSET_H)
+#if defined(HAVE_SYS_PARAM_H)
 #include <sys/param.h>
+#endif
+#if defined(HAVE_SYS_CPUSET_H)
 #include <sys/cpuset.h>
 #endif
 
@@ -101,14 +116,14 @@ waitCondition ( Condition* pCond, Mutex* pMut )
 }
 
 void
-yieldThread()
+yieldThread(void)
 {
   sched_yield();
   return;
 }
 
 void
-shutdownThread()
+shutdownThread(void)
 {
   pthread_exit(NULL);
 }
@@ -123,7 +138,7 @@ createOSThread (OSThreadId* pId, OSThreadProc *startProc, void *param)
 }
 
 OSThreadId
-osThreadId()
+osThreadId(void)
 {
   return pthread_self();
 }
@@ -197,8 +212,7 @@ forkOS_createThreadWrapper ( void * entry )
 {
     Capability *cap;
     cap = rts_lock();
-    cap = rts_evalStableIO(cap, (HsStablePtr) entry, NULL);
-    taskTimeStamp(myTask());
+    rts_evalStableIO(&cap, (HsStablePtr) entry, NULL);
     rts_unlock(cap);
     return NULL;
 }
@@ -308,4 +322,31 @@ forkOS_createThread ( HsStablePtr entry STG_UNUSED )
     return -1;
 }
 
-#endif /* !defined(THREADED_RTS) */
+nat getNumberOfProcessors (void)
+{
+    return 1;
+}
+
+#endif /* defined(THREADED_RTS) */
+
+KernelThreadId kernelThreadId (void)
+{
+#if defined(linux_HOST_OS)
+    pid_t tid = syscall(SYS_gettid); // no really, see man gettid
+    return (KernelThreadId) tid;
+
+/* FreeBSD 9.0+ */
+#elif defined(freebsd_HOST_OS) && (__FreeBSD_version >= 900031)
+    return pthread_getthreadid_np();
+
+// Check for OS X >= 10.6 (see #7356)
+#elif defined(darwin_HOST_OS) && !(defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED < 1060)
+    uint64_t ktid;
+    pthread_threadid_np(NULL, &ktid);
+    return ktid;
+
+#else
+    // unsupported
+    return 0;
+#endif
+}

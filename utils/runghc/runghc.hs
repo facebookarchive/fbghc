@@ -20,17 +20,26 @@ module Main (main) where
 
 import Control.Exception
 import Data.Monoid
-import System.Cmd
 import System.Directory
 import System.Environment
 import System.Exit
 import System.FilePath
 import System.IO
+import System.Process
 
 #if defined(mingw32_HOST_OS)
-import Control.Monad
 import Foreign
 import Foreign.C.String
+#endif
+
+#if defined(mingw32_HOST_OS)
+# if defined(i386_HOST_ARCH)
+#  define WINDOWS_CCONV stdcall
+# elif defined(x86_64_HOST_ARCH)
+#  define WINDOWS_CCONV ccall
+# else
+#  error Unknown mingw32 arch
+# endif
 #endif
 
 main :: IO ()
@@ -39,14 +48,14 @@ main = do
     case parseRunGhcFlags args of
         (Help, _) -> printUsage
         (ShowVersion, _) -> printVersion
-        (RunGhcFlags (Just ghc), args') -> doIt ghc args'
+        (RunGhcFlags (Just ghc), args') -> uncurry (doIt ghc) $ getGhcArgs args'
         (RunGhcFlags Nothing, args') -> do
             mbPath <- getExecPath
             case mbPath of
                 Nothing  -> dieProg ("cannot find ghc")
                 Just path ->
                     let ghc = takeDirectory (normalise path) </> "ghc"
-                    in doIt ghc args'
+                    in uncurry (doIt ghc) $ getGhcArgs args'
 
 data RunGhcFlags = RunGhcFlags (Maybe FilePath) -- GHC location
                  | Help -- Print help text
@@ -87,9 +96,11 @@ printUsage = do
     putStrLn "    --help                Print this usage information"
     putStrLn "    --version             Print version number"
 
-doIt :: String -> [String] -> IO ()
-doIt ghc args = do
-    let (ghc_args, rest) = getGhcArgs args
+doIt :: String -- ^ path to GHC
+     -> [String] -- ^ GHC args
+     -> [String] -- ^ rest of the args
+     -> IO ()
+doIt ghc ghc_args rest = do
     case rest of
         [] -> do
            -- behave like typical perl, python, ruby interpreters:
@@ -101,7 +112,7 @@ doIt ghc args = do
              $ \(filename,h) -> do
                  getContents >>= hPutStr h
                  hClose h
-                 doIt ghc (ghc_args ++ [filename])
+                 doIt ghc ghc_args [filename]
         filename : prog_args -> do
             -- If the file exists, and is not a .lhs file, then we
             -- want to treat it as a .hs file.
@@ -127,7 +138,11 @@ getGhcArgs args
                               (xs, "--":ys) -> (xs, ys)
                               (xs, ys)      -> (xs, ys)
    in (map unescape ghcArgs, otherArgs)
-    where unescape ('-':'-':'g':'h':'c':'-':'a':'r':'g':'=':arg) = arg
+    where unescape ('-':'-':'g':'h':'c':'-':'a':'r':'g':'=':arg) =
+                case arg of
+                    -- Bug #8601: allow --ghc-arg=--ghc-arg= as a prefix as well for backwards compatibility
+                    ('-':'-':'g':'h':'c':'-':'a':'r':'g':'=':arg') -> arg'
+                    _ -> arg
           unescape arg = arg
 
 pastArgs :: String -> Bool
@@ -149,15 +164,17 @@ dieProg msg = do
 
 getExecPath :: IO (Maybe String)
 #if defined(mingw32_HOST_OS)
-getExecPath =
-     allocaArray len $ \buf -> do
-         ret <- getModuleFileName nullPtr buf len
-         if ret == 0 then return Nothing
-                     else liftM Just $ peekCString buf
-    where len = 2048 -- Plenty, PATH_MAX is 512 under Win32.
+getExecPath = try_size 2048 -- plenty, PATH_MAX is 512 under Win32.
+  where
+    try_size size = allocaArray (fromIntegral size) $ \buf -> do
+        ret <- c_GetModuleFileName nullPtr buf size
+        case ret of
+          0 -> return Nothing
+          _ | ret < size -> fmap Just $ peekCWString buf
+            | otherwise  -> try_size (size * 2)
 
-foreign import stdcall unsafe "GetModuleFileNameA"
-    getModuleFileName :: Ptr () -> CString -> Int -> IO Int32
+foreign import WINDOWS_CCONV unsafe "windows.h GetModuleFileNameW"
+  c_GetModuleFileName :: Ptr () -> CWString -> Word32 -> IO Word32
 #else
 getExecPath = return Nothing
 #endif

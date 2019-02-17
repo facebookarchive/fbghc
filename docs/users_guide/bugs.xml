@@ -3,27 +3,42 @@
   <title>Known bugs and infelicities</title>
 
   <sect1 id="vs-Haskell-defn">
-    <title>Haskell&nbsp;98 vs.&nbsp;Glasgow Haskell: language non-compliance
+    <title>Haskell&nbsp;standards vs.&nbsp;Glasgow Haskell: language non-compliance
 </title>
-    
-    <indexterm><primary>GHC vs the Haskell 98 language</primary></indexterm>
-    <indexterm><primary>Haskell 98 language vs GHC</primary></indexterm>
 
-  <para>This section lists Glasgow Haskell infelicities in its
-  implementation of Haskell&nbsp;98.  See also the &ldquo;when things
-  go wrong&rdquo; section (<xref linkend="wrong"/>) for information
-  about crashes, space leaks, and other undesirable phenomena.</para>
+    <indexterm><primary>GHC vs the Haskell standards</primary></indexterm>
+    <indexterm><primary>Haskell standards vs GHC</primary></indexterm>
 
-  <para>The limitations here are listed in Haskell Report order
-  (roughly).</para>
+    <para>
+        This section lists Glasgow Haskell infelicities in its
+        implementation of Haskell&nbsp;98 and Haskell&nbsp;2010.
+        See also the &ldquo;when things go wrong&rdquo; section
+        (<xref linkend="wrong"/>) for information about crashes,
+        space leaks, and other undesirable phenomena.
+    </para>
 
-  <sect2 id="haskell98-divergence">
-    <title>Divergence from Haskell&nbsp;98</title>
-    
-      
+    <para>
+        The limitations here are listed in Haskell Report order
+        (roughly).
+    </para>
+
+  <sect2 id="haskell-standards-divergence">
+    <title>Divergence from Haskell&nbsp;98 and Haskell&nbsp;2010</title>
+
+    <para>
+        By default, GHC mainly aims to behave (mostly) like a Haskell&nbsp;2010
+        compiler, although you can tell it to try to behave like a
+        particular version of the language with the
+        <literal>-XHaskell98</literal> and
+        <literal>-XHaskell2010</literal> flags. The known deviations
+        from the standards are described below. Unless otherwise stated,
+        the deviation applies in Haskell&nbsp;98, Haskell&nbsp;2010 and
+        the default modes.
+    </para>
+
     <sect3 id="infelicities-lexical">
       <title>Lexical syntax</title>
-      
+
       <itemizedlist>
 	<listitem>
 	  <para>Certain lexical rules regarding qualified identifiers
@@ -36,13 +51,15 @@
 	</listitem>
       </itemizedlist>
     </sect3>
-      
+
       <sect3 id="infelicities-syntax">
 	<title>Context-free syntax</title>
-	
+
 	<itemizedlist>
 	  <listitem>
-	    <para>GHC is a little less strict about the layout rule when used
+	    <para>In Haskell&nbsp;98 mode and by default (but not in
+          Haskell&nbsp;2010 mode), GHC is a little less strict about the
+          layout rule when used
 	      in <literal>do</literal> expressions.  Specifically, the
 	      restriction that "a nested context must be indented further to
 	      the right than the enclosing context" is relaxed to allow the
@@ -58,13 +75,16 @@ main = do args &lt;- getArgs
           ps &lt;- mapM process args
           mapM print ps</programlisting>
 
+        This behaviour is controlled by the
+        <literal>NondecreasingIndentation</literal> extension.
 	      </para>
 	  </listitem>
 
 	<listitem>
-	  <para>GHC doesn't do fixity resolution in expressions during
-	  parsing.  For example, according to the Haskell report, the
-	  following expression is legal Haskell:
+	  <para>GHC doesn't do the fixity resolution in expressions during
+	  parsing as required by Haskell&nbsp;98 (but not by Haskell&nbsp;2010).
+      For example, according to the Haskell&nbsp;98 report, the
+	  following expression is legal:
 <programlisting>
     let x = 42 in x == 42 == True</programlisting>
 	and parses as:
@@ -79,10 +99,7 @@ main = do args &lt;- getArgs
 	  <literal>let</literal>-expression must terminate there.  GHC
 	  simply gobbles up the whole expression, parsing like this:
 <programlisting>
-    (let x = 42 in x == 42 == True)</programlisting>
-
-          The Haskell report is arguably wrong here, but nevertheless
-          it's a difference between GHC &amp; Haskell 98.</para>
+    (let x = 42 in x == 42 == True)</programlisting></para>
 	</listitem>
       </itemizedlist>
     </sect3>
@@ -90,25 +107,45 @@ main = do args &lt;- getArgs
   <sect3 id="infelicities-exprs-pats">
       <title>Expressions and patterns</title>
 
-	<para>None known.</para>
+    <para>In its default mode, GHC makes some programs slightly more defined 
+    than they should be. For example, consider
+    <programlisting>
+f :: [a] -> b -> b
+f [] = error "urk"
+f (x:xs) = \v -> v
+
+main = print (f [] `seq` True)
+    </programlisting>
+This should call <literal>error</literal> but actually prints <literal>True</literal>.
+Reason: GHC eta-expands <literal>f</literal> to
+    <programlisting>
+f :: [a] -> b -> b
+f []     v = error "urk"
+f (x:xs) v = v
+    </programlisting>
+This improves efficiency slightly but significantly for most programs, and
+is bad for only a few.  To suppress this bogus "optimisation" use <option>-fpedantic-bottoms</option>.
+</para>
+
     </sect3>
 
     <sect3 id="infelicities-decls">
       <title>Declarations and bindings</title>
 
-      <para>GHC's typechecker makes all pattern bindings monomorphic
-      by default; this behaviour can be disabled with
-      <option>-XNoMonoPatBinds</option>.  See <xref
-      linkend="options-language" />.</para>
+      <para>In its default mode, GHC does not accept datatype contexts,
+      as it has been decided to remove them from the next version of the
+      language standard. This behaviour can be controlled with the
+      <option>DatatypeContexts</option> extension.
+      See <xref linkend="datatype-contexts" />.</para>
     </sect3>
-      
+
       <sect3 id="infelicities-Modules">
 	<title>Module system and interface files</title>
-	
+
 	<para>GHC requires the use of <literal>hs-boot</literal>
 	  files to cut the recursive loops among mutually recursive modules
 	  as described in <xref linkend="mutual-recursion"/>.  This more of an infelicity
-	    than a bug: the Haskell Report says 
+	    than a bug: the Haskell Report says
 	  (<ulink url="http://haskell.org/onlinereport/modules.html#sect5.7">Section 5.7</ulink>) "Depending on the Haskell
 	implementation used, separate compilation of mutually
 	recursive modules may require that imported modules contain
@@ -127,6 +164,98 @@ main = do args &lt;- getArgs
 
       <variablelist>
 	<varlistentry>
+	  <term>Num superclasses</term>
+	  <listitem>
+	    <para>
+              The <literal>Num</literal> class does not have
+              <literal>Show</literal> or <literal>Eq</literal>
+              superclasses.
+            </para>
+
+	    <para>
+              You can make code that works with both
+              Haskell98/Haskell2010 and GHC by:
+              <itemizedlist>
+                <listitem>
+                  <para>
+                    Whenever you make a <literal>Num</literal> instance
+                    of a type, also make <literal>Show</literal> and
+                    <literal>Eq</literal> instances, and
+                  </para>
+                </listitem>
+                <listitem>
+                  <para>
+                    Whenever you give a function, instance or class a
+                    <literal>Num t</literal> constraint, also give it
+                    <literal>Show t</literal> and
+                    <literal>Eq t</literal> constraints.
+                  </para>
+                </listitem>
+              </itemizedlist>
+            </para>
+	    </listitem>
+	  </varlistentry>
+
+	<varlistentry>
+	  <term>Bits superclasses</term>
+	  <listitem>
+	    <para>
+              The <literal>Bits</literal> class does not have
+              a <literal>Num</literal> superclasses. It therefore
+              does not have default methods for the
+              <literal>bit</literal>,
+              <literal>testBit</literal> and
+              <literal>popCount</literal> methods.
+            </para>
+
+	    <para>
+              You can make code that works with both
+              Haskell2010 and GHC by:
+              <itemizedlist>
+                <listitem>
+                  <para>
+                    Whenever you make a <literal>Bits</literal> instance
+                    of a type, also make a <literal>Num</literal>
+                    instance, and
+                  </para>
+                </listitem>
+                <listitem>
+                  <para>
+                    Whenever you give a function, instance or class a
+                    <literal>Bits t</literal> constraint, also give it
+                    a <literal>Num t</literal> constraint, and
+                  </para>
+                </listitem>
+                <listitem>
+                  <para>
+                    Always define the <literal>bit</literal>,
+                    <literal>testBit</literal> and
+                    <literal>popCount</literal> methods in
+                    <literal>Bits</literal> instances.
+                  </para>
+                </listitem>
+              </itemizedlist>
+            </para>
+	    </listitem>
+	  </varlistentry>
+
+	<varlistentry>
+	  <term>Extra instances</term>
+	  <listitem>
+	    <para>
+              The following extra instances are defined:
+            </para>
+<programlisting>
+instance Functor ((->) r)
+instance Monad ((->) r)
+instance Functor ((,) a)
+instance Functor (Either a)
+instance Monad (Either e)
+</programlisting>
+	    </listitem>
+	  </varlistentry>
+
+	<varlistentry>
 	  <term>Multiply-defined array elements&mdash;not checked:</term>
 	  <listitem>
 	    <para>This code fragment should
@@ -141,7 +270,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 	  </listitem>
 	</varlistentry>
       </variablelist>
-      
+
     </sect3>
 
       <sect3 id="infelicities-Prelude">
@@ -209,11 +338,28 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
           </varlistentry>
 	</variablelist>
     </sect3>
+
+    <sect3 id="infelicities-ffi">
+      <title>The Foreign Function Interface</title>
+      <variablelist>
+      <varlistentry>
+        <term><literal>hs_init()</literal> not allowed
+        after <literal>hs_exit()</literal></term>
+        <listitem>
+          <para>The FFI spec requires the implementation to support
+            re-initialising itself after being shut down
+            with <literal>hs_exit()</literal>, but GHC does not
+            currently support that.</para>
+        </listitem>
+      </varlistentry>
+    </variablelist>
+    </sect3>
+
   </sect2>
 
-  <sect2 id="haskell98-undefined">
+  <sect2 id="haskell-98-2010-undefined">
     <title>GHC's interpretation of undefined behaviour in
-    Haskell&nbsp;98</title>
+    Haskell&nbsp;98 and Haskell&nbsp;2010</title>
 
     <para>This section documents GHC's take on various issues that are
     left undefined or implementation specific in Haskell 98.</para>
@@ -251,7 +397,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 	  the <literal>Int</literal> type.</para>
 
 	  <para>The <literal>fromInteger</literal><indexterm><primary><literal>fromInteger</literal></primary>
-	    </indexterm>function (and hence
+	    </indexterm> function (and hence
 	  also <literal>fromIntegral</literal><indexterm><primary><literal>fromIntegral</literal></primary>
 	    </indexterm>) is a special case when
 	  converting to <literal>Int</literal>.  The value of
@@ -265,7 +411,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 
 
 	   <para>Negative literals, such as <literal>-3</literal>, are
-             specified by (a careful reading of) the Haskell Report as 
+             specified by (a careful reading of) the Haskell Report as
              meaning <literal>Prelude.negate (Prelude.fromInteger 3)</literal>.
 	     So <literal>-2147483648</literal> means <literal>negate (fromInteger 2147483648)</literal>.
 	     Since <literal>fromInteger</literal> takes the lower 32 bits of the representation,
@@ -273,7 +419,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 	     <literal>-2147483648::Int</literal>.  The <literal>negate</literal> operation then
 	     overflows, but it is unchecked, so <literal>negate (-2147483648::Int)</literal> is just
 	     <literal>-2147483648</literal>.  In short, one can write <literal>minBound::Int</literal> as
-	     a literal with the expected meaning (but that is not in general guaranteed.
+	     a literal with the expected meaning (but that is not in general guaranteed).
              </para>
 
 	  <para>The <literal>fromIntegral</literal> function also
@@ -293,7 +439,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 	  <para>Operations on <literal>Float</literal> and
           <literal>Double</literal> numbers are
           <emphasis>unchecked</emphasis> for overflow, underflow, and
-          other sad occurrences.  (note, however that some
+          other sad occurrences.  (note, however, that some
           architectures trap floating-point overflow and
           loss-of-precision and report a floating-point exception,
           probably terminating the
@@ -302,26 +448,8 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
 	</listitem>
       </varlistentry>
     </variablelist>
-      
-    </sect2>
-
-  <sect2 id="ffi-divergence">
-    <title>Divergence from the FFI specification</title>
-    
-    <variablelist>
-      <varlistentry>
-        <term><literal>hs_init()</literal> not allowed
-        after <literal>hs_exit()</literal></term>
-        <listitem>
-          <para>The FFI spec requires the implementation to support
-            re-initialising itself after being shut down
-            with <literal>hs_exit()</literal>, but GHC does not
-            currently support that.</para>
-        </listitem>
-      </varlistentry>
-    </variablelist>
   </sect2>
-    
+
   </sect1>
 
 
@@ -329,8 +457,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
     <title>Known bugs or infelicities</title>
 
     <para>The bug tracker lists bugs that have been reported in GHC but not
-      yet fixed: see the <ulink url="http://sourceforge.net/projects/ghc/">SourceForge GHC
-    page</ulink>.  In addition to those, GHC also has the following known bugs
+      yet fixed: see the <ulink url="http://ghc.haskell.org/trac/ghc/">GHC Trac</ulink>.  In addition to those, GHC also has the following known bugs
       or  infelicities.  These bugs are more permanent; it is unlikely that
       any of them will be fixed in the short term.</para>
 
@@ -348,7 +475,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
       </listitem>
 
       <listitem>
-	<para>GHC does not allow you to have a data type with a context 
+	<para>GHC does not allow you to have a data type with a context
 	   that mentions type variables that are not data type parameters.
 	  For example:
 <programlisting>
@@ -369,10 +496,10 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
         using the standard way to encode recursion via a data type:</para>
 <programlisting>
   data U = MkU (U -> Bool)
-       
+
   russel :: U -> Bool
   russel u@(MkU p) = not $ p u
-  
+
   x :: Bool
   x = russel (MkU russel)
 </programlisting>
@@ -387,13 +514,32 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
       </listitem>
 
       <listitem>
-	<para>GHC does not keep careful track of
-	    what instance declarations are 'in scope' if they come from other packages.
-        Instead, all instance declarations that GHC has seen in other
-        packages are all in scope everywhere, whether or not the
-        module from that package is used by the command-line
-        expression.  This bug affects only the <option>--make</option> mode and
-	  GHCi.</para>
+        <para>On 32-bit x86 platforms when using the native code
+        generator, the
+        <option>-fexcess-precision</option><indexterm><primary><option>-fexcess-precision</option></primary></indexterm> option
+        is always on.  This means that floating-point calculations are
+        non-deterministic, because depending on how the program is
+        compiled (optimisation settings, for example), certain
+        calculations might be done at 80-bit precision instead of the
+        intended 32-bit or 64-bit precision.  Floating-point results
+        may differ when optimisation is turned on.  In the worst case,
+        referential transparency is violated, because for example
+        <literal>let x = E1 in E2</literal> can evaluate to a
+        different value than <literal>E2[E1/x]</literal>.</para>
+
+        <para>
+          One workaround is to use the
+          <option>-msse2</option><indexterm><primary><option>-msse2</option></primary></indexterm>
+          option (see <xref linkend="options-platform" />, which
+          generates code to use the SSE2 instruction set instead of
+          the x87 instruction set.  SSE2 code uses the correct
+          precision for all floating-point operations, and so gives
+          deterministic results.  However, note that this only works
+          with processors that support SSE2 (Intel Pentium 4 or AMD
+          Athlon 64 and later), which is why the option is not enabled
+          by default.  The libraries that come with GHC are probably
+          built without this option, unless you built GHC yourself.
+        </para>
       </listitem>
 
     </itemizedlist>
@@ -414,7 +560,7 @@ checking for duplicates.  The reason for this is efficiency, pure and simple.
         module (whatever that is).</para>
       </listitem>
 
-      <listitem> 
+      <listitem>
       <para>On Windows, there's a GNU ld/BFD bug
       whereby it emits bogus PE object files that have more than
       0xffff relocations. When GHCi tries to load a package affected by this
@@ -430,6 +576,17 @@ Loading package javavm ... linking ... WARNING: Overflown relocation field (# re
       <para>The workaround is to split up the .o files that make up
       your package into two or more .o's, along the lines of
       how the "base" package does it.</para>
+      </listitem>
+
+      <listitem>
+        <para>
+          GHCi does not keep careful track of what instance
+          declarations are 'in scope' if they come from other
+          packages.  Instead, all instance declarations that GHC has
+          seen in other packages are all available at the prompt,
+          whether or not the instance really ought to be in visible
+          given the current set of modules in scope.
+        </para>
       </listitem>
     </itemizedlist>
   </sect2>

@@ -1,4 +1,11 @@
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 -- | Handy functions for creating much Core syntax
 module MkCore (
         -- * Constructing normal syntax
@@ -6,6 +13,7 @@ module MkCore (
         mkCoreApp, mkCoreApps, mkCoreConApps,
         mkCoreLams, mkWildCase, mkIfThenElse,
         mkWildValBinder, mkWildEvBinder,
+        sortQuantVars, castBottomExpr,
         
         -- * Constructing boxed literals
         mkWordExpr, mkWordExprWord,
@@ -13,7 +21,13 @@ module MkCore (
         mkIntegerExpr,
         mkFloatExpr, mkDoubleExpr,
         mkCharExpr, mkStringExpr, mkStringExprFS,
-        
+
+        -- * Floats
+        FloatBind(..), wrapFloat,
+
+        -- * Constructing equality evidence boxes
+        mkEqBox,
+
         -- * Constructing general big tuples
         -- $big_tuples
         mkChunkified,
@@ -39,14 +53,14 @@ module MkCore (
     	mkRuntimeErrorApp, mkImpossibleExpr, errorIds,
     	rEC_CON_ERROR_ID, iRREFUT_PAT_ERROR_ID, rUNTIME_ERROR_ID,
     	nON_EXHAUSTIVE_GUARDS_ERROR_ID, nO_METHOD_BINDING_ERROR_ID,
-    	pAT_ERROR_ID, eRROR_ID, rEC_SEL_ERROR_ID, aBSENT_ERROR_ID
+    	pAT_ERROR_ID, eRROR_ID, rEC_SEL_ERROR_ID, aBSENT_ERROR_ID,
+        uNDEFINED_ID, undefinedName
     ) where
 
 #include "HsVersions.h"
 
 import Id
-import IdInfo
-import Var      ( EvVar, mkWildCoVar, setTyVarUnique )
+import Var      ( EvVar, setTyVarUnique )
 
 import CoreSyn
 import CoreUtils        ( exprType, needsCaseBinding, bindNonRec )
@@ -58,18 +72,25 @@ import PrelNames
 
 import TcType		( mkSigmaTy )
 import Type
+import Coercion
 import TysPrim
 import DataCon          ( DataCon, dataConWorkId )
-import Demand
-import Name
+import IdInfo		( vanillaIdInfo, setStrictnessInfo, 
+                          setArityInfo )
+import Demand 
+import Name      hiding ( varName )
 import Outputable
 import FastString
 import UniqSupply
 import BasicTypes
-import Util             ( notNull, zipEqual )
+import Util
+import Pair
 import Constants
+import DynFlags
 
 import Data.Char        ( ord )
+import Data.List
+import Data.Ord
 import Data.Word
 
 infixl 4 `mkCoreApp`, `mkCoreApps`
@@ -82,6 +103,18 @@ infixl 4 `mkCoreApp`, `mkCoreApps`
 %************************************************************************
 
 \begin{code}
+sortQuantVars :: [Var] -> [Var]
+-- Sort the variables (KindVars, TypeVars, and Ids) 
+-- into order: Kind, then Type, then Id
+sortQuantVars = sortBy (comparing withCategory)
+  where
+    withCategory v = (category v, v)
+    category :: Var -> Int
+    category v
+     | isKindVar v = 1
+     | isTyVar   v = 2
+     | otherwise   = 3
+
 -- | Bind a binding group over an expression, using a @let@ or @case@ as
 -- appropriate (see "CoreSyn#let_app_invariant")
 mkCoreLet :: CoreBind -> CoreExpr -> CoreExpr
@@ -102,6 +135,7 @@ mkCoreApp :: CoreExpr -> CoreExpr -> CoreExpr
 -- Check the invariant that the arg of an App is ok-for-speculation if unlifted
 -- See CoreSyn Note [CoreSyn let/app invariant]
 mkCoreApp fun (Type ty) = App fun (Type ty)
+mkCoreApp fun (Coercion co) = App fun (Coercion co)
 mkCoreApp fun arg       = ASSERT2( isFunTy fun_ty, ppr fun $$ ppr arg )
                           mk_val_app fun arg arg_ty res_ty
                       where
@@ -117,6 +151,7 @@ mkCoreApps orig_fun orig_args
   where
     go fun _      []               = fun
     go fun fun_ty (Type ty : args) = go (App fun (Type ty)) (applyTy fun_ty ty) args
+    go fun fun_ty (Coercion co : args) = go (App fun (Coercion co)) (applyCo fun_ty co) args
     go fun fun_ty (arg     : args) = ASSERT2( isFunTy fun_ty, ppr fun_ty $$ ppr orig_fun $$ ppr orig_args )
                                      go (mk_val_app fun arg arg_ty res_ty) res_ty args
                                    where
@@ -148,8 +183,7 @@ mk_val_app fun arg arg_ty res_ty
 	-- fragmet of it as the fun part of a 'mk_val_app'.
 
 mkWildEvBinder :: PredType -> EvVar
-mkWildEvBinder pred@(EqPred {}) = mkWildCoVar     (mkPredTy pred)
-mkWildEvBinder pred             = mkWildValBinder (mkPredTy pred)
+mkWildEvBinder pred = mkWildValBinder pred
 
 -- | Make a /wildcard binder/. This is typically used when you need a binder 
 -- that you expect to use only at a *binding* site.  Do not use it at
@@ -171,6 +205,16 @@ mkIfThenElse guard then_expr else_expr
   = mkWildCase guard boolTy (exprType then_expr) 
 	 [ (DataAlt falseDataCon, [], else_expr),	-- Increasing order of tag!
     	   (DataAlt trueDataCon,  [], then_expr) ]
+
+castBottomExpr :: CoreExpr -> Type -> CoreExpr
+-- (castBottomExpr e ty), assuming that 'e' diverges, 
+-- return an expression of type 'ty'
+-- See Note [Empty case alternatives] in CoreSyn
+castBottomExpr e res_ty
+  | e_ty `eqType` res_ty = e
+  | otherwise            = Case e (mkWildValBinder e_ty) res_ty []
+  where
+    e_ty = exprType e
 \end{code}
 
 The functions from this point don't really do anything cleverer than
@@ -192,56 +236,25 @@ mkCoreLams = mkLams
 
 \begin{code}
 -- | Create a 'CoreExpr' which will evaluate to the given @Int@
-mkIntExpr      :: Integer    -> CoreExpr            -- Result = I# i :: Int
-mkIntExpr  i = mkConApp intDataCon  [mkIntLit i]
+mkIntExpr :: DynFlags -> Integer -> CoreExpr        -- Result = I# i :: Int
+mkIntExpr dflags i = mkConApp intDataCon  [mkIntLit dflags i]
 
 -- | Create a 'CoreExpr' which will evaluate to the given @Int@
-mkIntExprInt   :: Int        -> CoreExpr            -- Result = I# i :: Int
-mkIntExprInt  i = mkConApp intDataCon  [mkIntLitInt i]
+mkIntExprInt :: DynFlags -> Int -> CoreExpr         -- Result = I# i :: Int
+mkIntExprInt dflags i = mkConApp intDataCon  [mkIntLitInt dflags i]
 
 -- | Create a 'CoreExpr' which will evaluate to the a @Word@ with the given value
-mkWordExpr     :: Integer    -> CoreExpr
-mkWordExpr w = mkConApp wordDataCon [mkWordLit w]
+mkWordExpr :: DynFlags -> Integer -> CoreExpr
+mkWordExpr dflags w = mkConApp wordDataCon [mkWordLit dflags w]
 
 -- | Create a 'CoreExpr' which will evaluate to the given @Word@
-mkWordExprWord :: Word       -> CoreExpr
-mkWordExprWord w = mkConApp wordDataCon [mkWordLitWord w]
+mkWordExprWord :: DynFlags -> Word -> CoreExpr
+mkWordExprWord dflags w = mkConApp wordDataCon [mkWordLitWord dflags w]
 
 -- | Create a 'CoreExpr' which will evaluate to the given @Integer@
-mkIntegerExpr  :: MonadThings m => Integer    -> m CoreExpr  -- Result :: Integer
-mkIntegerExpr i
-  | inIntRange i        -- Small enough, so start from an Int
-    = do integer_id <- lookupId smallIntegerName
-         return (mkSmallIntegerLit integer_id i)
-
--- Special case for integral literals with a large magnitude:
--- They are transformed into an expression involving only smaller
--- integral literals. This improves constant folding.
-
-  | otherwise = do       -- Big, so start from a string
-      plus_id <- lookupId plusIntegerName
-      times_id <- lookupId timesIntegerName
-      integer_id <- lookupId smallIntegerName
-      let
-           lit i = mkSmallIntegerLit integer_id i
-           plus a b  = Var plus_id  `App` a `App` b
-           times a b = Var times_id `App` a `App` b
-
-           -- Transform i into (x1 + (x2 + (x3 + (...) * b) * b) * b) with abs xi <= b
-           horner :: Integer -> Integer -> CoreExpr
-           horner b i | abs q <= 1 = if r == 0 || r == i 
-                                     then lit i 
-                                     else lit r `plus` lit (i-r)
-                      | r == 0     =               horner b q `times` lit b
-                      | otherwise  = lit r `plus` (horner b q `times` lit b)
-                      where
-                        (q,r) = i `quotRem` b
-
-      return (horner tARGET_MAX_INT i)
-  where
-    mkSmallIntegerLit :: Id -> Integer -> CoreExpr
-    mkSmallIntegerLit small_integer i = mkApps (Var small_integer) [mkIntLit i]
-
+mkIntegerExpr  :: MonadThings m => Integer -> m CoreExpr  -- Result :: Integer
+mkIntegerExpr i = do t <- lookupTyCon integerTyConName
+                     return (Lit (mkLitInteger i (mkTyConTy t)))
 
 -- | Create a 'CoreExpr' which will evaluate to the given @Float@
 mkFloatExpr :: Float -> CoreExpr
@@ -273,15 +286,30 @@ mkStringExprFS str
 
   | all safeChar chars
   = do unpack_id <- lookupId unpackCStringName
-       return (App (Var unpack_id) (Lit (MachStr str)))
+       return (App (Var unpack_id) (Lit (MachStr (fastStringToByteString str))))
 
   | otherwise
   = do unpack_id <- lookupId unpackCStringUtf8Name
-       return (App (Var unpack_id) (Lit (MachStr str)))
+       return (App (Var unpack_id) (Lit (MachStr (fastStringToByteString str))))
 
   where
     chars = unpackFS str
     safeChar c = ord c >= 1 && ord c <= 0x7F
+\end{code}
+
+\begin{code}
+
+-- This take a ~# b (or a ~# R b) and returns a ~ b (or Coercible a b)
+mkEqBox :: Coercion -> CoreExpr
+mkEqBox co = ASSERT2( typeKind ty2 `eqKind` k, ppr co $$ ppr ty1 $$ ppr ty2 $$ ppr (typeKind ty1) $$ ppr (typeKind ty2) )
+             Var (dataConWorkId datacon) `mkTyApps` [k, ty1, ty2] `App` Coercion co
+  where Pair ty1 ty2 = coercionKind co
+        k = typeKind ty1
+        datacon = case coercionRole co of 
+            Nominal ->          eqBoxDataCon
+            Representational -> coercibleDataCon
+            Phantom ->          pprPanic "mkEqBox does not support boxing phantom coercions"
+                                         (ppr co)
 \end{code}
 
 %************************************************************************
@@ -358,7 +386,7 @@ mkCoreVarTupTy ids = mkBoxedTupleTy (map idType ids)
 mkCoreTup :: [CoreExpr] -> CoreExpr
 mkCoreTup []  = Var unitDataConId
 mkCoreTup [c] = c
-mkCoreTup cs  = mkConApp (tupleCon Boxed (length cs))
+mkCoreTup cs  = mkConApp (tupleCon BoxedTuple (length cs))
                          (map (Type . exprType) cs ++ cs)
 
 -- | Build a big tuple holding the specified variables
@@ -376,6 +404,25 @@ mkBigCoreTup = mkChunkified mkCoreTup
 -- | Build the type of a big tuple that holds the specified type of thing
 mkBigCoreTupTy :: [Type] -> Type
 mkBigCoreTupTy = mkChunkified mkBoxedTupleTy
+\end{code}
+
+
+%************************************************************************
+%*                                                                      *
+                Floats
+%*                                                                      *
+%************************************************************************
+
+\begin{code}
+data FloatBind 
+  = FloatLet  CoreBind
+  | FloatCase CoreExpr Id AltCon [Var]       
+      -- case e of y { C ys -> ... }
+      -- See Note [Floating cases] in SetLevels
+
+wrapFloat :: FloatBind -> CoreExpr -> CoreExpr
+wrapFloat (FloatLet defns)       body = Let defns body
+wrapFloat (FloatCase e b con bs) body = Case e b (exprType body) [(con, bs, body)]
 \end{code}
 
 %************************************************************************
@@ -442,7 +489,7 @@ mkSmallTupleSelector [var] should_be_the_same_var _ scrut
 mkSmallTupleSelector vars the_var scrut_var scrut
   = ASSERT( notNull vars )
     Case scrut scrut_var (idType the_var)
-         [(DataAlt (tupleCon Boxed (length vars)), vars, Var the_var)]
+         [(DataAlt (tupleCon BoxedTuple (length vars)), vars, Var the_var)]
 \end{code}
 
 \begin{code}
@@ -499,7 +546,7 @@ mkSmallTupleCase [var] body _scrut_var scrut
   = bindNonRec var scrut body
 mkSmallTupleCase vars body scrut_var scrut
 -- One branch no refinement?
-  = Case scrut scrut_var (exprType body) [(DataAlt (tupleCon Boxed (length vars)), vars, body)]
+  = Case scrut scrut_var (exprType body) [(DataAlt (tupleCon BoxedTuple (length vars)), vars, body)]
 \end{code}
 
 %************************************************************************
@@ -618,6 +665,9 @@ errorIds
                   -- import its type from the interface file; we just get
                   -- the Id defined here.  Which has an 'open-tyvar' type.
 
+      uNDEFINED_ID,   -- Ditto for 'undefined'. The big deal is to give it
+                      -- an 'open-tyvar' type.
+
       rUNTIME_ERROR_ID,
       iRREFUT_PAT_ERROR_ID,
       nON_EXHAUSTIVE_GUARDS_ERROR_ID,
@@ -659,7 +709,7 @@ nON_EXHAUSTIVE_GUARDS_ERROR_ID  = mkRuntimeErrorId nonExhaustiveGuardsErrorName
 aBSENT_ERROR_ID                 = mkRuntimeErrorId absentErrorName
 
 mkRuntimeErrorId :: Name -> Id
-mkRuntimeErrorId name = pc_bottoming_Id name runtimeErrorTy
+mkRuntimeErrorId name = pc_bottoming_Id1 name runtimeErrorTy
 
 runtimeErrorTy :: Type
 -- The runtime error Ids take a UTF8-encoded string as argument
@@ -671,14 +721,32 @@ errorName :: Name
 errorName = mkWiredInIdName gHC_ERR (fsLit "error") errorIdKey eRROR_ID
 
 eRROR_ID :: Id
-eRROR_ID = pc_bottoming_Id errorName errorTy
+eRROR_ID = pc_bottoming_Id1 errorName errorTy
 
-errorTy  :: Type
+errorTy  :: Type   -- See Note [Error and friends have an "open-tyvar" forall]
 errorTy  = mkSigmaTy [openAlphaTyVar] [] (mkFunTys [mkListTy charTy] openAlphaTy)
-    -- Notice the openAlphaTyVar.  It says that "error" can be applied
-    -- to unboxed as well as boxed types.  This is OK because it never
-    -- returns, so the return type is irrelevant.
+
+undefinedName :: Name
+undefinedName = mkWiredInIdName gHC_ERR (fsLit "undefined") undefinedKey uNDEFINED_ID
+
+uNDEFINED_ID :: Id
+uNDEFINED_ID = pc_bottoming_Id0 undefinedName undefinedTy
+
+undefinedTy  :: Type   -- See Note [Error and friends have an "open-tyvar" forall]
+undefinedTy  = mkSigmaTy [openAlphaTyVar] [] openAlphaTy
 \end{code}
+
+Note [Error and friends have an "open-tyvar" forall]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+'error' and 'undefined' have types 
+        error     :: forall (a::OpenKind). String -> a
+        undefined :: forall (a::OpenKind). a
+Notice the 'OpenKind' (manifested as openAlphaTyVar in the code). This ensures that
+"error" can be instantiated at 
+  * unboxed as well as boxed types
+  * polymorphic types
+This is OK because it never returns, so the return type is irrelevant.
+See Note [OpenTypeKind accepts foralls] in TcUnify.
 
 
 %************************************************************************
@@ -688,12 +756,12 @@ errorTy  = mkSigmaTy [openAlphaTyVar] [] (mkFunTys [mkListTy charTy] openAlphaTy
 %************************************************************************
 
 \begin{code}
-pc_bottoming_Id :: Name -> Type -> Id
+pc_bottoming_Id1 :: Name -> Type -> Id
 -- Function of arity 1, which diverges after being given one argument
-pc_bottoming_Id name ty
+pc_bottoming_Id1 name ty
  = mkVanillaGlobalWithInfo name ty bottoming_info
  where
-    bottoming_info = vanillaIdInfo `setStrictnessInfo` Just strict_sig
+    bottoming_info = vanillaIdInfo `setStrictnessInfo`    strict_sig
 				   `setArityInfo`         1
 			-- Make arity and strictness agree
 
@@ -706,7 +774,15 @@ pc_bottoming_Id name ty
         -- any pc_bottoming_Id will itself have CafRefs, which bloats
         -- SRTs.
 
-    strict_sig = mkStrictSig (mkTopDmdType [evalDmd] BotRes)
-        -- These "bottom" out, no matter what their arguments
+    strict_sig = mkClosedStrictSig [evalDmd] botRes
+    -- These "bottom" out, no matter what their arguments
+
+pc_bottoming_Id0 :: Name -> Type -> Id
+-- Same but arity zero
+pc_bottoming_Id0 name ty
+ = mkVanillaGlobalWithInfo name ty bottoming_info
+ where
+    bottoming_info = vanillaIdInfo `setStrictnessInfo` strict_sig
+    strict_sig = mkClosedStrictSig [] botRes
 \end{code}
 

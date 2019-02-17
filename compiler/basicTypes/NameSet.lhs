@@ -4,6 +4,13 @@
 %
 
 \begin{code}
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module NameSet (
 	-- * Names set type
 	NameSet,
@@ -30,13 +37,9 @@ module NameSet (
     ) where
 
 #include "HsVersions.h"
-#include "Typeable.h"
 
 import Name
 import UniqSet
-import Util
-
-import Data.Data
 \end{code}
 
 %************************************************************************
@@ -48,20 +51,7 @@ import Data.Data
 \begin{code}
 type NameSet = UniqSet Name
 
--- TODO: These Data/Typeable instances look very dubious. Surely either
--- UniqFM should have the instances, or this should be a newtype?
-
-nameSetTc :: TyCon
-nameSetTc = mkTyCon "NameSet"
-instance Typeable NameSet where { typeOf _ = mkTyConApp nameSetTc [] }
-
-instance Data NameSet where
-  gfoldl k z s = z mkNameSet `k` nameSetToList s -- traverse abstractly
-  toConstr _   = abstractConstr "NameSet"
-  gunfold _ _  = error "gunfold"
-  dataTypeOf _ = mkNoRepType "NameSet"
-
-emptyNameSet	   :: NameSet
+emptyNameSet       :: NameSet
 unitNameSet	   :: Name -> NameSet
 addListToNameSet   :: NameSet -> [Name] -> NameSet
 addOneToNameSet    :: NameSet -> Name -> NameSet

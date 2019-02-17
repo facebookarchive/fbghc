@@ -46,9 +46,9 @@ void sendMessage(Capability *from_cap, Capability *to_cap, Message *msg)
     if (to_cap->running_task == NULL) {
 	to_cap->running_task = myTask(); 
             // precond for releaseCapability_()
-	releaseCapability_(to_cap,rtsFalse);
+        releaseCapability_(to_cap,rtsFalse);
     } else {
-        contextSwitchCapability(to_cap);
+        interruptCapability(to_cap);
     }
 
     RELEASE_LOCK(&to_cap->lock);
@@ -74,7 +74,7 @@ loop:
     {
         StgTSO *tso = ((MessageWakeup *)m)->tso;
         debugTraceCap(DEBUG_sched, cap, "message: try wakeup thread %ld", 
-                      (lnat)tso->id);
+                      (W_)tso->id);
         tryWakeupThread(cap, tso);
     }
     else if (i == &stg_MSG_THROWTO_info)
@@ -90,7 +90,7 @@ loop:
         }
 
         debugTraceCap(DEBUG_sched, cap, "message: throwTo %ld -> %ld", 
-                      (lnat)t->source->id, (lnat)t->target->id);
+                      (W_)t->source->id, (W_)t->target->id);
 
         ASSERT(t->source->why_blocked == BlockedOnMsgThrowTo);
         ASSERT(t->source->block_info.closure == (StgClosure *)m);
@@ -167,7 +167,7 @@ nat messageBlackHole(Capability *cap, MessageBlackHole *msg)
     StgTSO *owner;
 
     debugTraceCap(DEBUG_sched, cap, "message: thread %d blocking on blackhole %p", 
-                  (lnat)msg->tso->id, msg->bh);
+                  (W_)msg->tso->id, msg->bh);
 
     info = bh->header.info;
 
@@ -246,8 +246,7 @@ loop:
         // the current thread, since in that case it will not be on
         // the run queue.
         if (owner->why_blocked == NotBlocked && owner->id != msg->tso->id) {
-            removeFromRunQueue(cap, owner);
-            pushOnRunQueue(cap,owner);
+            promoteInRunQueue(cap, owner);
         }
 
         // point to the BLOCKING_QUEUE from the BLACKHOLE
@@ -256,7 +255,7 @@ loop:
         recordClosureMutated(cap,bh); // bh was mutated
 
         debugTraceCap(DEBUG_sched, cap, "thread %d blocked on thread %d", 
-                      (lnat)msg->tso->id, (lnat)owner->id);
+                      (W_)msg->tso->id, (W_)owner->id);
 
         return 1; // blocked
     }
@@ -289,12 +288,11 @@ loop:
         }
 
         debugTraceCap(DEBUG_sched, cap, "thread %d blocked on thread %d", 
-                      (lnat)msg->tso->id, (lnat)owner->id);
+                      (W_)msg->tso->id, (W_)owner->id);
 
         // See above, #3838
         if (owner->why_blocked == NotBlocked && owner->id != msg->tso->id) {
-            removeFromRunQueue(cap, owner);
-            pushOnRunQueue(cap,owner);
+            promoteInRunQueue(cap, owner);
         }
 
         return 1; // blocked

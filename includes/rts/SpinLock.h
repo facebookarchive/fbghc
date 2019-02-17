@@ -15,7 +15,7 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * -------------------------------------------------------------------------- */
 
@@ -34,7 +34,7 @@ typedef struct SpinLock_
 typedef StgWord SpinLock;
 #endif
 
-typedef lnat SpinLockCount;
+typedef StgWord SpinLockCount;
 
 #if defined(PROF_SPIN)
 

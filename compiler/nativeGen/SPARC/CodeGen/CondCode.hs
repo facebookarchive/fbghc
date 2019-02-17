@@ -1,4 +1,11 @@
 
+{-# OPTIONS -fno-warn-tabs #-}
+-- The above warning supression flag is a temporary kludge.
+-- While working on this module you are encouraged to remove it and
+-- detab the module (please do the detabbing in a separate patch). See
+--     http://ghc.haskell.org/trac/ghc/wiki/Commentary/CodingStyle#TabsvsSpaces
+-- for details
+
 module SPARC.CodeGen.CondCode (
 	getCondCode,
 	condIntCode,
@@ -17,7 +24,7 @@ import SPARC.Base
 import NCGMonad
 import Size
 
-import OldCmm
+import Cmm
 
 import OrdList
 import Outputable
@@ -54,9 +61,9 @@ getCondCode (CmmMachOp mop [x, y])
       MO_U_Lt _   -> condIntCode LU   x y
       MO_U_Le _   -> condIntCode LEU  x y
 
-      _ 	  -> pprPanic "SPARC.CodeGen.CondCode.getCondCode" (ppr (CmmMachOp mop [x,y]))
+      _           -> pprPanic "SPARC.CodeGen.CondCode.getCondCode" (ppr (CmmMachOp mop [x,y]))
 
-getCondCode other =  pprPanic "SPARC.CodeGen.CondCode.getCondCode" (ppr other)
+getCondCode other = pprPanic "SPARC.CodeGen.CondCode.getCondCode" (ppr other)
 
 
 
@@ -86,14 +93,15 @@ condIntCode cond x y = do
 
 condFltCode :: Cond -> CmmExpr -> CmmExpr -> NatM CondCode
 condFltCode cond x y = do
+    dflags <- getDynFlags
     (src1, code1) <- getSomeReg x
     (src2, code2) <- getSomeReg y
     tmp <- getNewRegNat FF64
     let
    	promote x = FxTOy FF32 FF64 x tmp
 
-    	pk1   = cmmExprType x
-    	pk2   = cmmExprType y
+    	pk1   = cmmExprType dflags x
+    	pk2   = cmmExprType dflags y
 
     	code__2 =
 		if pk1 `cmmEqType` pk2 then

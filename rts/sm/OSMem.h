@@ -16,8 +16,9 @@ void *osGetMBlocks(nat n);
 void osFreeMBlocks(char *addr, nat n);
 void osReleaseFreeMemory(void);
 void osFreeAllMBlocks(void);
-lnat getPageSize (void);
-void setExecutable (void *p, lnat len, rtsBool exec);
+W_ getPageSize (void);
+StgWord64 getPhysicalMemorySize (void);
+void setExecutable (void *p, W_ len, rtsBool exec);
 
 #include "EndPrivate.h"
 

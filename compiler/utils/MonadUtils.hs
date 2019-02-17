@@ -5,34 +5,23 @@
 module MonadUtils
         ( Applicative(..)
         , (<$>)
-        
+
         , MonadFix(..)
         , MonadIO(..)
-	
-  	, ID, runID
-        
+
         , liftIO1, liftIO2, liftIO3, liftIO4
 
-        , zipWith3M        
+        , zipWith3M
         , mapAndUnzipM, mapAndUnzip3M, mapAndUnzip4M
         , mapAccumLM
         , mapSndM
         , concatMapM
         , mapMaybeM
-	, fmapMaybeM, fmapEitherM
+        , fmapMaybeM, fmapEitherM
         , anyM, allM
         , foldlM, foldlM_, foldrM
         , maybeMapM
         ) where
-
-import Outputable 
-
--------------------------------------------------------------------------------
--- Detection of available libraries
--------------------------------------------------------------------------------
-
--- we don't depend on MTL for now
-#define HAVE_MTL 0
 
 -------------------------------------------------------------------------------
 -- Imports
@@ -41,37 +30,9 @@ import Outputable
 import Maybes
 
 import Control.Applicative
-#if HAVE_MTL
-import Control.Monad.Trans
-#endif
 import Control.Monad
 import Control.Monad.Fix
-
--------------------------------------------------------------------------------
--- The ID monad
--------------------------------------------------------------------------------
-
-newtype ID a = ID a
-instance Monad ID where
-  return x     = ID x
-  (ID x) >>= f = f x
-  _ >> y       = y
-  fail s       = panic s
-
-runID :: ID a -> a
-runID (ID x) = x
-
--------------------------------------------------------------------------------
--- MTL
--------------------------------------------------------------------------------
-
-#if !HAVE_MTL
-
-class Monad m => MonadIO m where
-    liftIO :: IO a -> m a
-
-instance MonadIO IO where liftIO = id
-#endif
+import Control.Monad.IO.Class
 
 -------------------------------------------------------------------------------
 -- Lift combinators
@@ -103,7 +64,7 @@ zipWith3M :: Monad m => (a -> b -> c -> m d) -> [a] -> [b] -> [c] -> m [d]
 zipWith3M _ []     _      _      = return []
 zipWith3M _ _      []     _      = return []
 zipWith3M _ _      _      []     = return []
-zipWith3M f (x:xs) (y:ys) (z:zs) 
+zipWith3M f (x:xs) (y:ys) (z:zs)
   = do { r  <- f x y z
        ; rs <- zipWith3M f xs ys zs
        ; return $ r:rs
@@ -163,7 +124,7 @@ fmapEitherM _ fr (Right b) = fr b >>= (return . Right)
 anyM :: Monad m => (a -> m Bool) -> [a] -> m Bool
 anyM _ []     = return False
 anyM f (x:xs) = do b <- f x
-                   if b then return True 
+                   if b then return True
                         else anyM f xs
 
 -- | Monad version of 'all', aborts the computation at the first @False@ value

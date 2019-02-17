@@ -5,8 +5,8 @@
 # This file is part of the GHC build system.
 #
 # To understand how the build system works and how to modify it, see
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Architecture
-#      http://hackage.haskell.org/trac/ghc/wiki/Building/Modifying
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Architecture
+#      http://ghc.haskell.org/trac/ghc/wiki/Building/Modifying
 #
 # -----------------------------------------------------------------------------
 
@@ -43,12 +43,10 @@ $(call clean-target,$1,$2,$1/$2)
 
 distclean : clean_$1_$2_config
 
-maintainer-clean : distclean
-
 .PHONY: clean_$1_$2_config
 clean_$1_$2_config:
-	"$$(RM)" $$(RM_OPTS) $1/config.log $1/config.status $1/include/Hs*Config.h
-	"$$(RM)" $$(RM_OPTS_REC) $1/autom4te.cache
+	$$(call removeFiles,$1/config.log $1/config.status $(wildcard $1/include/Hs*Config.h))
+	$$(call removeTrees,$1/autom4te.cache)
 
 ifneq "$$($1_$2_NOT_NEEDED)" "YES"
 $$(eval $$(call build-package-helper,$1,$2,$3))
@@ -66,11 +64,24 @@ define build-package-helper
 
 $(call package-config,$1,$2,$3)
 
+ifeq "$3" "1"
+$$($1_PACKAGE)_INSTALL_INFO = $1_$2
+endif
+
 # Bootstrapping libs are only built one way
 ifeq "$3" "0"
 $1_$2_WAYS = v
 else
-$1_$2_WAYS = $$(GhcLibWays)
+$1_$2_WAYS = $$(filter-out $$($1_$2_EXCLUDED_WAYS),$$(GhcLibWays))
+endif
+
+$1_$2_DYNAMIC_TOO = NO
+ifneq "$$(DYNAMIC_TOO)" "NO"
+ifneq "$$(filter v,$$($1_$2_WAYS))" ""
+ifneq "$$(filter dyn,$$($1_$2_WAYS))" ""
+$1_$2_DYNAMIC_TOO = YES
+endif
+endif
 endif
 
 # We must use a different dependency file if $(GhcLibWays) changes, so
@@ -85,6 +96,10 @@ include $1/$2/package-data.mk
 else ifeq "$(phase)" "final"
 include $1/$2/package-data.mk
 endif
+# Each Haskell compilation in this package will depend on the
+# package-data.mk file because e.g. if the version of the package
+# changes we need to recompile everything in it.
+$1_$2_PKGDATA_DEP = $1/$2/package-data.mk
 endif
 
 # We don't bother splitting the bootstrap packages (built with stage 0)
@@ -99,6 +114,7 @@ endif
 $(call hs-sources,$1,$2)
 $(call c-sources,$1,$2)
 $(call includes-sources,$1,$2)
+$(call distdir-opts,$1,$2,$3)
 
 $(call dependencies,$1,$2,$3)
 
@@ -111,11 +127,21 @@ $$(foreach way,$$($1_$2_WAYS),$$(eval \
     $$(call build-package-way,$1,$2,$$(way),$3) \
   ))
 
+# Programs will need to depend on either the vanilla lib (if -static
+# is the default) or the dyn lib (if -dynamic is the default). We
+# conservatively make them depend on both, to keep things simple.
+# If dyn libs are not being built then $$($1_$2_dyn_LIB) will just
+# expand to the empty string, and be ignored.
+$1_$2_PROGRAM_DEP_LIB = $$($1_$2_v_LIB) $$($1_$2_dyn_LIB)
+$$($1_PACKAGE)-$$($1_$2_VERSION)_$2_PROGRAM_DEP_LIB = $$($1_$2_PROGRAM_DEP_LIB)
+
 # C and S files are possibly built the "dyn" way.
 ifeq "$$(BuildSharedLibs)" "YES"
 $(call c-objs,$1,$2,dyn)
 $(call c-suffix-rules,$1,$2,dyn,YES)
 endif
+$$(foreach dir,$$($1_$2_HS_SRC_DIRS),\
+  $$(eval $$(call hs-suffix-rules-srcdir,$1,$2,$$(dir))))
 
 $(call all-target,$1,all_$1_$2)
 # This give us things like
@@ -124,15 +150,9 @@ ifneq "$$($1_$2_GROUP)" ""
 all_$$($1_$2_GROUP): all_$1_$2
 endif
 
-ifneq "$$(CHECKED_$1)" "YES"
-CHECKED_$1 = YES
-check_packages: check_$1
-.PHONY: check_$1
-check_$1: $$(GHC_CABAL_INPLACE)
-	$$(GHC_CABAL_INPLACE) check $1
-endif
-
+ifneq "$3" "0"
 $(call haddock,$1,$2)
+endif
 
 # Don't put bootstrapping packages in the bindist
 ifneq "$3" "0"

@@ -8,26 +8,31 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * ---------------------------------------------------------------------------*/
 
 #ifndef RTS_THREADS_H
 #define RTS_THREADS_H
 
+#ifdef HAVE_SYS_TYPES_H
+#include <sys/types.h>
+#endif
+
 // 
 // Creating threads
 //
-StgTSO *createThread (Capability *cap, nat stack_size);
+StgTSO *createThread (Capability *cap, W_ stack_size);
 
-Capability *scheduleWaitThread (StgTSO *tso, /*out*/HaskellObj* ret,
-				Capability *cap);
+void scheduleWaitThread (/* in    */ StgTSO *tso,
+                         /* out   */ HaskellObj* ret,
+                         /* inout */ Capability **cap);
 
-StgTSO *createGenThread       (Capability *cap, nat stack_size,  
+StgTSO *createGenThread       (Capability *cap, W_ stack_size,
 			       StgClosure *closure);
-StgTSO *createIOThread        (Capability *cap, nat stack_size,  
+StgTSO *createIOThread        (Capability *cap, W_ stack_size,
 			       StgClosure *closure);
-StgTSO *createStrictIOThread  (Capability *cap, nat stack_size,  
+StgTSO *createStrictIOThread  (Capability *cap, W_ stack_size,
 			       StgClosure *closure);
 
 // Suspending/resuming threads around foreign calls
@@ -52,8 +57,17 @@ HsBool rtsSupportsBoundThreads (void);
 // The number of Capabilities
 extern unsigned int n_capabilities;
 
+// The number of Capabilities that are not disabled
+extern nat enabled_capabilities;
+
 #if !IN_STG_CODE
 extern Capability MainCapability;
 #endif
+
+//
+// Change the number of capabilities (only supports increasing the
+// current value at the moment).
+//
+extern void setNumCapabilities (nat new_);
 
 #endif /* RTS_THREADS_H */

@@ -7,7 +7,7 @@
  * Documentation on the architecture of the Garbage Collector can be
  * found in the online commentary:
  * 
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/Rts/Storage/GC
  *
  * ---------------------------------------------------------------------------*/
 
@@ -23,7 +23,7 @@ sweep(generation *gen)
 {
     bdescr *bd, *prev, *next;
     nat i;
-    nat freed, resid, fragd, blocks, live;
+    W_ freed, resid, fragd, blocks, live;
     
     ASSERT(countBlocks(gen->old_blocks) == gen->n_old_blocks);
 

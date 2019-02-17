@@ -9,7 +9,11 @@
 #ifndef LINKERINTERNALS_H
 #define LINKERINTERNALS_H
 
-typedef enum { OBJECT_LOADED, OBJECT_RESOLVED } OStatus;
+typedef enum {
+    OBJECT_LOADED,
+    OBJECT_RESOLVED,
+    OBJECT_UNLOADED
+} OStatus;
 
 /* Indication of section kinds for loaded objects.  Needed by
    the GC for deciding whether or not a pointer on the stack
@@ -18,6 +22,7 @@ typedef enum { OBJECT_LOADED, OBJECT_RESOLVED } OStatus;
 typedef 
    enum { SECTIONKIND_CODE_OR_RODATA,
           SECTIONKIND_RWDATA,
+          SECTIONKIND_INIT_ARRAY,
           SECTIONKIND_OTHER,
           SECTIONKIND_NOINFOAVAIL } 
    SectionKind;
@@ -39,8 +44,19 @@ typedef
    }
    ProddableBlock;
 
+/*
+ * We must keep track of the StablePtrs that are created for foreign
+ * exports by constructor functions when the module is loaded, so that
+ * we can free them again when the module is unloaded.  If we don't do
+ * this, then the StablePtr will keep the module alive indefinitely.
+ */
+typedef struct ForeignExportStablePtr_ {
+    StgStablePtr stable_ptr;
+    struct ForeignExportStablePtr_ *next;
+} ForeignExportStablePtr;
+
 /* Jump Islands are sniplets of machine code required for relative
- * address relocations on the PowerPC.
+ * address relocations on the PowerPC, x86_64 and ARM.
  */
 typedef struct {
 #ifdef powerpc_HOST_ARCH
@@ -53,6 +69,8 @@ typedef struct {
 #elif x86_64_HOST_ARCH
     uint64_t    addr;
     uint8_t     jumpIsland[6];
+#elif arm_HOST_ARCH
+    uint8_t     jumpIsland[16];
 #endif
 } SymbolExtra;
 
@@ -61,7 +79,7 @@ typedef struct {
  */
 typedef struct _ObjectCode {
     OStatus    status;
-    char*      fileName;
+    pathchar  *fileName;
     int        fileSize;
     char*      formatName;            /* eg "ELF32", "DLL", "COFF", etc. */
 
@@ -79,6 +97,9 @@ typedef struct _ObjectCode {
 
     /* ptr to malloc'd lump of memory holding the obj file */
     char*      image;
+
+    /* flag used when deciding whether to unload an object file */
+    int        referenced;
 
 #ifdef darwin_HOST_OS
     /* record by how much image has been deliberately misaligned
@@ -104,11 +125,13 @@ typedef struct _ObjectCode {
     unsigned int pltIndex;
 #endif
 
-#if powerpc_HOST_ARCH || x86_64_HOST_ARCH
+#if powerpc_HOST_ARCH || x86_64_HOST_ARCH || arm_HOST_ARCH
     SymbolExtra    *symbol_extras;
     unsigned long   first_symbol_extra;
     unsigned long   n_symbol_extras;
 #endif
+
+    ForeignExportStablePtr *stable_ptrs;
 
 } ObjectCode;
 
@@ -119,7 +142,10 @@ typedef struct _ObjectCode {
     )
 
 extern ObjectCode *objects;
+extern ObjectCode *unloaded_objects;
 
 void exitLinker( void );
+
+void freeObjectCode (ObjectCode *oc);
 
 #endif /* LINKERINTERNALS_H */

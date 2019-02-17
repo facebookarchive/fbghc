@@ -10,6 +10,7 @@
 #include "Rts.h"
 #include "rts/Bytecodes.h"  /* for InstrPtr */
 
+#include "sm/Storage.h"
 #include "Printer.h"
 #include "RtsUtils.h"
 
@@ -91,7 +92,7 @@ printThunkPayload( StgThunk *obj )
     StgWord i, j;
     const StgInfoTable* info;
 
-    info = get_itbl(obj);
+    info = get_itbl((StgClosure *)obj);
     for (i = 0; i < info->layout.payload.ptrs; ++i) {
         debugBelch(", ");
         printPtr((StgPtr)obj->payload[i]);
@@ -147,7 +148,7 @@ printClosure( StgClosure *obj )
     case FUN_1_0: case FUN_0_1: 
     case FUN_1_1: case FUN_0_2: case FUN_2_0:
     case FUN_STATIC:
-	debugBelch("FUN/%d(",itbl_to_fun_itbl(info)->f.arity);
+	debugBelch("FUN/%d(",(int)itbl_to_fun_itbl(info)->f.arity);
 	printPtr((StgPtr)obj->header.info);
 #ifdef PROFILING
 	debugBelch(", %s", obj->header.prof.ccs->cc->label);
@@ -157,6 +158,12 @@ printClosure( StgClosure *obj )
 
     case PRIM:
 	debugBelch("PRIM(");
+	printPtr((StgPtr)obj->header.info);
+	printStdObjPayload(obj);
+	break;
+
+    case MUT_PRIM:
+        debugBelch("MUT_PRIM(");
 	printPtr((StgPtr)obj->header.info);
 	printStdObjPayload(obj);
 	break;
@@ -199,7 +206,7 @@ printClosure( StgClosure *obj )
         {
 	    StgPAP* pap = (StgPAP*)obj;
             StgWord i;
-            debugBelch("PAP/%d(",pap->arity); 
+            debugBelch("PAP/%d(",(int)pap->arity); 
 	    printPtr((StgPtr)pap->fun);
             for (i = 0; i < pap->n_args; ++i) {
                 debugBelch(", ");
@@ -250,15 +257,14 @@ printClosure( StgClosure *obj )
     case RET_BCO:
     case RET_SMALL:
     case RET_BIG:
-    case RET_DYN:
     case RET_FUN:
     */
 
     case UPDATE_FRAME:
         {
             StgUpdateFrame* u = (StgUpdateFrame*)obj;
-            debugBelch("UPDATE_FRAME(");
-            printPtr((StgPtr)GET_INFO(u));
+            debugBelch("%s(", info_update_frame(obj));
+            printPtr((StgPtr)GET_INFO((StgClosure *)u));
             debugBelch(",");
             printPtr((StgPtr)u->updatee);
             debugBelch(")\n"); 
@@ -269,7 +275,7 @@ printClosure( StgClosure *obj )
         {
             StgCatchFrame* u = (StgCatchFrame*)obj;
             debugBelch("CATCH_FRAME(");
-            printPtr((StgPtr)GET_INFO(u));
+            printPtr((StgPtr)GET_INFO((StgClosure *)u));
             debugBelch(",");
             printPtr((StgPtr)u->handler);
             debugBelch(")\n"); 
@@ -289,7 +295,7 @@ printClosure( StgClosure *obj )
         {
             StgStopFrame* u = (StgStopFrame*)obj;
             debugBelch("STOP_FRAME(");
-            printPtr((StgPtr)GET_INFO(u));
+            printPtr((StgPtr)GET_INFO((StgClosure *)u));
             debugBelch(")\n"); 
             break;
         }
@@ -299,21 +305,21 @@ printClosure( StgClosure *obj )
             StgWord i;
             debugBelch("ARR_WORDS(\"");
 	    for (i=0; i<arr_words_words((StgArrWords *)obj); i++)
-	      debugBelch("%lu", (lnat)((StgArrWords *)obj)->payload[i]);
+	      debugBelch("%" FMT_Word, (W_)((StgArrWords *)obj)->payload[i]);
             debugBelch("\")\n");
             break;
         }
 
     case MUT_ARR_PTRS_CLEAN:
-	debugBelch("MUT_ARR_PTRS_CLEAN(size=%lu)\n", (lnat)((StgMutArrPtrs *)obj)->ptrs);
+	debugBelch("MUT_ARR_PTRS_CLEAN(size=%" FMT_Word ")\n", (W_)((StgMutArrPtrs *)obj)->ptrs);
 	break;
 
     case MUT_ARR_PTRS_DIRTY:
-	debugBelch("MUT_ARR_PTRS_DIRTY(size=%lu)\n", (lnat)((StgMutArrPtrs *)obj)->ptrs);
+	debugBelch("MUT_ARR_PTRS_DIRTY(size=%" FMT_Word ")\n", (W_)((StgMutArrPtrs *)obj)->ptrs);
 	break;
 
     case MUT_ARR_PTRS_FROZEN:
-	debugBelch("MUT_ARR_PTRS_FROZEN(size=%lu)\n", (lnat)((StgMutArrPtrs *)obj)->ptrs);
+	debugBelch("MUT_ARR_PTRS_FROZEN(size=%" FMT_Word ")\n", (W_)((StgMutArrPtrs *)obj)->ptrs);
 	break;
 
     case MVAR_CLEAN:
@@ -321,6 +327,13 @@ printClosure( StgClosure *obj )
         {
 	  StgMVar* mv = (StgMVar*)obj;
 	  debugBelch("MVAR(head=%p, tail=%p, value=%p)\n", mv->head, mv->tail, mv->value);
+          break;
+        }
+
+    case TVAR:
+        {
+          StgTVar* tv = (StgTVar*)obj;
+          debugBelch("TVAR(value=%p, wq=%p, num_updates=%" FMT_Word ")\n", tv->current_value, tv->first_watch_queue_entry, tv->num_updates);
           break;
         }
 
@@ -354,6 +367,10 @@ printClosure( StgClosure *obj )
       debugBelch(")\n"); 
       break;
 
+    case STACK:
+      debugBelch("STACK");
+      break;
+
 #if 0
       /* Symptomatic of a problem elsewhere, have it fall-through & fail */
     case EVACUATED:
@@ -366,9 +383,27 @@ printClosure( StgClosure *obj )
     default:
             //barf("printClosure %d",get_itbl(obj)->type);
             debugBelch("*** printClosure: unknown type %d ****\n",
-                    get_itbl(obj)->type );
+                    (int)get_itbl(obj)->type );
             barf("printClosure %d",get_itbl(obj)->type);
             return;
+    }
+}
+
+// If you know you have an UPDATE_FRAME, but want to know exactly which.
+char *info_update_frame(StgClosure *closure) {
+    // Note: We intentionally don't take the info table pointer as
+    // an argument. As it will be confusing whether one should pass
+    // it pointing to the code or struct members when compiling with
+    // TABLES_NEXT_TO_CODE.
+    const StgInfoTable *info = closure->header.info;
+    if (info == &stg_upd_frame_info) {
+        return "NORMAL_UPDATE_FRAME";
+    } else if (info == &stg_bh_upd_frame_info) {
+        return "BH_UPDATE_FRAME";
+    } else if (info == &stg_marked_upd_frame_info) {
+        return "MARKED_UPDATE_FRAME";
+    } else {
+        return "ERROR: Not an update frame!!!";
     }
 }
 
@@ -418,17 +453,15 @@ printStackObj( StgPtr sp )
 static void
 printSmallBitmap( StgPtr spBottom, StgPtr payload, StgWord bitmap, nat size )
 {
-    StgPtr p;
     nat i;
 
-    p = payload;
     for(i = 0; i < size; i++, bitmap >>= 1 ) {
 	debugBelch("   stk[%ld] (%p) = ", (long)(spBottom-(payload+i)), payload+i);
 	if ((bitmap & 1) == 0) {
 	    printPtr((P_)payload[i]);
 	    debugBelch("\n");
 	} else {
-	    debugBelch("Word# %lu\n", (lnat)payload[i]);
+	    debugBelch("Word# %" FMT_Word "\n", (W_)payload[i]);
 	}
     }
 }
@@ -444,12 +477,12 @@ printLargeBitmap( StgPtr spBottom, StgPtr payload, StgLargeBitmap* large_bitmap,
 	StgWord bitmap = large_bitmap->bitmap[bmp];
 	j = 0;
 	for(; i < size && j < BITS_IN(W_); j++, i++, bitmap >>= 1 ) {
-	    debugBelch("   stk[%lu] (%p) = ", (lnat)(spBottom-(payload+i)), payload+i);
+	    debugBelch("   stk[%" FMT_Word "] (%p) = ", (W_)(spBottom-(payload+i)), payload+i);
 	    if ((bitmap & 1) == 0) {
 		printPtr((P_)payload[i]);
 		debugBelch("\n");
 	    } else {
-		debugBelch("Word# %lu\n", (lnat)payload[i]);
+		debugBelch("Word# %" FMT_Word "\n", (W_)payload[i]);
 	    }
 	}
     }
@@ -475,38 +508,7 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
             printObj((StgClosure*)sp);
 	    continue;
 
-	case RET_DYN:
-	{ 
-	    StgRetDyn* r;
-	    StgPtr p;
-	    StgWord dyn;
-	    nat size;
-
-	    r = (StgRetDyn *)sp;
-	    dyn = r->liveness;
-	    debugBelch("RET_DYN (%p)\n", r);
-
-	    p = (P_)(r->payload);
-	    printSmallBitmap(spBottom, sp,
-			     RET_DYN_LIVENESS(r->liveness), 
-			     RET_DYN_BITMAP_SIZE);
-	    p += RET_DYN_BITMAP_SIZE + RET_DYN_NONPTR_REGS_SIZE;
-
-	    for (size = RET_DYN_NONPTRS(dyn); size > 0; size--) {
-		debugBelch("   stk[%ld] (%p) = ", (long)(spBottom-p), p);
-		debugBelch("Word# %ld\n", (long)*p);
-		p++;
-	    }
-	
-	    for (size = RET_DYN_PTRS(dyn); size > 0; size--) {
-		debugBelch("   stk[%ld] (%p) = ", (long)(spBottom-p), p);
-		printPtr(p);
-		p++;
-	    }
-	    continue;
-	}
-
-	case RET_SMALL:
+        case RET_SMALL:
 	    debugBelch("RET_SMALL (%p)\n", info);
 	    bitmap = info->layout.bitmap;
 	    printSmallBitmap(spBottom, sp+1, 
@@ -531,12 +533,10 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
 	{
 	    StgFunInfoTable *fun_info;
 	    StgRetFun *ret_fun;
-	    nat size;
 
 	    ret_fun = (StgRetFun *)sp;
 	    fun_info = get_fun_itbl(ret_fun->fun);
-	    size = ret_fun->size;
-	    debugBelch("RET_FUN (%p) (type=%d)\n", ret_fun->fun, fun_info->f.fun_type);
+	    debugBelch("RET_FUN (%p) (type=%d)\n", ret_fun->fun, (int)fun_info->f.fun_type);
 	    switch (fun_info->f.fun_type) {
 	    case ARG_GEN:
 		printSmallBitmap(spBottom, sp+2,
@@ -558,7 +558,7 @@ printStackChunk( StgPtr sp, StgPtr spBottom )
 	}
 	   
 	default:
-	    debugBelch("unknown object %d\n", info->type);
+	    debugBelch("unknown object %d\n", (int)info->type);
 	    barf("printStackChunk");
 	}
     }
@@ -942,12 +942,18 @@ findPtrBlocks (StgPtr p, bdescr *bd, StgPtr arr[], int arr_size, int i)
 void
 findPtr(P_ p, int follow)
 {
-  nat g;
+  nat g, n;
   bdescr *bd;
   const int arr_size = 1024;
   StgPtr arr[arr_size];
   int i = 0;
   searched = 0;
+
+  for (n = 0; n < n_capabilities; n++) {
+      bd = nurseries[i].blocks;
+      i = findPtrBlocks(p,bd,arr,arr_size,i);
+      if (i >= arr_size) return;
+  }
 
   for (g = 0; g < RtsFlags.GcFlags.generations; g++) {
       bd = generations[g].blocks;
@@ -1105,16 +1111,16 @@ char *closure_type_names[] = {
  [RET_BCO]               = "RET_BCO",
  [RET_SMALL]             = "RET_SMALL",
  [RET_BIG]               = "RET_BIG",
- [RET_DYN]               = "RET_DYN",
  [RET_FUN]               = "RET_FUN",
  [UPDATE_FRAME]          = "UPDATE_FRAME",
  [CATCH_FRAME]           = "CATCH_FRAME",
  [UNDERFLOW_FRAME]       = "UNDERFLOW_FRAME",
  [STOP_FRAME]            = "STOP_FRAME",
- [BLACKHOLE]             = "BLACKHOLE",
  [BLOCKING_QUEUE]        = "BLOCKING_QUEUE",
+ [BLACKHOLE]             = "BLACKHOLE",
  [MVAR_CLEAN]            = "MVAR_CLEAN",
  [MVAR_DIRTY]            = "MVAR_DIRTY",
+ [TVAR]                  = "TVAR",
  [ARR_WORDS]             = "ARR_WORDS",
  [MUT_ARR_PTRS_CLEAN]    = "MUT_ARR_PTRS_CLEAN",
  [MUT_ARR_PTRS_DIRTY]    = "MUT_ARR_PTRS_DIRTY",

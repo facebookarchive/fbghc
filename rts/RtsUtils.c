@@ -114,12 +114,12 @@ stgFree(void* p)
    -------------------------------------------------------------------------- */
 
 void
-stackOverflow(void)
+stackOverflow(StgTSO* tso)
 {
-  StackOverflowHook(RtsFlags.GcFlags.maxStkSize * sizeof(W_));
+    StackOverflowHook(tso->tot_stack_size * sizeof(W_));
 
 #if defined(TICKY_TICKY)
-  if (RtsFlags.TickyFlags.showTickyStats) PrintTickyInfo();
+    if (RtsFlags.TickyFlags.showTickyStats) PrintTickyInfo();
 #endif
 }
 
@@ -130,30 +130,10 @@ heapOverflow(void)
     {
         /* don't fflush(stdout); WORKAROUND bug in Linux glibc */
         OutOfHeapHook(0/*unknown request size*/,
-                      RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE);
+                      (W_)RtsFlags.GcFlags.maxHeapSize * BLOCK_SIZE);
 
         heap_overflow = rtsTrue;
     }
-}
-
-/* -----------------------------------------------------------------------------
-   genSym stuff, used by GHC itself for its splitting unique supply.
-
-   ToDo: put this somewhere sensible.
-   -------------------------------------------------------------------------  */
-
-static HsInt __GenSymCounter = 0;
-
-HsInt
-genSymZh(void)
-{
-    return(__GenSymCounter++);
-}
-HsInt
-resetGenSymZh(void) /* it's your funeral */
-{
-    __GenSymCounter=0;
-    return(__GenSymCounter);
 }
 
 /* -----------------------------------------------------------------------------
@@ -272,7 +252,7 @@ heapCheckFail( void )
  * genericRaise(), rather than raise(3).
  */
 int genericRaise(int sig) {
-#if defined(THREADED_RTS) && (defined(openbsd_HOST_OS) || defined(freebsd_HOST_OS) || defined(dragonfly_HOST_OS))
+#if defined(THREADED_RTS) && (defined(openbsd_HOST_OS) || defined(freebsd_HOST_OS) || defined(dragonfly_HOST_OS) || defined(netbsd_HOST_OS) || defined(darwin_HOST_OS))
         return pthread_kill(pthread_self(), sig);
 #else
         return raise(sig);
@@ -318,6 +298,17 @@ void printRtsInfo(void) {
 int rts_isProfiled(void)
 {
 #ifdef PROFILING
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+// Provides a way for Haskell programs to tell whether they're
+// dynamically-linked or not.
+int rts_isDynamic(void)
+{
+#ifdef DYNAMIC
     return 1;
 #else
     return 0;

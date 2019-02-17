@@ -1,46 +1,417 @@
 \begin{code}
 module TcCanonical(
-    mkCanonical, mkCanonicals, mkCanonicalFEV, mkCanonicalFEVs, canWanteds, canGivens,
-    canOccursCheck, canEqToWorkList,
-    rewriteWithFunDeps
+    canonicalize, emitWorkNC,
+    StopOrContinue (..)
  ) where
 
 #include "HsVersions.h"
 
-import BasicTypes
-import Type
 import TcRnTypes
-import FunDeps
-import qualified TcMType as TcM
 import TcType
-import TcErrors
-import Coercion
+import Type
+import Kind
+import TcEvidence
 import Class
 import TyCon
 import TypeRep
-import Name
 import Var
-import VarEnv		( TidyEnv )
+import VarEnv
+import OccName( OccName )
 import Outputable
-import Control.Monad    ( unless, when, zipWithM, zipWithM_ )
-import MonadUtils
-import Control.Applicative ( (<|>) )
-
+import Control.Monad    ( when )
+import DynFlags( DynFlags )
 import VarSet
-import Bag
-
-import HsBinds
 import TcSMonad
 import FastString
+
+import Util
+import BasicTypes
+import Maybes( catMaybes )
 \end{code}
 
-Note [Canonicalisation]
-~~~~~~~~~~~~~~~~~~~~~~~
-* Converts (Constraint f) _which_does_not_contain_proper_implications_ to CanonicalCts
-* Unary: treats individual constraints one at a time
-* Does not do any zonking
-* Lives in TcS monad so that it can create new skolem variables
 
+%************************************************************************
+%*                                                                      *
+%*                      The Canonicaliser                               *
+%*                                                                      *
+%************************************************************************
+
+Note [Canonicalization]
+~~~~~~~~~~~~~~~~~~~~~~~
+
+Canonicalization converts a flat constraint to a canonical form. It is
+unary (i.e. treats individual constraints one at a time), does not do
+any zonking, but lives in TcS monad because it needs to create fresh
+variables (for flattening) and consult the inerts (for efficiency).
+
+The execution plan for canonicalization is the following:
+
+  1) Decomposition of equalities happens as necessary until we reach a
+     variable or type family in one side. There is no decomposition step
+     for other forms of constraints.
+
+  2) If, when we decompose, we discover a variable on the head then we
+     look at inert_eqs from the current inert for a substitution for this
+     variable and contine decomposing. Hence we lazily apply the inert
+     substitution if it is needed.
+
+  3) If no more decomposition is possible, we deeply apply the substitution
+     from the inert_eqs and continue with flattening.
+
+  4) During flattening, we examine whether we have already flattened some
+     function application by looking at all the CTyFunEqs with the same
+     function in the inert set. The reason for deeply applying the inert
+     substitution at step (3) is to maximise our chances of matching an
+     already flattened family application in the inert.
+
+The net result is that a constraint coming out of the canonicalization
+phase cannot be rewritten any further from the inerts (but maybe /it/ can
+rewrite an inert or still interact with an inert in a further phase in the
+simplifier.
+
+\begin{code}
+
+-- Informative results of canonicalization
+data StopOrContinue
+  = ContinueWith Ct   -- Either no canonicalization happened, or if some did
+                      -- happen, it is still safe to just keep going with this
+                      -- work item.
+  | Stop              -- Some canonicalization happened, extra work is now in
+                      -- the TcS WorkList.
+
+instance Outputable StopOrContinue where
+  ppr Stop             = ptext (sLit "Stop")
+  ppr (ContinueWith w) = ptext (sLit "ContinueWith") <+> ppr w
+
+
+continueWith :: Ct -> TcS StopOrContinue
+continueWith = return . ContinueWith
+
+andWhenContinue :: TcS StopOrContinue
+                -> (Ct -> TcS StopOrContinue)
+                -> TcS StopOrContinue
+andWhenContinue tcs1 tcs2
+  = do { r <- tcs1
+       ; case r of
+           Stop            -> return Stop
+           ContinueWith ct -> tcs2 ct }
+
+\end{code}
+
+Note [Caching for canonicals]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Our plan with pre-canonicalization is to be able to solve a constraint
+really fast from existing bindings in TcEvBinds. So one may think that
+the condition (isCNonCanonical) is not necessary.  However consider
+the following setup:
+
+InertSet = { [W] d1 : Num t }
+WorkList = { [W] d2 : Num t, [W] c : t ~ Int}
+
+Now, we prioritize equalities, but in our concrete example
+(should_run/mc17.hs) the first (d2) constraint is dealt with first,
+because (t ~ Int) is an equality that only later appears in the
+worklist since it is pulled out from a nested implication
+constraint. So, let's examine what happens:
+
+   - We encounter work item (d2 : Num t)
+
+   - Nothing is yet in EvBinds, so we reach the interaction with inerts
+     and set:
+              d2 := d1
+    and we discard d2 from the worklist. The inert set remains unaffected.
+
+   - Now the equation ([W] c : t ~ Int) is encountered and kicks-out
+     (d1 : Num t) from the inerts.  Then that equation gets
+     spontaneously solved, perhaps. We end up with:
+        InertSet : { [G] c : t ~ Int }
+        WorkList : { [W] d1 : Num t}
+
+   - Now we examine (d1), we observe that there is a binding for (Num
+     t) in the evidence binds and we set:
+             d1 := d2
+     and end up in a loop!
+
+Now, the constraints that get kicked out from the inert set are always
+Canonical, so by restricting the use of the pre-canonicalizer to
+NonCanonical constraints we eliminate this danger. Moreover, for
+canonical constraints we already have good caching mechanisms
+(effectively the interaction solver) and we are interested in reducing
+things like superclasses of the same non-canonical constraint being
+generated hence I don't expect us to lose a lot by introducing the
+(isCNonCanonical) restriction.
+
+A similar situation can arise in TcSimplify, at the end of the
+solve_wanteds function, where constraints from the inert set are
+returned as new work -- our substCt ensures however that if they are
+not rewritten by subst, they remain canonical and hence we will not
+attempt to solve them from the EvBinds. If on the other hand they did
+get rewritten and are now non-canonical they will still not match the
+EvBinds, so we are again good.
+
+
+
+\begin{code}
+
+-- Top-level canonicalization
+-- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+canonicalize :: Ct -> TcS StopOrContinue
+canonicalize ct@(CNonCanonical { cc_ev = ev })
+  = do { traceTcS "canonicalize (non-canonical)" (ppr ct)
+       ; {-# SCC "canEvVar" #-}
+         canEvNC ev }
+
+canonicalize (CDictCan { cc_ev = ev
+                       , cc_class  = cls
+                       , cc_tyargs = xis })
+  = {-# SCC "canClass" #-}
+    canClass ev cls xis -- Do not add any superclasses
+canonicalize (CTyEqCan { cc_ev = ev
+                       , cc_tyvar  = tv
+                       , cc_rhs    = xi })
+  = {-# SCC "canEqLeafTyVarEq" #-}
+    canEqTyVar ev NotSwapped tv xi xi
+
+canonicalize (CFunEqCan { cc_ev = ev
+                        , cc_fun    = fn
+                        , cc_tyargs = xis1
+                        , cc_rhs    = xi2 })
+  = {-# SCC "canEqLeafFunEq" #-}
+    canEqLeafFun ev NotSwapped fn xis1 xi2 xi2
+
+canonicalize (CIrredEvCan { cc_ev = ev })
+  = canIrred ev
+canonicalize (CHoleCan { cc_ev = ev, cc_occ = occ })
+  = canHole ev occ
+
+canEvNC :: CtEvidence -> TcS StopOrContinue
+-- Called only for non-canonical EvVars
+canEvNC ev
+  = case classifyPredType (ctEvPred ev) of
+      ClassPred cls tys -> traceTcS "canEvNC:cls" (ppr cls <+> ppr tys) >> canClassNC ev cls tys
+      EqPred ty1 ty2    -> traceTcS "canEvNC:eq" (ppr ty1 $$ ppr ty2)   >> canEqNC    ev ty1 ty2
+      TuplePred tys     -> traceTcS "canEvNC:tup" (ppr tys)             >> canTuple   ev tys
+      IrredPred {}      -> traceTcS "canEvNC:irred" (ppr (ctEvPred ev)) >> canIrred   ev
+\end{code}
+
+
+%************************************************************************
+%*                                                                      *
+%*                      Tuple Canonicalization
+%*                                                                      *
+%************************************************************************
+
+\begin{code}
+canTuple :: CtEvidence -> [PredType] -> TcS StopOrContinue
+canTuple ev tys
+  = do { traceTcS "can_pred" (text "TuplePred!")
+       ; let xcomp = EvTupleMk
+             xdecomp x = zipWith (\_ i -> EvTupleSel x i) tys [0..]
+       ; ctevs <- xCtEvidence ev (XEvTerm tys xcomp xdecomp)
+       ; canEvVarsCreated ctevs }
+\end{code}
+
+%************************************************************************
+%*                                                                      *
+%*                      Class Canonicalization
+%*                                                                      *
+%************************************************************************
+
+\begin{code}
+canClass, canClassNC
+   :: CtEvidence
+   -> Class -> [Type] -> TcS StopOrContinue
+-- Precondition: EvVar is class evidence
+
+-- The canClassNC version is used on non-canonical constraints
+-- and adds superclasses.  The plain canClass version is used
+-- for already-canonical class constraints (but which might have
+-- been subsituted or somthing), and hence do not need superclasses
+
+canClassNC ev cls tys
+  = canClass ev cls tys
+    `andWhenContinue` emitSuperclasses
+
+canClass ev cls tys
+  = do { (xis, cos) <- flattenMany FMFullFlatten ev tys
+       ; let co = mkTcTyConAppCo Nominal (classTyCon cls) cos
+             xi = mkClassPred cls xis
+       ; mb <- rewriteEvidence ev xi co
+       ; traceTcS "canClass" (vcat [ ppr ev <+> ppr cls <+> ppr tys
+                                   , ppr xi, ppr mb ])
+       ; case mb of
+           Nothing -> return Stop
+           Just new_ev -> continueWith $
+                          CDictCan { cc_ev = new_ev
+                                   , cc_tyargs = xis, cc_class = cls } }
+
+emitSuperclasses :: Ct -> TcS StopOrContinue
+emitSuperclasses ct@(CDictCan { cc_ev = ev , cc_tyargs = xis_new, cc_class = cls })
+            -- Add superclasses of this one here, See Note [Adding superclasses].
+            -- But only if we are not simplifying the LHS of a rule.
+ = do { newSCWorkFromFlavored ev cls xis_new
+      -- Arguably we should "seq" the coercions if they are derived,
+      -- as we do below for emit_kind_constraint, to allow errors in
+      -- superclasses to be executed if deferred to runtime!
+      ; continueWith ct }
+emitSuperclasses _ = panic "emit_superclasses of non-class!"
+\end{code}
+
+Note [Adding superclasses]
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Since dictionaries are canonicalized only once in their lifetime, the
+place to add their superclasses is canonicalisation (The alternative
+would be to do it during constraint solving, but we'd have to be
+extremely careful to not repeatedly introduced the same superclass in
+our worklist). Here is what we do:
+
+For Givens:
+       We add all their superclasses as Givens.
+
+For Wanteds:
+       Generally speaking we want to be able to add superclasses of
+       wanteds for two reasons:
+
+       (1) Oportunities for improvement. Example:
+                  class (a ~ b) => C a b
+           Wanted constraint is: C alpha beta
+           We'd like to simply have C alpha alpha. Similar
+           situations arise in relation to functional dependencies.
+
+       (2) To have minimal constraints to quantify over:
+           For instance, if our wanted constraint is (Eq a, Ord a)
+           we'd only like to quantify over Ord a.
+
+       To deal with (1) above we only add the superclasses of wanteds
+       which may lead to improvement, that is: equality superclasses or
+       superclasses with functional dependencies.
+
+       We deal with (2) completely independently in TcSimplify. See
+       Note [Minimize by SuperClasses] in TcSimplify.
+
+
+       Moreover, in all cases the extra improvement constraints are
+       Derived. Derived constraints have an identity (for now), but
+       we don't do anything with their evidence. For instance they
+       are never used to rewrite other constraints.
+
+       See also [New Wanted Superclass Work] in TcInteract.
+
+
+For Deriveds:
+       We do nothing.
+
+Here's an example that demonstrates why we chose to NOT add
+superclasses during simplification: [Comes from ticket #4497]
+
+   class Num (RealOf t) => Normed t
+   type family RealOf x
+
+Assume the generated wanted constraint is:
+   RealOf e ~ e, Normed e
+If we were to be adding the superclasses during simplification we'd get:
+   Num uf, Normed e, RealOf e ~ e, RealOf e ~ uf
+==>
+   e ~ uf, Num uf, Normed e, RealOf e ~ e
+==> [Spontaneous solve]
+   Num uf, Normed uf, RealOf uf ~ uf
+
+While looks exactly like our original constraint. If we add the superclass again we'd loop.
+By adding superclasses definitely only once, during canonicalisation, this situation can't
+happen.
+
+\begin{code}
+newSCWorkFromFlavored :: CtEvidence -> Class -> [Xi] -> TcS ()
+-- Returns superclasses, see Note [Adding superclasses]
+newSCWorkFromFlavored flavor cls xis
+  | isDerived flavor
+  = return ()  -- Deriveds don't yield more superclasses because we will
+               -- add them transitively in the case of wanteds.
+
+  | isGiven flavor
+  = do { let sc_theta = immSuperClasses cls xis
+             xev_decomp x = zipWith (\_ i -> EvSuperClass x i) sc_theta [0..]
+             xev = XEvTerm { ev_preds  =  sc_theta
+                           , ev_comp   = panic "Can't compose for given!"
+                           , ev_decomp = xev_decomp }
+       ; ctevs <- xCtEvidence flavor xev
+       ; emitWorkNC ctevs }
+
+  | isEmptyVarSet (tyVarsOfTypes xis)
+  = return () -- Wanteds with no variables yield no deriveds.
+              -- See Note [Improvement from Ground Wanteds]
+
+  | otherwise -- Wanted case, just add those SC that can lead to improvement.
+  = do { let sc_rec_theta = transSuperClasses cls xis
+             impr_theta   = filter is_improvement_pty sc_rec_theta
+             loc          = ctev_loc flavor
+       ; traceTcS "newSCWork/Derived" $ text "impr_theta =" <+> ppr impr_theta
+       ; mb_der_evs <- mapM (newDerived loc) impr_theta
+       ; emitWorkNC (catMaybes mb_der_evs) }
+
+is_improvement_pty :: PredType -> Bool
+-- Either it's an equality, or has some functional dependency
+is_improvement_pty ty = go (classifyPredType ty)
+  where
+    go (EqPred {})         = True
+    go (ClassPred cls _tys) = not $ null fundeps
+      where (_,fundeps) = classTvsFds cls
+    go (TuplePred ts)      = any is_improvement_pty ts
+    go (IrredPred {})      = True -- Might have equalities after reduction?
+\end{code}
+
+
+%************************************************************************
+%*                                                                      *
+%*                      Irreducibles canonicalization
+%*                                                                      *
+%************************************************************************
+
+
+\begin{code}
+canIrred :: CtEvidence -> TcS StopOrContinue
+-- Precondition: ty not a tuple and no other evidence form
+canIrred old_ev
+  = do { let old_ty = ctEvPred old_ev
+       ; traceTcS "can_pred" (text "IrredPred = " <+> ppr old_ty)
+       ; (xi,co) <- flatten FMFullFlatten old_ev old_ty -- co :: xi ~ old_ty
+       ; mb <- rewriteEvidence old_ev xi co
+       ; case mb of {
+             Nothing     -> return Stop ;
+             Just new_ev ->
+
+    do { -- Re-classify, in case flattening has improved its shape
+       ; case classifyPredType (ctEvPred new_ev) of
+           ClassPred cls tys -> canClassNC new_ev cls tys
+           TuplePred tys     -> canTuple   new_ev tys
+           EqPred ty1 ty2
+              | something_changed old_ty ty1 ty2 -> canEqNC new_ev ty1 ty2
+           _  -> continueWith $
+                 CIrredEvCan { cc_ev = new_ev } } } }
+  where
+    -- If the constraint was a kind-mis-matched equality, we must
+    -- retry canEqNC only if something has changed, otherwise we
+    -- get an infinite loop
+    something_changed old_ty new_ty1 new_ty2
+       | EqPred old_ty1 old_ty2 <- classifyPredType old_ty
+       = not (            new_ty1 `tcEqType`          old_ty1
+              && typeKind new_ty1 `tcEqKind` typeKind old_ty1
+              &&          new_ty2 `tcEqType`          old_ty2
+              && typeKind new_ty2 `tcEqKind` typeKind old_ty2)
+       | otherwise
+       = True
+
+canHole :: CtEvidence -> OccName -> TcS StopOrContinue
+canHole ev occ
+  = do { let ty = ctEvPred ev
+       ; (xi,co) <- flatten FMFullFlatten ev ty -- co :: xi ~ ty
+       ; mb <- rewriteEvidence ev xi co
+       ; case mb of
+             Just new_ev -> emitInsoluble (CHoleCan { cc_ev = new_ev, cc_occ = occ })
+             Nothing     -> return ()   -- Found a cached copy; won't happen
+       ; return Stop }
+\end{code}
 
 %************************************************************************
 %*                                                                      *
@@ -52,9 +423,10 @@ Note [Flattening]
 ~~~~~~~~~~~~~~~~~~~~
   flatten ty  ==>   (xi, cc)
     where
-      xi has no type functions
+      xi has no type functions, unless they appear under ForAlls
+
       cc = Auxiliary given (equality) constraints constraining
-           the fresh type variables in xi.  Evidence for these 
+           the fresh type variables in xi.  Evidence for these
            is always the identity coercion, because internally the
            fresh flattening skolem variables are actually identified
            with the types they have been generated to stand in for.
@@ -74,7 +446,7 @@ for ty.
               F beta ~ alpha[flat = F beta] }
 Here
   * alpha and beta are 'flattening skolem variables'.
-  * All the constraints in cc are 'given', and all their coercion terms 
+  * All the constraints in cc are 'given', and all their coercion terms
     are the identity.
 
 NB: Flattening Skolems only occur in canonical constraints, which
@@ -87,503 +459,527 @@ transitive expansion contains any type function applications.  If so,
 it expands the synonym and proceeds; if not, it simply returns the
 unexpanded synonym.
 
-TODO: caching the information about whether transitive synonym
-expansions contain any type function applications would speed things
-up a bit; right now we waste a lot of energy traversing the same types
-multiple times.
-
 \begin{code}
--- Flatten a bunch of types all at once.
-flattenMany :: CtFlavor -> [Type] -> TcS ([Xi], [Coercion], CanonicalCts)
--- Coercions :: Xi ~ Type 
-flattenMany ctxt tys 
-  = do { (xis, cos, cts_s) <- mapAndUnzip3M (flatten ctxt) tys
-       ; return (xis, cos, andCCans cts_s) }
+data FlattenMode = FMSubstOnly | FMFullFlatten
+                   -- See Note [Flattening under a forall]
 
+-- Flatten a bunch of types all at once.
+flattenMany ::  FlattenMode
+            -> CtEvidence
+            -> [Type] -> TcS ([Xi], [TcCoercion])
+-- Coercions :: Xi ~ Type
+-- Returns True iff (no flattening happened)
+-- NB: The EvVar inside the 'ctxt :: CtEvidence' is unused,
+--     we merely want (a) Given/Solved/Derived/Wanted info
+--                    (b) the GivenLoc/WantedLoc for when we create new evidence
+flattenMany f ctxt tys
+  = -- pprTrace "flattenMany" empty $
+    go tys
+  where go []       = return ([],[])
+        go (ty:tys) = do { (xi,co)    <- flatten f ctxt ty
+                         ; (xis,cos)  <- go tys
+                         ; return (xi:xis,co:cos) }
+
+flatten :: FlattenMode
+        -> CtEvidence -> TcType -> TcS (Xi, TcCoercion)
 -- Flatten a type to get rid of type function applications, returning
 -- the new type-function-free type, and a collection of new equality
 -- constraints.  See Note [Flattening] for more detail.
-flatten :: CtFlavor -> TcType -> TcS (Xi, Coercion, CanonicalCts)
--- Postcondition: Coercion :: Xi ~ TcType 
-flatten ctxt ty 
+--
+-- Postcondition: Coercion :: Xi ~ TcType
+
+flatten f ctxt ty
   | Just ty' <- tcView ty
-  = do { (xi, co, ccs) <- flatten ctxt ty'
-	-- Preserve type synonyms if possible
-	-- We can tell if ty' is function-free by
-	-- whether there are any floated constraints
-       ; if isEmptyCCan ccs then
-             return (ty, ty, emptyCCan)  
-         else
-             return (xi, co, ccs) }
+  = do { (xi, co) <- flatten f ctxt ty'
+       ; if xi `tcEqType` ty' then return (ty,co) 
+                              else return (xi,co) }
+       -- Small tweak for better error messages
+       -- by preserving type synonyms where possible
 
-flatten _ v@(TyVarTy _)
-  = return (v, v, emptyCCan)
+flatten _ _ xi@(LitTy {}) = return (xi, mkTcNomReflCo xi)
 
-flatten ctxt (AppTy ty1 ty2)
-  = do { (xi1,co1,c1) <- flatten ctxt ty1
-       ; (xi2,co2,c2) <- flatten ctxt ty2
-       ; return (mkAppTy xi1 xi2, mkAppCoercion co1 co2, c1 `andCCan` c2) }
+flatten f ctxt (TyVarTy tv)
+  = flattenTyVar f ctxt tv
 
-flatten ctxt (FunTy ty1 ty2)
-  = do { (xi1,co1,c1) <- flatten ctxt ty1
-       ; (xi2,co2,c2) <- flatten ctxt ty2
-       ; return (mkFunTy xi1 xi2, mkFunCoercion co1 co2, c1 `andCCan` c2) }
+flatten f ctxt (AppTy ty1 ty2)
+  = do { (xi1,co1) <- flatten f ctxt ty1
+       ; (xi2,co2) <- flatten f ctxt ty2
+       ; traceTcS "flatten/appty" (ppr ty1 $$ ppr ty2 $$ ppr xi1 $$ ppr co1 $$ ppr xi2 $$ ppr co2)
+       ; return (mkAppTy xi1 xi2, mkTcAppCo co1 co2) }
 
-flatten fl (TyConApp tc tys)
-  -- For a normal type constructor or data family application, we just
-  -- recursively flatten the arguments.
+flatten f ctxt (FunTy ty1 ty2)
+  = do { (xi1,co1) <- flatten f ctxt ty1
+       ; (xi2,co2) <- flatten f ctxt ty2
+       ; return (mkFunTy xi1 xi2, mkTcFunCo Nominal co1 co2) }
+
+flatten f ctxt (TyConApp tc tys)
+  -- For a normal type constructor or data family application,
+  -- we just recursively flatten the arguments.
   | not (isSynFamilyTyCon tc)
-    = do { (xis,cos,ccs) <- flattenMany fl tys
-         ; return (mkTyConApp tc xis, mkTyConCoercion tc cos, ccs) }
+    = do { (xis,cos) <- flattenMany f ctxt tys
+         ; return (mkTyConApp tc xis, mkTcTyConAppCo Nominal tc cos) }
 
   -- Otherwise, it's a type function application, and we have to
   -- flatten it away as well, and generate a new given equality constraint
   -- between the application and a newly generated flattening skolem variable.
-  | otherwise 
-  = ASSERT( tyConArity tc <= length tys )	-- Type functions are saturated
-      do { (xis, cos, ccs) <- flattenMany fl tys
-         ; let (xi_args, xi_rest)  = splitAt (tyConArity tc) xis
-               (cos_args, cos_rest) = splitAt (tyConArity tc) cos 
-	       	 -- The type function might be *over* saturated
-		 -- in which case the remaining arguments should
-		 -- be dealt with by AppTys
-               fam_ty = mkTyConApp tc xi_args 
-               fam_co = fam_ty -- identity 
+  | otherwise
+  = ASSERT( tyConArity tc <= length tys )       -- Type functions are saturated
+      do { (xis, cos) <- flattenMany f ctxt tys
+         ; let (xi_args,  xi_rest)  = splitAt (tyConArity tc) xis
+               (cos_args, cos_rest) = splitAt (tyConArity tc) cos
+                 -- The type function might be *over* saturated
+                 -- in which case the remaining arguments should
+                 -- be dealt with by AppTys
 
-         ; (ret_co, rhs_var, ct) <- 
-             if isGiven fl then
-               do { rhs_var <- newFlattenSkolemTy fam_ty
-                  ; cv <- newGivenCoVar fam_ty rhs_var fam_co
-                  ; let ct = CFunEqCan { cc_id     = cv
-                                       , cc_flavor = fl -- Given
-                                       , cc_fun    = tc 
-                                       , cc_tyargs = xi_args 
-                                       , cc_rhs    = rhs_var }
-                  ; return $ (mkCoVarCoercion cv, rhs_var, ct) }
-             else -- Derived or Wanted: make a new *unification* flatten variable
-               do { rhs_var <- newFlexiTcSTy (typeKind fam_ty)
-                  ; cv <- newCoVar fam_ty rhs_var
-                  ; let ct = CFunEqCan { cc_id = cv
-                                       , cc_flavor = mkWantedFlavor fl
-                                           -- Always Wanted, not Derived
-                                       , cc_fun = tc
-                                       , cc_tyargs = xi_args
-                                       , cc_rhs    = rhs_var }
-                  ; return $ (mkCoVarCoercion cv, rhs_var, ct) }
+         ; (rhs_xi, ret_co) <- flattenNestedFamApp f ctxt tc xi_args
 
-         ; return ( foldl AppTy rhs_var xi_rest
-                  , foldl AppTy (mkSymCoercion ret_co 
-                                    `mkTransCoercion` mkTyConCoercion tc cos_args) cos_rest
-                  , ccs `extendCCans` ct) }
+                  -- Emit the flat constraints
+         ; return ( mkAppTys rhs_xi xi_rest -- NB mkAppTys: rhs_xi might not be a type variable
+                                            --    cf Trac #5655
+                  , mkTcAppCos (mkTcSymCo ret_co `mkTcTransCo` mkTcTyConAppCo Nominal tc cos_args) $
+                    cos_rest
+                  )
+         }
 
-
-flatten ctxt (PredTy pred) 
-  = do { (pred', co, ccs) <- flattenPred ctxt pred
-       ; return (PredTy pred', co, ccs) }
-
-flatten ctxt ty@(ForAllTy {})
+flatten _f ctxt ty@(ForAllTy {})
 -- We allow for-alls when, but only when, no type function
--- applications inside the forall involve the bound type variables
--- TODO: What if it is a (t1 ~ t2) => t3
---       Must revisit when the New Coercion API is here! 
+-- applications inside the forall involve the bound type variables.
   = do { let (tvs, rho) = splitForAllTys ty
-       ; (rho', co, ccs) <- flatten ctxt rho
-       ; let bad_eqs  = filterBag is_bad ccs
-             is_bad c = tyVarsOfCanonical c `intersectsVarSet` tv_set
-             tv_set   = mkVarSet tvs
-       ; unless (isEmptyBag bad_eqs)
-                (flattenForAllErrorTcS ctxt ty bad_eqs)
-       ; return (mkForAllTys tvs rho', mkForAllTys tvs co, ccs)  }
-
----------------
-flattenPred :: CtFlavor -> TcPredType -> TcS (TcPredType, Coercion, CanonicalCts)
-flattenPred ctxt (ClassP cls tys)
-  = do { (tys', cos, ccs) <- flattenMany ctxt tys
-       ; return (ClassP cls tys', mkClassPPredCo cls cos, ccs) }
-flattenPred ctxt (IParam nm ty)
-  = do { (ty', co, ccs) <- flatten ctxt ty
-       ; return (IParam nm ty', mkIParamPredCo nm co, ccs) }
--- TODO: Handling of coercions between EqPreds must be revisited once the New Coercion API is ready!
-flattenPred ctxt (EqPred ty1 ty2)
-  = do { (ty1', co1, ccs1) <- flatten ctxt ty1
-       ; (ty2', co2, ccs2) <- flatten ctxt ty2
-       ; return (EqPred ty1' ty2', mkEqPredCo co1 co2, ccs1 `andCCan` ccs2) }
-
+       ; (rho', co) <- flatten FMSubstOnly ctxt rho
+                         -- Substitute only under a forall
+                         -- See Note [Flattening under a forall]
+       ; return (mkForAllTys tvs rho', foldr mkTcForAllCo co tvs) }
 \end{code}
+
+Note [Flattening under a forall]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Under a forall, we
+  (a) MUST apply the inert subsitution
+  (b) MUST NOT flatten type family applications
+Hence FMSubstOnly.
+
+For (a) consider   c ~ a, a ~ T (forall b. (b, [c])
+If we don't apply the c~a substitution to the second constraint
+we won't see the occurs-check error.
+
+For (b) consider  (a ~ forall b. F a b), we don't want to flatten
+to     (a ~ forall b.fsk, F a b ~ fsk)
+because now the 'b' has escaped its scope.  We'd have to flatten to
+       (a ~ forall b. fsk b, forall b. F a b ~ fsk b)
+and we have not begun to think about how to make that work!
+
+\begin{code}
+flattenNestedFamApp :: FlattenMode -> CtEvidence
+                    -> TyCon -> [TcType]   -- Exactly-saturated type function application
+                    -> TcS (Xi, TcCoercion)
+flattenNestedFamApp FMSubstOnly _ tc xi_args
+  = do { let fam_ty = mkTyConApp tc xi_args
+       ; return (fam_ty, mkTcNomReflCo fam_ty) }
+
+flattenNestedFamApp FMFullFlatten ctxt tc xi_args  -- Eactly saturated
+  = do { let fam_ty = mkTyConApp tc xi_args
+       ; mb_ct <- lookupFlatEqn tc xi_args
+       ; case mb_ct of
+           Just (ctev, rhs_ty)
+             | ctev `canRewriteOrSame `ctxt    -- Must allow [W]/[W]
+             -> -- You may think that we can just return (cc_rhs ct) but not so.
+                --            return (mkTcCoVarCo (ctId ct), cc_rhs ct, [])
+                -- The cached constraint resides in the cache so we have to flatten
+                -- the rhs to make sure we have applied any inert substitution to it.
+                -- Alternatively we could be applying the inert substitution to the
+                -- cache as well when we interact an equality with the inert.
+                -- The design choice is: do we keep the flat cache rewritten or not?
+                -- For now I say we don't keep it fully rewritten.
+               do { (rhs_xi,co) <- flatten FMFullFlatten ctev rhs_ty
+                  ; let final_co = evTermCoercion (ctEvTerm ctev)
+                                   `mkTcTransCo` mkTcSymCo co
+                  ; traceTcS "flatten/flat-cache hit" $ (ppr ctev $$ ppr rhs_xi $$ ppr final_co)
+                  ; return (rhs_xi, final_co) }
+
+           _ -> do { (ctev, rhs_xi) <- newFlattenSkolem ctxt fam_ty
+                   ; extendFlatCache tc xi_args ctev rhs_xi
+
+                   -- The new constraint (F xi_args ~ rhs_xi) is not necessarily inert
+                   -- (e.g. the LHS may be a redex) so we must put it in the work list
+                   ; let ct = CFunEqCan { cc_ev     = ctev
+                                        , cc_fun    = tc
+                                        , cc_tyargs = xi_args
+                                        , cc_rhs    = rhs_xi }
+                   ; updWorkListTcS $ extendWorkListFunEq ct
+
+                   ; traceTcS "flatten/flat-cache miss" $ (ppr fam_ty $$ ppr rhs_xi $$ ppr ctev)
+                   ; return (rhs_xi, evTermCoercion (ctEvTerm ctev)) }
+       }
+\end{code}
+
+\begin{code}
+flattenTyVar :: FlattenMode -> CtEvidence -> TcTyVar -> TcS (Xi, TcCoercion)
+-- "Flattening" a type variable means to apply the substitution to it
+-- The substitution is actually the union of the substitution in the TyBinds
+-- for the unification variables that have been unified already with the inert
+-- equalities, see Note [Spontaneously solved in TyBinds] in TcInteract.
+--
+-- Postcondition: co : xi ~ tv
+flattenTyVar f ctxt tv
+  = do { mb_yes <- flattenTyVarOuter f ctxt tv
+       ; case mb_yes of
+           Left tv'         -> -- Done 
+                               return (ty, mkTcNomReflCo ty)
+                            where
+                               ty = mkTyVarTy tv'
+
+           Right (ty1, co1) -> -- Recurse
+                               do { (ty2, co2) <- flatten f ctxt ty1
+                                  ; return (ty2, co2 `mkTcTransCo` co1) }
+       }
+
+flattenTyVarOuter, flattenTyVarFinal 
+   :: FlattenMode -> CtEvidence
+   -> TcTyVar 
+   -> TcS (Either TyVar (TcType, TcCoercion))
+-- Look up the tyvar in 
+--   a) the internal MetaTyVar box
+--   b) the tyvar binds 
+--   c) the inerts
+-- Return (Left tv')       if it is not found, tv' has a properly zonked kind
+--        (Right (ty, co)) if found, with co :: ty ~ tv
+--                         NB: in the latter case ty is not necessarily flattened
+
+flattenTyVarOuter f ctxt tv
+  | not (isTcTyVar tv)            -- Happens when flatten under a (forall a. ty)
+  = flattenTyVarFinal f ctxt tv   -- So ty contains refernces to the non-TcTyVar a
+  | otherwise
+  = do { mb_ty <- isFilledMetaTyVar_maybe tv
+       ; case mb_ty of {
+           Just ty -> do { traceTcS "Following filled tyvar" (ppr tv <+> equals <+> ppr ty)
+                         ; return (Right (ty, mkTcNomReflCo ty)) } ;
+           Nothing ->
+
+    -- Try in ty_binds
+    do { ty_binds <- getTcSTyBindsMap
+       ; case lookupVarEnv ty_binds tv of {
+           Just (_tv,ty) -> do { traceTcS "Following bound tyvar" (ppr tv <+> equals <+> ppr ty)
+                               ; return (Right (ty, mkTcNomReflCo ty)) } ;
+                                 -- NB: ty_binds coercions are all ReflCo,
+           Nothing ->
+
+    -- Try in the inert equalities
+    do { ieqs <- getInertEqs
+       ; case lookupVarEnv ieqs tv of
+           Just (ct:_)                      -- If the first doesn't work,
+             | let ctev   = ctEvidence ct   -- the subsequent ones won't either
+                   rhs_ty = cc_rhs ct
+             , ctev `canRewrite` ctxt 
+             ->  do { traceTcS "Following inert tyvar" (ppr tv <+> equals <+> ppr rhs_ty $$ ppr ctev)
+                    ; return (Right (rhs_ty, mkTcSymCo (evTermCoercion (ctEvTerm ctev)))) }
+                    -- NB: even if ct is Derived we are not going to
+                    -- touch the actual coercion so we are fine.
+
+           _other -> flattenTyVarFinal f ctxt tv
+    } } } } }
+
+flattenTyVarFinal f ctxt tv
+  = -- Done, but make sure the kind is zonked
+    do { let knd = tyVarKind tv
+       ; (new_knd, _kind_co) <- flatten f ctxt knd
+       ; return (Left (setVarType tv new_knd)) }
+\end{code}
+
+Note [Non-idempotent inert substitution]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The inert substitution is not idempotent in the broad sense. It is only idempotent in
+that it cannot rewrite the RHS of other inert equalities any further. An example of such
+an inert substitution is:
+
+ [G] g1 : ta8 ~ ta4
+ [W] g2 : ta4 ~ a5Fj
+
+Observe that the wanted cannot rewrite the solved goal, despite the fact that ta4 appears on
+an RHS of an equality. Now, imagine a constraint:
+
+ [W] g3: ta8 ~ Int
+
+coming in. If we simply apply once the inert substitution we will get:
+
+ [W] g3_1: ta4 ~ Int
+
+and because potentially ta4 is untouchable we will try to insert g3_1 in the inert set,
+getting a panic since the inert only allows ONE equation per LHS type variable (as it
+should).
+
+For this reason, when we reach to flatten a type variable, we flatten it recursively,
+so that we can make sure that the inert substitution /is/ fully applied.
+
+Insufficient (non-recursive) rewriting was the reason for #5668.
+
 
 %************************************************************************
 %*                                                                      *
-%*                Canonicalising given constraints                      *
+%*        Equalities
 %*                                                                      *
 %************************************************************************
 
 \begin{code}
-canWanteds :: [WantedEvVar] -> TcS WorkList
-canWanteds = fmap unionWorkLists . mapM (\(EvVarX ev loc) -> mkCanonical (Wanted loc) ev)
+canEvVarsCreated :: [CtEvidence] -> TcS StopOrContinue
+canEvVarsCreated [] = return Stop
+    -- Add all but one to the work list
+    -- and return the first (if any) for futher processing
+canEvVarsCreated (ev : evs)
+  = do { emitWorkNC evs; canEvNC ev }
+          -- Note the "NC": these are fresh goals, not necessarily canonical
 
-canGivens :: GivenLoc -> [EvVar] -> TcS WorkList
-canGivens loc givens = do { ccs <- mapM (mkCanonical (Given loc)) givens
-                          ; return (unionWorkLists ccs) }
+emitWorkNC :: [CtEvidence] -> TcS ()
+emitWorkNC evs
+  | null evs  = return ()
+  | otherwise = do { traceTcS "Emitting fresh work" (vcat (map ppr evs))
+                   ; updWorkListTcS (extendWorkListCts (map mk_nc evs)) }
+  where
+    mk_nc ev = mkNonCanonical ev
 
-mkCanonicals :: CtFlavor -> [EvVar] -> TcS WorkList
-mkCanonicals fl vs = fmap unionWorkLists (mapM (mkCanonical fl) vs)
-
-mkCanonicalFEV :: FlavoredEvVar -> TcS WorkList
-mkCanonicalFEV (EvVarX ev fl) = mkCanonical fl ev
-
-mkCanonicalFEVs :: Bag FlavoredEvVar -> TcS WorkList
-mkCanonicalFEVs = foldrBagM canon_one emptyWorkList
-  where 	-- Preserves order (shouldn't be important, but curently
-  		--                  is important for the vectoriser)
-    canon_one fev wl = do { wl' <- mkCanonicalFEV fev
-                          ; return (unionWorkList wl' wl) }
-
-mkCanonical :: CtFlavor -> EvVar -> TcS WorkList
-mkCanonical fl ev = case evVarPred ev of 
-                        ClassP clas tys -> canClassToWorkList fl ev clas tys 
-                        IParam ip ty    -> canIPToWorkList    fl ev ip ty 
-                        EqPred ty1 ty2  -> canEqToWorkList    fl ev ty1 ty2 
-                         
-
-canClassToWorkList :: CtFlavor -> EvVar -> Class -> [TcType] -> TcS WorkList
-canClassToWorkList fl v cn tys 
-  = do { (xis,cos,ccs) <- flattenMany fl tys  -- cos :: xis ~ tys
-       ; let no_flattening_happened = isEmptyCCan ccs
-             dict_co = mkTyConCoercion (classTyCon cn) cos
-       ; v_new <- if no_flattening_happened then return v
-                  else if isGiven fl        then return v
-                         -- The cos are all identities if fl=Given,
-                         -- hence nothing to do
-                  else do { v' <- newDictVar cn xis  -- D xis
-                          ; when (isWanted fl) $ setDictBind v  (EvCast v' dict_co)
-                          ; when (isGiven fl)  $ setDictBind v' (EvCast v (mkSymCoercion dict_co))
-                                 -- NB: No more setting evidence for derived now 
-                          ; return v' }
-
-       -- Add the superclasses of this one here, See Note [Adding superclasses]. 
-       -- But only if we are not simplifying the LHS of a rule. 
-       ; sctx <- getTcSContext
-       ; sc_cts <- if simplEqsOnly sctx then return emptyWorkList
-                   else newSCWorkFromFlavored v_new fl cn xis
-
-       ; return (sc_cts `unionWorkList` 
-                 workListFromEqs ccs `unionWorkList` 
-                 workListFromNonEq CDictCan { cc_id     = v_new
-                                           , cc_flavor = fl
-                                           , cc_class  = cn 
-                                           , cc_tyargs = xis }) }
-\end{code}
-
-Note [Adding superclasses]
-~~~~~~~~~~~~~~~~~~~~~~~~~~ 
-Since dictionaries are canonicalized only once in their lifetime, the
-place to add their superclasses is canonicalisation (The alternative
-would be to do it during constraint solving, but we'd have to be
-extremely careful to not repeatedly introduced the same superclass in
-our worklist). Here is what we do:
-
-For Givens: 
-       We add all their superclasses as Givens. 
-
-For Wanteds: 
-       Generally speaking we want to be able to add superclasses of 
-       wanteds for two reasons:
-
-       (1) Oportunities for improvement. Example: 
-                  class (a ~ b) => C a b 
-           Wanted constraint is: C alpha beta 
-           We'd like to simply have C alpha alpha. Similar 
-           situations arise in relation to functional dependencies. 
-           
-       (2) To have minimal constraints to quantify over: 
-           For instance, if our wanted constraint is (Eq a, Ord a) 
-           we'd only like to quantify over Ord a. 
-
-       To deal with (1) above we only add the superclasses of wanteds
-       which may lead to improvement, that is: equality superclasses or 
-       superclasses with functional dependencies. 
-
-       We deal with (2) completely independently in TcSimplify. See 
-       Note [Minimize by SuperClasses] in TcSimplify. 
+-------------------------
+canEqNC :: CtEvidence -> Type -> Type -> TcS StopOrContinue
+canEqNC ev ty1 ty2 = can_eq_nc ev ty1 ty1 ty2 ty2
 
 
-       Moreover, in all cases the extra improvement constraints are 
-       Derived. Derived constraints have an identity (for now), but 
-       we don't do anything with their evidence. For instance they 
-       are never used to rewrite other constraints. 
+can_eq_nc, can_eq_nc' 
+   :: CtEvidence 
+   -> Type -> Type    -- LHS, after and before type-synonym expansion, resp 
+   -> Type -> Type    -- RHS, after and before type-synonym expansion, resp 
+   -> TcS StopOrContinue
 
-       See also [New Wanted Superclass Work] in TcInteract. 
+can_eq_nc ev ty1 ps_ty1 ty2 ps_ty2
+  = do { traceTcS "can_eq_nc" $ 
+         vcat [ ppr ev, ppr ty1, ppr ps_ty1, ppr ty2, ppr ps_ty2 ]
+       ; can_eq_nc' ev ty1 ps_ty1 ty2 ps_ty2 }
 
+-- Expand synonyms first; see Note [Type synonyms and canonicalization]
+can_eq_nc' ev ty1 ps_ty1 ty2 ps_ty2
+  | Just ty1' <- tcView ty1 = can_eq_nc ev ty1' ps_ty1 ty2  ps_ty2
+  | Just ty2' <- tcView ty2 = can_eq_nc ev ty1  ps_ty1 ty2' ps_ty2
 
-For Deriveds: 
-       We do nothing.
+-- Type family on LHS or RHS take priority
+can_eq_nc' ev (TyConApp fn tys) _ ty2 ps_ty2
+  | isSynFamilyTyCon fn
+  = canEqLeafFun ev NotSwapped fn tys ty2 ps_ty2
+can_eq_nc' ev ty1 ps_ty1 (TyConApp fn tys) _
+  | isSynFamilyTyCon fn
+  = canEqLeafFun ev IsSwapped fn tys ty1 ps_ty1
 
-Here's an example that demonstrates why we chose to NOT add
-superclasses during simplification: [Comes from ticket #4497]
+-- Type variable on LHS or RHS are next
+can_eq_nc' ev (TyVarTy tv1) _ ty2 ps_ty2
+  = canEqTyVar ev NotSwapped tv1 ty2 ps_ty2
+can_eq_nc' ev ty1 ps_ty1 (TyVarTy tv2) _
+  = canEqTyVar ev IsSwapped tv2 ty1 ps_ty1
 
-   class Num (RealOf t) => Normed t
-   type family RealOf x
+----------------------
+-- Otherwise try to decompose
+----------------------
 
-Assume the generated wanted constraint is: 
-   RealOf e ~ e, Normed e 
-If we were to be adding the superclasses during simplification we'd get: 
-   Num uf, Normed e, RealOf e ~ e, RealOf e ~ uf 
-==> 
-   e ~ uf, Num uf, Normed e, RealOf e ~ e 
-==> [Spontaneous solve] 
-   Num uf, Normed uf, RealOf uf ~ uf 
+-- Literals
+can_eq_nc' ev ty1@(LitTy l1) _ (LitTy l2) _
+ | l1 == l2
+  = do { when (isWanted ev) $
+         setEvBind (ctev_evar ev) (EvCoercion (mkTcNomReflCo ty1))
+       ; return Stop }
 
-While looks exactly like our original constraint. If we add the superclass again we'd loop. 
-By adding superclasses definitely only once, during canonicalisation, this situation can't 
-happen.
+-- Decomposable type constructor applications 
+-- Synonyms and type functions (which are not decomposable)
+-- have already been dealt with 
+can_eq_nc' ev (TyConApp tc1 tys1) _ (TyConApp tc2 tys2) _
+  | isDecomposableTyCon tc1
+  , isDecomposableTyCon tc2
+  = canDecomposableTyConApp ev tc1 tys1 tc2 tys2
 
-\begin{code}
+can_eq_nc' ev (TyConApp tc1 _) ps_ty1 (FunTy {}) ps_ty2
+  | isDecomposableTyCon tc1 
+      -- The guard is important
+      -- e.g.  (x -> y) ~ (F x y) where F has arity 1
+      --       should not fail, but get the app/app case
+  = canEqFailure ev ps_ty1 ps_ty2
 
-newSCWorkFromFlavored :: EvVar -> CtFlavor -> Class -> [Xi] -> TcS WorkList
--- Returns superclasses, see Note [Adding superclasses]
-newSCWorkFromFlavored ev orig_flavor cls xis 
-  | isDerived orig_flavor 
-  = return emptyWorkList  -- Deriveds don't yield more superclasses because we will
-                          -- add them transitively in the case of wanteds. 
+can_eq_nc' ev (FunTy s1 t1) _ (FunTy s2 t2) _
+  = canDecomposableTyConAppOK ev funTyCon [s1,t1] [s2,t2]
 
-  | isGiven orig_flavor 
-  = do { let sc_theta = immSuperClasses cls xis 
-             flavor   = orig_flavor
-       ; sc_vars <- mapM newEvVar sc_theta
-       ; _ <- zipWithM_ setEvBind sc_vars [EvSuperClass ev n | n <- [0..]]
-       ; mkCanonicals flavor sc_vars }
+can_eq_nc' ev (FunTy {}) ps_ty1 (TyConApp tc2 _) ps_ty2
+  | isDecomposableTyCon tc2 
+  = canEqFailure ev ps_ty1 ps_ty2
 
-  | isEmptyVarSet (tyVarsOfTypes xis) 
-  = return emptyWorkList -- Wanteds with no variables yield no deriveds.
-                         -- See Note [Improvement from Ground Wanteds]
-
-  | otherwise -- Wanted case, just add those SC that can lead to improvement. 
-  = do { let sc_rec_theta = transSuperClasses cls xis 
-             impr_theta   = filter is_improvement_pty sc_rec_theta 
-             Wanted wloc  = orig_flavor
-       ; der_ids <- mapM newDerivedId impr_theta
-       ; mkCanonicals (Derived wloc) der_ids }
-
-
-is_improvement_pty :: PredType -> Bool 
--- Either it's an equality, or has some functional dependency
-is_improvement_pty (EqPred {})      = True 
-is_improvement_pty (ClassP cls _ty) = not $ null fundeps
- where (_,fundeps,_,_,_,_) = classExtraBigSig cls
-is_improvement_pty _ = False
-
-
-
-
-canIPToWorkList :: CtFlavor -> EvVar -> IPName Name -> TcType -> TcS WorkList
--- See Note [Canonical implicit parameter constraints] to see why we don't 
--- immediately canonicalize (flatten) IP constraints. 
-canIPToWorkList fl v nm ty 
-  = return $ workListFromNonEq (CIPCan { cc_id = v
-                                      , cc_flavor = fl
-                                      , cc_ip_nm = nm
-                                      , cc_ip_ty = ty })
-
------------------
-canEqToWorkList :: CtFlavor -> EvVar -> Type -> Type -> TcS WorkList
-canEqToWorkList fl cv ty1 ty2 = do { cts <- canEq fl cv ty1 ty2 
-                         ; return $ workListFromEqs cts }
-
-canEq :: CtFlavor -> EvVar -> Type -> Type -> TcS CanonicalCts 
-canEq fl cv ty1 ty2 
-  | tcEqType ty1 ty2	-- Dealing with equality here avoids
-    	     	 	-- later spurious occurs checks for a~a
-  = do { when (isWanted fl) (setCoBind cv ty1)
-       ; return emptyCCan }
-
--- If one side is a variable, orient and flatten, 
--- WITHOUT expanding type synonyms, so that we tend to 
--- substitute a ~ Age rather than a ~ Int when @type Age = Int@
-canEq fl cv ty1@(TyVarTy {}) ty2 
-  = do { untch <- getUntouchables 
-       ; canEqLeaf untch fl cv (classify ty1) (classify ty2) }
-canEq fl cv ty1 ty2@(TyVarTy {}) 
-  = do { untch <- getUntouchables 
-       ; canEqLeaf untch fl cv (classify ty1) (classify ty2) }
-      -- NB: don't use VarCls directly because tv1 or tv2 may be scolems!
-
-canEq fl cv (TyConApp fn tys) ty2 
-  | isSynFamilyTyCon fn, length tys == tyConArity fn
-  = do { untch <- getUntouchables 
-       ; canEqLeaf untch fl cv (FunCls fn tys) (classify ty2) }
-canEq fl cv ty1 (TyConApp fn tys)
-  | isSynFamilyTyCon fn, length tys == tyConArity fn
-  = do { untch <- getUntouchables 
-       ; canEqLeaf untch fl cv (classify ty1) (FunCls fn tys) }
-
-canEq fl cv s1 s2
-  | Just (t1a,t1b,t1c) <- splitCoPredTy_maybe s1, 
-    Just (t2a,t2b,t2c) <- splitCoPredTy_maybe s2
-  = do { (v1,v2,v3) 
-             <- if isWanted fl then                   -- Wanted
-                    do { v1 <- newCoVar t1a t2a
-                       ; v2 <- newCoVar t1b t2b 
-                       ; v3 <- newCoVar t1c t2c 
-                       ; let res_co = mkCoPredCo (mkCoVarCoercion v1) 
-                                        (mkCoVarCoercion v2) (mkCoVarCoercion v3)
-                       ; setCoBind cv res_co
-                       ; return (v1,v2,v3) }
-                else if isGiven fl then               -- Given 
-                         let co_orig = mkCoVarCoercion cv 
-                             coa = mkCsel1Coercion co_orig
-                             cob = mkCsel2Coercion co_orig
-                             coc = mkCselRCoercion co_orig
-                         in do { v1 <- newGivenCoVar t1a t2a coa
-                               ; v2 <- newGivenCoVar t1b t2b cob
-                               ; v3 <- newGivenCoVar t1c t2c coc 
-                               ; return (v1,v2,v3) }
-                else                                  -- Derived 
-                    do { v1 <- newDerivedId (EqPred t1a t2a)
-                       ; v2 <- newDerivedId (EqPred t1b t2b)
-                       ; v3 <- newDerivedId (EqPred t1c t2c)
-                       ; return (v1,v2,v3) }
-       ; cc1 <- canEq fl v1 t1a t2a 
-       ; cc2 <- canEq fl v2 t1b t2b 
-       ; cc3 <- canEq fl v3 t1c t2c 
-       ; return (cc1 `andCCan` cc2 `andCCan` cc3) }
-
-
--- Split up an equality between function types into two equalities.
-canEq fl cv (FunTy s1 t1) (FunTy s2 t2)
-  = do { (argv, resv) <- 
-             if isWanted fl then 
-                 do { argv <- newCoVar s1 s2 
-                    ; resv <- newCoVar t1 t2 
-                    ; setCoBind cv $ 
-                      mkFunCoercion (mkCoVarCoercion argv) (mkCoVarCoercion resv) 
-                    ; return (argv,resv) } 
-
-             else if isGiven fl then 
-                      let [arg,res] = decomposeCo 2 (mkCoVarCoercion cv) 
-                      in do { argv <- newGivenCoVar s1 s2 arg 
-                            ; resv <- newGivenCoVar t1 t2 res
-                            ; return (argv,resv) } 
-
-             else -- Derived 
-                 do { argv <- newDerivedId (EqPred s1 s2)
-                    ; resv <- newDerivedId (EqPred t1 t2)
-                    ; return (argv,resv) }
-
-       ; cc1 <- canEq fl argv s1 s2 -- inherit original kinds and locations
-       ; cc2 <- canEq fl resv t1 t2
-       ; return (cc1 `andCCan` cc2) }
-
-canEq fl cv (PredTy (IParam n1 t1)) (PredTy (IParam n2 t2))
-  | n1 == n2
-  = if isWanted fl then 
-        do { v <- newCoVar t1 t2 
-           ; setCoBind cv $ mkIParamPredCo n1 (mkCoVarCoercion cv)
-           ; canEq fl v t1 t2 } 
-    else return emptyCCan -- DV: How to decompose given IP coercions? 
-
-canEq fl cv (PredTy (ClassP c1 tys1)) (PredTy (ClassP c2 tys2))
-  | c1 == c2
-  = if isWanted fl then 
-       do { vs <- zipWithM newCoVar tys1 tys2 
-          ; setCoBind cv $ mkClassPPredCo c1 (map mkCoVarCoercion vs) 
-          ; andCCans <$> zipWith3M (canEq fl) vs tys1 tys2
-          }
-    else return emptyCCan 
-  -- How to decompose given dictionary (and implicit parameter) coercions? 
-  -- You may think that the following is right: 
-  --    let cos = decomposeCo (length tys1) (mkCoVarCoercion cv) 
-  --    in  zipWith3M newGivOrDerCoVar tys1 tys2 cos
-  -- But this assumes that the coercion is a type constructor-based 
-  -- coercion, and not a PredTy (ClassP cn cos) coercion. So we chose
-  -- to not decompose these coercions. We have to get back to this 
-  -- when we clean up the Coercion API.
-
-canEq fl cv (TyConApp tc1 tys1) (TyConApp tc2 tys2)
-  | isAlgTyCon tc1 && isAlgTyCon tc2
-  , tc1 == tc2
-  , length tys1 == length tys2
-  = -- Generate equalities for each of the corresponding arguments
-    do { argsv 
-             <- if isWanted fl then
-                    do { argsv <- zipWithM newCoVar tys1 tys2
-                       ; setCoBind cv $ 
-                         mkTyConCoercion tc1 (map mkCoVarCoercion argsv)
-                       ; return argsv } 
-
-                else if isGiven fl then 
-                    let cos = decomposeCo (length tys1) (mkCoVarCoercion cv) 
-                    in zipWith3M newGivenCoVar tys1 tys2 cos
-
-                else -- Derived 
-                    zipWithM (\t1 t2 -> newDerivedId (EqPred t1 t2)) tys1 tys2
-
-       ; andCCans <$> zipWith3M (canEq fl) argsv tys1 tys2 }
-
--- See Note [Equality between type applications]
---     Note [Care with type applications] in TcUnify
-canEq fl cv ty1 ty2
-  | Just (s1,t1) <- tcSplitAppTy_maybe ty1
-  , Just (s2,t2) <- tcSplitAppTy_maybe ty2
-    = do { (cv1,cv2) <- 
-             if isWanted fl 
-             then do { cv1 <- newCoVar s1 s2 
-                     ; cv2 <- newCoVar t1 t2 
-                     ; setCoBind cv $ 
-                       mkAppCoercion (mkCoVarCoercion cv1) (mkCoVarCoercion cv2) 
-                     ; return (cv1,cv2) } 
-
-             else if isGiven fl then 
-                    let co1 = mkLeftCoercion  $ mkCoVarCoercion cv 
-                        co2 = mkRightCoercion $ mkCoVarCoercion cv
-                    in do { cv1 <- newGivenCoVar s1 s2 co1 
-                          ; cv2 <- newGivenCoVar t1 t2 co2 
-                          ; return (cv1,cv2) } 
-             else -- Derived
-                 do { cv1 <- newDerivedId (EqPred s1 s2)
-                    ; cv2 <- newDerivedId (EqPred t1 t2)
-                    ; return (cv1,cv2) }
-
-         ; cc1 <- canEq fl cv1 s1 s2 
-         ; cc2 <- canEq fl cv2 t1 t2 
-         ; return (cc1 `andCCan` cc2) } 
-
-canEq fl cv s1@(ForAllTy {}) s2@(ForAllTy {})
- | tcIsForAllTy s1, tcIsForAllTy s2, 
-   Wanted {} <- fl 
- = canEqFailure fl cv
+can_eq_nc' ev s1@(ForAllTy {}) _ s2@(ForAllTy {}) _
+ | CtWanted { ctev_loc = loc, ctev_evar = orig_ev } <- ev
+ = do { let (tvs1,body1) = tcSplitForAllTys s1
+            (tvs2,body2) = tcSplitForAllTys s2
+      ; if not (equalLength tvs1 tvs2) then
+          canEqFailure ev s1 s2
+        else
+          do { traceTcS "Creating implication for polytype equality" $ ppr ev
+             ; ev_term <- deferTcSForAllEq Nominal loc (tvs1,body1) (tvs2,body2)
+             ; setEvBind orig_ev ev_term
+             ; return Stop } }
  | otherwise
- = do { traceTcS "Ommitting decomposition of given polytype equality" (pprEq s1 s2)
-      ; return emptyCCan }
+ = do { traceTcS "Ommitting decomposition of given polytype equality" $
+        pprEq s1 s2    -- See Note [Do not decompose given polytype equalities]
+      ; return Stop }
 
--- Finally expand any type synonym applications.
-canEq fl cv ty1 ty2 | Just ty1' <- tcView ty1 = canEq fl cv ty1' ty2
-canEq fl cv ty1 ty2 | Just ty2' <- tcView ty2 = canEq fl cv ty1 ty2'
-canEq fl cv _ _                               = canEqFailure fl cv
+can_eq_nc' ev (AppTy s1 t1) ps_ty1 ty2 ps_ty2
+  = can_eq_app ev NotSwapped s1 t1 ps_ty1 ty2 ps_ty2
+can_eq_nc' ev ty1 ps_ty1 (AppTy s2 t2) ps_ty2
+  = can_eq_app ev IsSwapped s2 t2 ps_ty2 ty1 ps_ty1
 
-canEqFailure :: CtFlavor -> EvVar -> TcS CanonicalCts
-canEqFailure fl cv = return (singleCCan (mkFrozenError fl cv))
+-- Everything else is a definite type error, eg LitTy ~ TyConApp
+can_eq_nc' ev _ ps_ty1 _ ps_ty2
+  = canEqFailure ev ps_ty1 ps_ty2
+
+------------
+can_eq_app, can_eq_flat_app
+    :: CtEvidence -> SwapFlag
+    -> Type -> Type -> Type  -- LHS (s1 t2), after and before type-synonym expansion, resp 
+    -> Type -> Type          -- RHS (ty2),   after and before type-synonym expansion, resp 
+    -> TcS StopOrContinue
+-- See Note [Canonicalising type applications]
+can_eq_app ev swapped s1 t1 ps_ty1 ty2 ps_ty2
+  =  do { traceTcS "can_eq_app 1" $
+          vcat [ ppr ev, ppr swapped, ppr s1, ppr t1, ppr ty2 ]
+        ; (xi_s1, co_s1) <- flatten FMSubstOnly ev s1
+        ; traceTcS "can_eq_app 2" $ vcat [ ppr ev, ppr xi_s1 ]
+        ; if s1 `tcEqType` xi_s1
+          then can_eq_flat_app ev swapped s1 t1 ps_ty1 ty2 ps_ty2
+          else
+     do { (xi_t1, co_t1) <- flatten FMSubstOnly ev t1
+             -- We flatten t1 as well so that (xi_s1 xi_t1) is well-kinded
+             -- If we form (xi_s1 t1) that might (appear) ill-kinded, 
+             -- and then crash in a call to typeKind
+        ; let xi1 = mkAppTy xi_s1 xi_t1
+              co1 = mkTcAppCo co_s1 co_t1
+        ; traceTcS "can_eq_app 3" $ vcat [ ppr ev, ppr xi1, ppr co1 ]
+        ; mb_ct <- rewriteEqEvidence ev swapped xi1 ps_ty2 
+                                     co1 (mkTcNomReflCo ps_ty2)
+        ; traceTcS "can_eq_app 4" $ vcat [ ppr ev, ppr xi1, ppr co1 ]
+        ; case mb_ct of
+           Nothing     -> return Stop
+           Just new_ev -> can_eq_nc new_ev xi1 xi1 ty2 ps_ty2 }}
+
+-- Preconditions: s1  is already flattened
+--                ty2 is not a type variable, so flattening
+--                    can't turn it into an application if it
+--                    doesn't look like one already
+-- See Note [Canonicalising type applications]
+can_eq_flat_app ev swapped s1 t1 ps_ty1 ty2 ps_ty2
+  | Just (s2,t2) <- tcSplitAppTy_maybe ty2
+  = unSwap swapped decompose_it (s1,t1) (s2,t2)
+  | otherwise
+  = unSwap swapped (canEqFailure ev) ps_ty1 ps_ty2
+  where
+    decompose_it (s1,t1) (s2,t2) 
+      = do { let xevcomp [x,y] = EvCoercion (mkTcAppCo (evTermCoercion x) (evTermCoercion y))
+                 xevcomp _ = error "canEqAppTy: can't happen" -- Can't happen
+                 xevdecomp x = let xco = evTermCoercion x
+                               in [ EvCoercion (mkTcLRCo CLeft xco)
+                                  , EvCoercion (mkTcLRCo CRight xco)]
+           ; ctevs <- xCtEvidence ev (XEvTerm [mkTcEqPred s1 s2, mkTcEqPred t1 t2] xevcomp xevdecomp)
+           ; canEvVarsCreated ctevs }
+
+
+------------------------
+canDecomposableTyConApp :: CtEvidence
+                        -> TyCon -> [TcType]
+                        -> TyCon -> [TcType]
+                        -> TcS StopOrContinue
+canDecomposableTyConApp ev tc1 tys1 tc2 tys2
+  | tc1 /= tc2 || length tys1 /= length tys2
+    -- Fail straight away for better error messages
+  = canEqFailure ev (mkTyConApp tc1 tys1) (mkTyConApp tc2 tys2)
+  | otherwise
+  = do { traceTcS "canDecomposableTyConApp" (ppr ev $$ ppr tc1 $$ ppr tys1 $$ ppr tys2)
+       ; canDecomposableTyConAppOK ev tc1 tys1 tys2 }
+
+canDecomposableTyConAppOK :: CtEvidence
+                          -> TyCon -> [TcType] -> [TcType]
+                          -> TcS StopOrContinue
+
+canDecomposableTyConAppOK ev tc1 tys1 tys2
+  = do { let xcomp xs  = EvCoercion (mkTcTyConAppCo Nominal tc1 (map evTermCoercion xs))
+             xdecomp x = zipWith (\_ i -> EvCoercion $ mkTcNthCo i (evTermCoercion x)) tys1 [0..]
+             xev = XEvTerm (zipWith mkTcEqPred tys1 tys2) xcomp xdecomp
+       ; ctevs <- xCtEvidence ev xev
+       ; canEvVarsCreated ctevs }
+
+canEqFailure :: CtEvidence -> TcType -> TcType -> TcS StopOrContinue
+-- See Note [Make sure that insolubles are fully rewritten]
+canEqFailure ev ty1 ty2
+  = do { (s1, co1) <- flatten FMSubstOnly ev ty1
+       ; (s2, co2) <- flatten FMSubstOnly ev ty2
+       ; mb_ct <- rewriteEqEvidence ev NotSwapped s1 s2 co1 co2
+       ; case mb_ct of
+           Just new_ev -> emitInsoluble (mkNonCanonical new_ev)
+           Nothing -> pprPanic "canEqFailure" (ppr ev $$ ppr ty1 $$ ppr ty2)
+       ; return Stop }
 \end{code}
 
-Note [Equality between type applications]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-If we see an equality of the form s1 t1 ~ s2 t2 we can always split
-it up into s1 ~ s2 /\ t1 ~ t2, since s1 and s2 can't be type
-functions (type functions use the TyConApp constructor, which never
-shows up as the LHS of an AppTy).  Other than type functions, types
-in Haskell are always 
+Note [Canonicalising type applications]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Given (s1 t1) ~ ty2, how should we proceed?
+The simple things is to see if ty2 is of form (s2 t2), and 
+decompose.  By this time s1 and s2 can't be saturated type
+function applications, because those have been dealt with 
+by an earlier equation in can_eq_nc, so it is always sound to 
+decompose.
 
-  (1) generative: a b ~ c d implies a ~ c, since different type
-      constructors always generate distinct types
+However, over-eager decomposition gives bad error messages 
+for things like
+   a b ~ Maybe c
+   e f ~ p -> q
+Suppose (in the first example) we already know a~Array.  Then if we
+decompose the application eagerly, yielding
+   a ~ Maybe
+   b ~ c
+we get an error        "Can't match Array ~ Maybe", 
+but we'd prefer to get "Can't match Array b ~ Maybe c".
 
-  (2) injective: a b ~ a d implies b ~ d; we never generate the
-      same type from different type arguments.
+So instead can_eq_app flattens s1.  If flattening does something, it
+rewrites, and goes round can_eq_nc again.  If flattening 
+does nothing, then (at least with our present state of knowledge)
+we can only decompose, and that is what can_eq_flat_app attempts
+to do. 
+
+Note [Make sure that insolubles are fully rewritten]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+When an equality fails, we still want to rewrite the equality
+all the way down, so that it accurately reflects
+ (a) the mutable reference substitution in force at start of solving
+ (b) any ty-binds in force at this point in solving
+See Note [Kick out insolubles] in TcInteract.
+And if we don't do this there is a bad danger that
+TcSimplify.applyTyVarDefaulting will find a variable
+that has in fact been substituted.
+
+Note [Do not decompose Given polytype equalities]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Consider [G] (forall a. t1 ~ forall a. t2).  Can we decompose this?
+No -- what would the evidence look like?  So instead we simply discard
+this given evidence.
+
+
+Note [Combining insoluble constraints]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+As this point we have an insoluble constraint, like Int~Bool.
+
+ * If it is Wanted, delete it from the cache, so that subsequent
+   Int~Bool constraints give rise to separate error messages
+
+ * But if it is Derived, DO NOT delete from cache.  A class constraint
+   may get kicked out of the inert set, and then have its functional
+   dependency Derived constraints generated a second time. In that
+   case we don't want to get two (or more) error messages by
+   generating two (or more) insoluble fundep constraints from the same
+   class constraint.
 
 
 Note [Canonical ordering for equality constraints]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Implemented as (<+=) below:
 
-  - Type function applications always come before anything else.  
+  - Type function applications always come before anything else.
   - Variables always come before non-variables (other than type
       function applications).
 
@@ -621,7 +1017,7 @@ might:
       constraints at the end if necessary when extracting a substitution.
 
   (2) To ensure termination we might think it necessary to put
-      variables in lexicographic order. However, this isn't actually 
+      variables in lexicographic order. However, this isn't actually
       necessary as outlined below.
 
 While building up an inert set of canonical constraints, we maintain
@@ -671,267 +1067,252 @@ inert set is an idempotent subustitution...
     introduce any new ones.
 
 \begin{code}
-data TypeClassifier 
-  = FskCls TcTyVar      -- ^ Flatten skolem 
-  | VarCls TcTyVar      -- ^ Non-flatten-skolem variable 
-  | FunCls TyCon [Type] -- ^ Type function, exactly saturated
-  | OtherCls TcType     -- ^ Neither of the above
-
-unClassify :: TypeClassifier -> TcType
-unClassify (VarCls tv)      = TyVarTy tv
-unClassify (FskCls tv) = TyVarTy tv 
-unClassify (FunCls fn tys)  = TyConApp fn tys
-unClassify (OtherCls ty)    = ty
-
-classify :: TcType -> TypeClassifier
-
-classify (TyVarTy tv) 
-  | isTcTyVar tv, 
-    FlatSkol {} <- tcTyVarDetails tv = FskCls tv
-  | otherwise                        = VarCls tv
-classify (TyConApp tc tys) | isSynFamilyTyCon tc
-                           , tyConArity tc == length tys
-                           = FunCls tc tys
-classify ty                | Just ty' <- tcView ty
-	                   = case classify ty' of
-                               OtherCls {} -> OtherCls ty
-                               var_or_fn   -> var_or_fn
-                           | otherwise 
-                           = OtherCls ty
-
--- See note [Canonical ordering for equality constraints].
-reOrient :: CtFlavor -> TypeClassifier -> TypeClassifier -> Bool	
--- (t1 `reOrient` t2) responds True 
---   iff we should flip to (t2~t1)
--- We try to say False if possible, to minimise evidence generation
---
--- Postcondition: After re-orienting, first arg is not OTherCls
-reOrient _fl (OtherCls {}) (FunCls {})   = True
-reOrient _fl (OtherCls {}) (FskCls {})   = True
-reOrient _fl (OtherCls {}) (VarCls {})   = True
-reOrient _fl (OtherCls {}) (OtherCls {}) = panic "reOrient"  -- One must be Var/Fun
-
-reOrient _fl (FunCls {})   (VarCls _tv)  = False  
-  -- But consider the following variation: isGiven fl && isMetaTyVar tv
-
-  -- See Note [No touchables as FunEq RHS] in TcSMonad
-reOrient _fl (FunCls {}) _                = False             -- Fun/Other on rhs
-
-reOrient _fl (VarCls {}) (FunCls {})      = True 
-
-reOrient _fl (VarCls {}) (FskCls {})      = False
-
-reOrient _fl (VarCls {})  (OtherCls {})   = False
-reOrient _fl (VarCls tv1)  (VarCls tv2)  
-  | isMetaTyVar tv2 && not (isMetaTyVar tv1) = True 
-  | otherwise                                = False 
-  -- Just for efficiency, see CTyEqCan invariants 
-
-reOrient _fl (FskCls {}) (VarCls tv2)     = isMetaTyVar tv2 
-  -- Just for efficiency, see CTyEqCan invariants
-
-reOrient _fl (FskCls {}) (FskCls {})     = False
-reOrient _fl (FskCls {}) (FunCls {})     = True 
-reOrient _fl (FskCls {}) (OtherCls {})   = False 
-
-------------------
-canEqLeaf :: TcsUntouchables 
-          -> CtFlavor -> CoVar 
-          -> TypeClassifier -> TypeClassifier -> TcS CanonicalCts 
--- Canonicalizing "leaf" equality constraints which cannot be
--- decomposed further (ie one of the types is a variable or
--- saturated type function application).  
-
-  -- Preconditions: 
-  --    * one of the two arguments is not OtherCls
-  --    * the two types are not equal (looking through synonyms)
-canEqLeaf _untch fl cv cls1 cls2 
-  | cls1 `re_orient` cls2
-  = do { cv' <- if isWanted fl 
-                then do { cv' <- newCoVar s2 s1 
-                        ; setCoBind cv $ mkSymCoercion (mkCoVarCoercion cv') 
-                        ; return cv' } 
-                else if isGiven fl then 
-                         newGivenCoVar s2 s1 (mkSymCoercion (mkCoVarCoercion cv))
-                else -- Derived
-                    newDerivedId (EqPred s2 s1)
-       ; canEqLeafOriented fl cv' cls2 s1 }
+canEqLeafFun :: CtEvidence 
+             -> SwapFlag
+             -> TyCon -> [TcType]   -- LHS
+             -> TcType -> TcType    -- RHS
+             -> TcS StopOrContinue
+canEqLeafFun ev swapped fn tys1 ty2 ps_ty2
+  | length tys1 > tyConArity fn
+  = -- Over-saturated type function on LHS: 
+    -- flatten LHS, leaving an AppTy, and go around again
+    do { (xi1, co1) <- flatten FMFullFlatten ev (mkTyConApp fn tys1)
+       ; mb <- rewriteEqEvidence ev swapped xi1 ps_ty2 
+                                 co1 (mkTcNomReflCo ps_ty2)
+       ; case mb of
+            Nothing     -> return Stop
+            Just new_ev -> can_eq_nc new_ev xi1 xi1 ty2 ps_ty2 }
 
   | otherwise
-  = do { traceTcS "canEqLeaf" (ppr (unClassify cls1) $$ ppr (unClassify cls2))
-       ; canEqLeafOriented fl cv cls1 s2 }
+  = -- ev :: F tys1 ~ ty2,   if not swapped
+    -- ev :: ty2 ~ F tys1,   if swapped                                    
+    ASSERT( length tys1 == tyConArity fn )  
+        -- Type functions are never under-saturated
+        -- Previous equation checks for over-saturation
+    do { traceTcS "canEqLeafFun" $ pprEq (mkTyConApp fn tys1) ps_ty2
+
+            -- Flatten type function arguments
+            -- cos1 :: xis1 ~ tys1
+            -- co2  :: xi2 ~ ty2
+      ; (xis1,cos1) <- flattenMany FMFullFlatten ev tys1
+      ; (xi2, co2)  <- flatten     FMFullFlatten ev ps_ty2
+
+       ; let fam_head = mkTyConApp fn xis1
+             co1      = mkTcTyConAppCo Nominal fn cos1
+       ; mb <- rewriteEqEvidence ev swapped fam_head xi2 co1 co2
+
+       ; let k1 = typeKind fam_head
+             k2 = typeKind xi2
+       ; case mb of
+            Nothing     -> return Stop
+            Just new_ev | k1 `isSubKind` k2
+                        -- Establish CFunEqCan kind invariant
+                        -> continueWith (CFunEqCan { cc_ev = new_ev, cc_fun = fn
+                                                   , cc_tyargs = xis1, cc_rhs = xi2 })
+                        | otherwise
+                        -> checkKind new_ev fam_head k1 xi2 k2 }
+
+---------------------
+canEqTyVar :: CtEvidence -> SwapFlag
+           -> TcTyVar 
+           -> TcType -> TcType
+           -> TcS StopOrContinue
+-- A TyVar on LHS, but so far un-zonked
+canEqTyVar ev swapped tv1 ty2 ps_ty2              -- ev :: tv ~ s2
+  = do { traceTcS "canEqTyVar" (ppr tv1 $$ ppr ty2 $$ ppr swapped)
+       ; mb_yes <- flattenTyVarOuter FMFullFlatten ev tv1 
+       ; case mb_yes of
+           Right (ty1, co1) -> -- co1 :: ty1 ~ tv1
+                               do { mb <- rewriteEqEvidence ev swapped  ty1 ps_ty2
+                                                            co1 (mkTcNomReflCo ps_ty2)
+                                  ; traceTcS "canEqTyVar2" (vcat [ppr tv1, ppr ty2, ppr swapped, ppr ty1,
+                                                                  ppUnless (isDerived ev) (ppr co1)])
+                                  ; case mb of
+                                      Nothing     -> return Stop
+                                      Just new_ev -> can_eq_nc new_ev ty1 ty1 ty2 ps_ty2 }
+
+           Left tv1' -> do { (xi2, co2) <- flatten FMFullFlatten ev ps_ty2 -- co2 :: xi2 ~ ps_ty2
+                                           -- Use ps_ty2 to preserve type synonyms if poss
+                           ; dflags <- getDynFlags
+                           ; canEqTyVar2 dflags ev swapped tv1' xi2 co2 } }
+
+canEqTyVar2 :: DynFlags
+            -> CtEvidence   -- olhs ~ orhs (or, if swapped, orhs ~ olhs)
+            -> SwapFlag
+            -> TcTyVar      -- olhs
+            -> TcType       -- nrhs
+            -> TcCoercion   -- nrhs ~ orhs
+            -> TcS StopOrContinue
+-- LHS is an inert type variable, 
+-- and RHS is fully rewritten, but with type synonyms
+-- preserved as much as possible
+
+canEqTyVar2 dflags ev swapped tv1 xi2 co2
+  | Just tv2 <- getTyVar_maybe xi2
+  = canEqTyVarTyVar ev swapped tv1 tv2 co2
+
+  | OC_OK xi2' <- occurCheckExpand dflags tv1 xi2  -- No occurs check
+  = do { mb <- rewriteEqEvidence ev swapped xi1 xi2' co1 co2
+                -- Ensure that the new goal has enough type synonyms
+                -- expanded by the occurCheckExpand; hence using xi2' here
+                -- See Note [occurCheckExpand]
+
+       ; let k1 = tyVarKind tv1
+             k2 = typeKind xi2'
+       ; case mb of
+            Nothing     -> return Stop
+            Just new_ev | k2 `isSubKind` k1
+                        -- Establish CTyEqCan kind invariant
+                        -- Reorientation has done its best, but the kinds might
+                        -- simply be incompatible
+                        -> continueWith (CTyEqCan { cc_ev = new_ev
+                                                  , cc_tyvar  = tv1, cc_rhs = xi2' })
+                        | otherwise
+                        -> checkKind new_ev xi1 k1 xi2' k2 }
+
+  | otherwise  -- Occurs check error
+  = do { mb <- rewriteEqEvidence ev swapped xi1 xi2 co1 co2
+       ; case mb of
+           Nothing     -> return ()
+           Just new_ev -> emitInsoluble (mkNonCanonical new_ev)
+       ; return Stop }
   where
-    re_orient = reOrient fl 
-    s1 = unClassify cls1  
-    s2 = unClassify cls2  
+    xi1 = mkTyVarTy tv1
+    co1 = mkTcNomReflCo xi1
 
-------------------
-canEqLeafOriented :: CtFlavor -> CoVar 
-                  -> TypeClassifier -> TcType -> TcS CanonicalCts 
--- First argument is not OtherCls
-canEqLeafOriented fl cv cls1@(FunCls fn tys1) s2         -- cv : F tys1
-  | let k1 = kindAppResult (tyConKind fn) tys1,
-    let k2 = typeKind s2, 
-    not (k1 `compatKind` k2) -- Establish the kind invariant for CFunEqCan
-  = canEqFailure fl cv
-    -- Eagerly fails, see Note [Kind errors] in TcInteract
 
-  | otherwise 
-  = ASSERT2( isSynFamilyTyCon fn, ppr (unClassify cls1) )
-    do { (xis1,cos1,ccs1) <- flattenMany fl tys1 -- Flatten type function arguments
-                                                 -- cos1 :: xis1 ~ tys1
-       ; (xi2, co2, ccs2) <- flatten fl s2       -- Flatten entire RHS
-                                                 -- co2  :: xi2 ~ s2
-       ; let ccs = ccs1 `andCCan` ccs2
-             no_flattening_happened = isEmptyCCan ccs
-       ; cv_new <- if no_flattening_happened then return cv
-                   else if isGiven fl        then return cv
-                   else if isWanted fl then 
-                         do { cv' <- newCoVar (unClassify (FunCls fn xis1)) xi2
-                                 -- cv' : F xis ~ xi2
-                            ; let -- fun_co :: F xis1 ~ F tys1
-                                 fun_co = mkTyConCoercion fn cos1
-                                 -- want_co :: F tys1 ~ s2
-                                 want_co = mkSymCoercion fun_co
-                                           `mkTransCoercion` mkCoVarCoercion cv'
-                                           `mkTransCoercion` co2
-                            ; setCoBind cv  want_co
-                            ; return cv' }
-                   else -- Derived 
-                       newDerivedId (EqPred (unClassify (FunCls fn xis1)) xi2)
+canEqTyVarTyVar :: CtEvidence       -- tv1 ~ orhs (or orhs ~ tv1, if swapped)
+                -> SwapFlag
+                -> TyVar -> TyVar   -- tv2, tv2
+                -> TcCoercion       -- tv2 ~ orhs
+                -> TcS StopOrContinue
+-- Both LHS and RHS rewrote to a type variable,
+canEqTyVarTyVar ev swapped tv1 tv2 co2
+  | tv1 == tv2
+  = do { when (isWanted ev) $
+         ASSERT( tcCoercionRole co2 == Nominal )
+         setEvBind (ctev_evar ev) (EvCoercion (maybeSym swapped co2))
+       ; return Stop }  
 
-       ; let final_cc = CFunEqCan { cc_id     = cv_new
-                                  , cc_flavor = fl
-                                  , cc_fun    = fn
-                                  , cc_tyargs = xis1 
-                                  , cc_rhs    = xi2 }
-       ; return $ ccs `extendCCans` final_cc }
+  | reorient_me  -- See note [Canonical ordering for equality constraints].
+                 -- True => the kinds are compatible, 
+                 --         so no need for further sub-kind check
+                 -- If swapped = NotSwapped, then
+                 --     rw_orhs = tv1, rw_olhs = orhs
+                 --     rw_nlhs = tv2, rw_nrhs = xi1
+  = do { mb <- rewriteEqEvidence ev (flipSwap swapped)  xi2 xi1
+                                 co2 (mkTcNomReflCo xi1)
+       ; case mb of
+           Nothing     -> return Stop
+           Just new_ev -> continueWith (CTyEqCan { cc_ev = new_ev
+                                                 , cc_tyvar  = tv2, cc_rhs = xi1 }) }
 
--- Otherwise, we have a variable on the left, so call canEqLeafTyVarLeft
-canEqLeafOriented fl cv (FskCls tv) s2 
-  = canEqLeafTyVarLeft fl cv tv s2 
-canEqLeafOriented fl cv (VarCls tv) s2 
-  = canEqLeafTyVarLeft fl cv tv s2 
-canEqLeafOriented _ cv (OtherCls ty1) ty2 
-  = pprPanic "canEqLeaf" (ppr cv $$ ppr ty1 $$ ppr ty2)
-
-canEqLeafTyVarLeft :: CtFlavor -> CoVar -> TcTyVar -> TcType -> TcS CanonicalCts
--- Establish invariants of CTyEqCans 
-canEqLeafTyVarLeft fl cv tv s2       -- cv : tv ~ s2
-  | not (k1 `compatKind` k2) -- Establish the kind invariant for CTyEqCan
-  = canEqFailure fl cv
-       -- Eagerly fails, see Note [Kind errors] in TcInteract
   | otherwise
-  = do { (xi2, co, ccs2) <- flatten fl s2  -- Flatten RHS   co : xi2 ~ s2
-       ; mxi2' <- canOccursCheck fl tv xi2 -- Do an occurs check, and return a possibly
-                                           -- unfolded version of the RHS, if we had to 
-                                           -- unfold any type synonyms to get rid of tv.
-       ; case mxi2' of {
-           Nothing   -> canEqFailure fl cv ;
-           Just xi2' ->
-    do { let no_flattening_happened = isEmptyCCan ccs2
-       ; cv_new <- if no_flattening_happened then return cv
-                   else if isGiven fl        then return cv
-                   else if isWanted fl then 
-                         do { cv' <- newCoVar (mkTyVarTy tv) xi2'  -- cv' : tv ~ xi2
-                            ; setCoBind cv  (mkCoVarCoercion cv' `mkTransCoercion` co)
-                            ; return cv' }
-                   else -- Derived
-                       newDerivedId (EqPred (mkTyVarTy tv) xi2')
-
-       ; return $ ccs2 `extendCCans` CTyEqCan { cc_id     = cv_new
-                                              , cc_flavor = fl
-                                              , cc_tyvar  = tv
-                                              , cc_rhs    = xi2' } } } }
+  = do { mb <- rewriteEqEvidence ev swapped xi1 xi2 
+                                 (mkTcNomReflCo xi1) co2
+       ; case mb of
+           Nothing     -> return Stop
+           Just new_ev | k2 `isSubKind` k1
+                       -> continueWith (CTyEqCan { cc_ev = new_ev
+                                                 , cc_tyvar = tv1, cc_rhs = xi2 })
+                       | otherwise
+                       -> checkKind ev xi1 k1 xi2 k2 } 
   where
-    k1 = tyVarKind tv
-    k2 = typeKind s2
+    reorient_me 
+      | k1 `tcEqKind` k2    = tv2 `better_than` tv1
+      | k1 `isSubKind` k2   = True  -- Note [Kind orientation for CTyEqCan]
+      | otherwise           = False -- in TcRnTypes
 
--- See Note [Type synonyms and canonicalization].
--- Check whether the given variable occurs in the given type.  We may
--- have needed to do some type synonym unfolding in order to get rid
--- of the variable, so we also return the unfolded version of the
--- type, which is guaranteed to be syntactically free of the given
--- type variable.  If the type is already syntactically free of the
--- variable, then the same type is returned.
+    xi1 = mkTyVarTy tv1
+    xi2 = mkTyVarTy tv2
+    k1  = tyVarKind tv1
+    k2  = tyVarKind tv2
+
+    tv2 `better_than` tv1
+      | isMetaTyVar tv1     = False   -- Never swap a meta-tyvar
+      | isFlatSkolTyVar tv1 = isMetaTyVar tv2
+      | otherwise           = isMetaTyVar tv2 || isFlatSkolTyVar tv2
+                            -- Note [Eliminate flat-skols]
+
+checkKind :: CtEvidence         -- t1~t2
+          -> TcType -> TcKind
+          -> TcType -> TcKind   -- s1~s2, flattened and zonked
+          -> TcS StopOrContinue
+-- LHS and RHS have incompatible kinds, so emit an "irreducible" constraint
+--       CIrredEvCan (NOT CTyEqCan or CFunEqCan)
+-- for the type equality; and continue with the kind equality constraint.
+-- When the latter is solved, it'll kick out the irreducible equality for
+-- a second attempt at solving
 --
--- Precondition: the two types are not equal (looking though synonyms)
-canOccursCheck :: CtFlavor -> TcTyVar -> Xi -> TcS (Maybe Xi)
-canOccursCheck _gw tv xi = return (expandAway tv xi)
+-- See Note [Equalities with incompatible kinds]
+
+checkKind new_ev s1 k1 s2 k2   -- See Note [Equalities with incompatible kinds]
+  = ASSERT( isKind k1 && isKind k2 )
+    do { traceTcS "canEqLeaf: incompatible kinds" (vcat [ppr k1, ppr k2])
+
+         -- Put the not-currently-soluble thing back onto the work list
+       ; updWorkListTcS $ extendWorkListNonEq $
+         CIrredEvCan { cc_ev = new_ev }
+
+         -- Create a derived kind-equality, and solve it
+       ; mw <- newDerived kind_co_loc (mkEqPred k1 k2)
+       ; case mw of
+           Nothing  -> return Stop
+           Just kev -> canEqNC kev k1 k2 }
+  where
+    loc = ctev_loc new_ev
+    kind_co_loc = setCtLocOrigin loc (KindEqOrigin s1 s2 (ctLocOrigin loc))
 \end{code}
 
-@expandAway tv xi@ expands synonyms in xi just enough to get rid of
-occurrences of tv, if that is possible; otherwise, it returns Nothing.
-For example, suppose we have
-  type F a b = [a]
-Then
-  expandAway b (F Int b) = Just [Int]
-but
-  expandAway a (F a Int) = Nothing
+Note [Eliminate flat-skols]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Suppose we have  [G] Num (F [a])
+then we flatten to
+     [G] Num fsk
+     [G] F [a] ~ fsk
+where fsk is a flatten-skolem (FlatSkol). Suppose we have
+      type instance F [a] = a
+then we'll reduce the second constraint to
+     [G] a ~ fsk
+and then replace all uses of 'a' with fsk.  That's bad because
+in error messages intead of saying 'a' we'll say (F [a]).  In all
+places, including those where the programmer wrote 'a' in the first
+place.  Very confusing!  See Trac #7862.
 
-We don't promise to do the absolute minimum amount of expanding
-necessary, but we try not to do expansions we don't need to.  We
-prefer doing inner expansions first.  For example,
-  type F a b = (a, Int, a, [a])
-  type G b   = Char
-We have
-  expandAway b (F (G b)) = F Char
-even though we could also expand F to get rid of b.
+Solution: re-orient a~fsk to fsk~a, so that we preferentially eliminate
+the fsk.
 
-\begin{code}
-expandAway :: TcTyVar -> Xi -> Maybe Xi
-expandAway tv t@(TyVarTy tv') 
-  | tv == tv' = Nothing
-  | otherwise = Just t
-expandAway tv xi
-  | not (tv `elemVarSet` tyVarsOfType xi) = Just xi
-expandAway tv (AppTy ty1 ty2) 
-  = do { ty1' <- expandAway tv ty1
-       ; ty2' <- expandAway tv ty2 
-       ; return (mkAppTy ty1' ty2') }
--- mkAppTy <$> expandAway tv ty1 <*> expandAway tv ty2
-expandAway tv (FunTy ty1 ty2)
-  = do { ty1' <- expandAway tv ty1 
-       ; ty2' <- expandAway tv ty2 
-       ; return (mkFunTy ty1' ty2') } 
--- mkFunTy <$> expandAway tv ty1 <*> expandAway tv ty2
-expandAway tv ty@(ForAllTy {}) 
-  = let (tvs,rho) = splitForAllTys ty
-        tvs_knds  = map tyVarKind tvs 
-    in if tv `elemVarSet` tyVarsOfTypes tvs_knds then 
-       -- Can't expand away the kinds unless we create 
-       -- fresh variables which we don't want to do at this point.
-           Nothing 
-       else do { rho' <- expandAway tv rho
-               ; return (mkForAllTys tvs rho') }
-expandAway tv (PredTy pred) 
-  = do { pred' <- expandAwayPred tv pred  
-       ; return (PredTy pred') }
--- For a type constructor application, first try expanding away the
--- offending variable from the arguments.  If that doesn't work, next
--- see if the type constructor is a type synonym, and if so, expand
--- it and try again.
-expandAway tv ty@(TyConApp tc tys)
-  = (mkTyConApp tc <$> mapM (expandAway tv) tys) <|> (tcView ty >>= expandAway tv)
+Note [Equalities with incompatible kinds]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+canEqLeaf is about to make a CTyEqCan or CFunEqCan; but both have the
+invariant that LHS and RHS satisfy the kind invariants for CTyEqCan,
+CFunEqCan.  What if we try to unify two things with incompatible
+kinds?
 
-expandAwayPred :: TcTyVar -> TcPredType -> Maybe TcPredType 
-expandAwayPred tv (ClassP cls tys) 
-  = do { tys' <- mapM (expandAway tv) tys; return (ClassP cls tys') } 
-expandAwayPred tv (EqPred ty1 ty2)
-  = do { ty1' <- expandAway tv ty1
-       ; ty2' <- expandAway tv ty2 
-       ; return (EqPred ty1' ty2') }
-expandAwayPred tv (IParam nm ty) 
-  = do { ty' <- expandAway tv ty
-       ; return (IParam nm ty') }
+eg    a ~ b  where a::*, b::*->*
+or    a ~ b  where a::*, b::k, k is a kind variable
 
-                
+The CTyEqCan compatKind invariant is important.  If we make a CTyEqCan
+for a~b, then we might well *substitute* 'b' for 'a', and that might make
+a well-kinded type ill-kinded; and that is bad (eg typeKind can crash, see
+Trac #7696).
 
-\end{code}
+So instead for these ill-kinded equalities we generate a CIrredCan,
+which keeps it out of the way until a subsequent substitution (on kind
+variables, say) re-activates it.
+
+NB: it is important that the types s1,s2 are flattened and zonked
+    so that their kinds k1, k2 are inert wrt the substitution.  That
+    means that they can only become the same if we change the inert
+    set, which in turn will kick out the irreducible equality
+    E.g. it is WRONG to make an irred (a:k1)~(b:k2)
+         if we already have a substitution k1:=k2
+
+See also Note [Kind orientation for CTyEqCan] and
+         Note [Kind orientation for CFunEqCan] in TcRnTypes
 
 Note [Type synonyms and canonicalization]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
 We treat type synonym applications as xi types, that is, they do not
 count as type function applications.  However, we do need to be a bit
 careful with type synonyms: like type functions they may not be
@@ -970,11 +1351,14 @@ However, if we encounter an equality constraint with a type synonym
 application on one side and a variable on the other side, we should
 NOT (necessarily) expand the type synonym, since for the purpose of
 good error messages we want to leave type synonyms unexpanded as much
-as possible.
+as possible.  Hence the ps_ty1, ps_ty2 argument passed to canEqTyVar.
 
-However, there is a subtle point with type synonyms and the occurs
-check that takes place for equality constraints of the form tv ~ xi.
-As an example, suppose we have
+
+Note [occurCheckExpand]
+~~~~~~~~~~~~~~~~~~~~~~~
+There is a subtle point with type synonyms and the occurs check that
+takes place for equality constraints of the form tv ~ xi.  As an
+example, suppose we have
 
   type F a = Int
 
@@ -1005,94 +1389,5 @@ not contain the variable from the LHS.  In particular, given
 
 we first try expanding each of the ti to types which no longer contain
 a.  If this turns out to be impossible, we next try expanding F
-itself, and so on.
+itself, and so on.  See Note [Occurs check expansion] in TcType
 
-
-%************************************************************************
-%*                                                                      *
-%*          Functional dependencies, instantiation of equations
-%*                                                                      *
-%************************************************************************
-
-When we spot an equality arising from a functional dependency,
-we now use that equality (a "wanted") to rewrite the work-item
-constraint right away.  This avoids two dangers
-
- Danger 1: If we send the original constraint on down the pipeline
-           it may react with an instance declaration, and in delicate
-	   situations (when a Given overlaps with an instance) that
-	   may produce new insoluble goals: see Trac #4952
-
- Danger 2: If we don't rewrite the constraint, it may re-react
-           with the same thing later, and produce the same equality
-           again --> termination worries.
-
-To achieve this required some refactoring of FunDeps.lhs (nicer
-now!).  
-
-\begin{code}
-rewriteWithFunDeps :: [Equation]
-                   -> [Xi] -> CtFlavor
-                   -> TcS (Maybe ([Xi], [Coercion], WorkList))
-rewriteWithFunDeps eqn_pred_locs xis fl
- = do { fd_ev_poss <- mapM (instFunDepEqn fl) eqn_pred_locs
-      ; let fd_ev_pos :: [(Int,FlavoredEvVar)]
-            fd_ev_pos = concat fd_ev_poss
-            (rewritten_xis, cos) = unzip (rewriteDictParams fd_ev_pos xis)
-      ; fds <- mapM (\(_,fev) -> mkCanonicalFEV fev) fd_ev_pos
-      ; let fd_work = unionWorkLists fds
-      ; if isEmptyWorkList fd_work 
-        then return Nothing
-        else return (Just (rewritten_xis, cos, fd_work)) }
-
-instFunDepEqn :: CtFlavor -- Precondition: Only Wanted or Derived
-              -> Equation
-              -> TcS [(Int, FlavoredEvVar)]
--- Post: Returns the position index as well as the corresponding FunDep equality
-instFunDepEqn fl (FDEqn { fd_qtvs = qtvs, fd_eqs = eqs
-                        , fd_pred1 = d1, fd_pred2 = d2 })
-  = do { let tvs = varSetElems qtvs
-       ; tvs' <- mapM instFlexiTcS tvs
-       ; let subst = zipTopTvSubst tvs (mkTyVarTys tvs')
-       ; mapM (do_one subst) eqs }
-  where 
-    fl' = case fl of 
-             Given _     -> panic "mkFunDepEqns"
-             Wanted  loc -> Wanted  (push_ctx loc)
-             Derived loc -> Derived (push_ctx loc)
-
-    push_ctx loc = pushErrCtxt FunDepOrigin (False, mkEqnMsg d1 d2) loc
-
-    do_one subst (FDEq { fd_pos = i, fd_ty_left = ty1, fd_ty_right = ty2 })
-       = do { let sty1 = substTy subst ty1
-                  sty2 = substTy subst ty2
-            ; ev <- newCoVar sty1 sty2
-            ; return (i, mkEvVarX ev fl') }
-
-rewriteDictParams :: [(Int,FlavoredEvVar)] -- A set of coercions : (pos, ty' ~ ty)
-                  -> [Type]                -- A sequence of types: tys
-                  -> [(Type,Coercion)]     -- Returns            : [(ty', co : ty' ~ ty)]
-rewriteDictParams param_eqs tys
-  = zipWith do_one tys [0..]
-  where
-    do_one :: Type -> Int -> (Type,Coercion)
-    do_one ty n = case lookup n param_eqs of
-                    Just wev -> (get_fst_ty wev, mkCoVarCoercion (evVarOf wev))
-                    Nothing  -> (ty,ty)		-- Identity
-
-    get_fst_ty wev = case evVarOfPred wev of
-                          EqPred ty1 _ -> ty1
-                          _ -> panic "rewriteDictParams: non equality fundep"
-
-mkEqnMsg :: (TcPredType, SDoc) -> (TcPredType, SDoc) -> TidyEnv
-         -> TcM (TidyEnv, SDoc)
-mkEqnMsg (pred1,from1) (pred2,from2) tidy_env
-  = do  { zpred1 <- TcM.zonkTcPredType pred1
-        ; zpred2 <- TcM.zonkTcPredType pred2
-	; let { tpred1 = tidyPred tidy_env zpred1
-              ; tpred2 = tidyPred tidy_env zpred2 }
-	; let msg = vcat [ptext (sLit "When using functional dependencies to combine"),
-			  nest 2 (sep [ppr tpred1 <> comma, nest 2 from1]), 
-			  nest 2 (sep [ppr tpred2 <> comma, nest 2 from2])]
-	; return (tidy_env, msg) }
-\end{code}

@@ -1,33 +1,38 @@
+module Vectorise.Monad.InstEnv 
+  ( existsInst
+  , lookupInst
+  , lookupFamInst
+  ) 
+where
 
-module Vectorise.Monad.InstEnv (
-	lookupInst,
-	lookupFamInst
-) where
 import Vectorise.Monad.Global
 import Vectorise.Monad.Base
 import Vectorise.Env
 
+import DynFlags
 import FamInstEnv
 import InstEnv
 import Class
 import Type
 import TyCon
 import Outputable
+import Util
 
 
 #include "HsVersions.h"
 
 
-getInstEnv :: VM (InstEnv, InstEnv)
-getInstEnv = readGEnv global_inst_env
-
-getFamInstEnv :: VM FamInstEnvs
-getFamInstEnv = readGEnv global_fam_inst_env
-
+-- Check whether a unique class instance for a given class and type arguments exists.
+--
+existsInst :: Class -> [Type] -> VM Bool
+existsInst cls tys
+  = do { instEnv <- readGEnv global_inst_env
+       ; return $ either (const False) (const True) (lookupUniqueInstEnv instEnv cls tys)
+       }
 
 -- Look up the dfun of a class instance.
 --
--- The match must be unique - ie, match exactly one instance - but the 
+-- The match must be unique —i.e., match exactly one instance— but the 
 -- type arguments used for matching may be more specific than those of 
 -- the class instance declaration.  The found class instances must not have
 -- any type variables in the instance context that do not appear in the
@@ -36,29 +41,21 @@ getFamInstEnv = readGEnv global_fam_inst_env
 --
 lookupInst :: Class -> [Type] -> VM (DFunId, [Type])
 lookupInst cls tys
-  = do { instEnv <- getInstEnv
-       ; case lookupInstEnv instEnv cls tys of
-	   ([(inst, inst_tys)], _) 
-             | noFlexiVar -> return (instanceDFunId inst, inst_tys')
-             | otherwise  -> pprPanic "VectMonad.lookupInst: flexi var: " 
-                                      (ppr $ mkTyConApp (classTyCon cls) tys)
-             where
-               inst_tys'  = [ty | Right ty <- inst_tys]
-               noFlexiVar = all isRight inst_tys
-	   _other         ->
-             pprPanic "VectMonad.lookupInst: not found " (ppr cls <+> ppr tys)
+  = do { instEnv <- readGEnv global_inst_env
+       ; case lookupUniqueInstEnv instEnv cls tys of
+           Right (inst, inst_tys) -> return (instanceDFunId inst, inst_tys)
+           Left  err              ->
+               do dflags <- getDynFlags
+                  cantVectorise dflags "Vectorise.Monad.InstEnv.lookupInst:" err
        }
-  where
-    isRight (Left  _) = False
-    isRight (Right _) = True
 
--- Look up the representation tycon of a family instance.
+-- Look up a family instance.
 --
 -- The match must be unique - ie, match exactly one instance - but the 
 -- type arguments used for matching may be more specific than those of 
 -- the family instance declaration.
 --
--- Return the instance tycon and its type instance.  For example, if we have
+-- Return the family instance and its type instance.  For example, if we have
 --
 --  lookupFamInst 'T' '[Int]' yields (':R42T', 'Int')
 --
@@ -68,13 +65,14 @@ lookupInst cls tys
 --
 -- which implies that :R42T was declared as 'data instance T [a]'.
 --
-lookupFamInst :: TyCon -> [Type] -> VM (TyCon, [Type])
+lookupFamInst :: TyCon -> [Type] -> VM FamInstMatch
 lookupFamInst tycon tys
-  = ASSERT( isFamilyTyCon tycon )
-    do { instEnv <- getFamInstEnv
+  = ASSERT( isOpenFamilyTyCon tycon )
+    do { instEnv <- readGEnv global_fam_inst_env
        ; case lookupFamInstEnv instEnv tycon tys of
-	   [(fam_inst, rep_tys)] -> return (famInstTyCon fam_inst, rep_tys)
-	   _other                -> 
-             pprPanic "VectMonad.lookupFamInst: not found: " 
-                      (ppr $ mkTyConApp tycon tys)
+           [match] -> return match
+           _other                -> 
+             do dflags <- getDynFlags
+                cantVectorise dflags "Vectorise.Monad.InstEnv.lookupFamInst: not found: "
+                           (ppr $ mkTyConApp tycon tys)
        }

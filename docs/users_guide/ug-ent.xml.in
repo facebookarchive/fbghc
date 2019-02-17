@@ -3,16 +3,20 @@
 <!ENTITY flags          SYSTEM "flags.xml">
 <!ENTITY license        SYSTEM "license.xml">
 <!ENTITY intro          SYSTEM "intro.xml" >
-<!ENTITY relnotes1      SYSTEM "7.0.1-notes.xml" >
+<!ENTITY relnotes1      SYSTEM "7.8.1-notes.xml" >
 <!ENTITY using          SYSTEM "using.xml" >
+<!ENTITY code-gens      SYSTEM "codegens.xml" >
 <!ENTITY runtime        SYSTEM "runtime_control.xml" >
 <!ENTITY prof           SYSTEM "profiling.xml" >
 <!ENTITY debug          SYSTEM "debugging.xml" >
 <!ENTITY sooner         SYSTEM "sooner.xml" >
 <!ENTITY lang-features  SYSTEM "lang.xml" >
 <!ENTITY glasgowexts    SYSTEM "glasgow_exts.xml" >
+<!ENTITY external-core  SYSTEM "external_core.xml" >
 <!ENTITY packages       SYSTEM "packages.xml" >
 <!ENTITY parallel       SYSTEM "parallel.xml" >
+<!ENTITY safehaskell    SYSTEM "safe_haskell.xml" >
+<!ENTITY extending-ghc  SYSTEM "extending_ghc.xml" >
 <!ENTITY phases         SYSTEM "phases.xml" >
 <!ENTITY separate       SYSTEM "separate_compilation.xml" >
 <!ENTITY bugs           SYSTEM "bugs.xml" >
@@ -25,3 +29,4 @@
 <!ENTITY libraryBaseLocation    "../libraries/base-@LIBRARY_base_VERSION@">
 <!ENTITY libraryCabalLocation   "../libraries/Cabal-@LIBRARY_Cabal_VERSION@">
 <!ENTITY libraryGhcPrimLocation "../libraries/ghc-prim-@LIBRARY_ghc_prim_VERSION@">
+<!ENTITY arw "-&gt;">

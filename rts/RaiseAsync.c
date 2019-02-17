@@ -33,9 +33,6 @@ static void removeFromQueues(Capability *cap, StgTSO *tso);
 
 static void removeFromMVarBlockedQueue (StgTSO *tso);
 
-static void blockedThrowTo (Capability *cap, 
-                            StgTSO *target, MessageThrowTo *msg);
-
 static void throwToSendMsg (Capability *cap USED_IF_THREADS,
                             Capability *target_cap USED_IF_THREADS, 
                             MessageThrowTo *msg USED_IF_THREADS);
@@ -156,8 +153,7 @@ throwTo (Capability *cap,	// the Capability we hold
     MessageThrowTo *msg;
 
     msg = (MessageThrowTo *) allocate(cap, sizeofW(MessageThrowTo));
-    // message starts locked; the caller has to unlock it when it is
-    // ready.
+    // the message starts locked; see below
     SET_HDR(msg, &stg_WHITEHOLE_info, CCS_SYSTEM);
     msg->source      = source;
     msg->target      = target;
@@ -166,9 +162,16 @@ throwTo (Capability *cap,	// the Capability we hold
     switch (throwToMsg(cap, msg))
     {
     case THROWTO_SUCCESS:
+        // unlock the message now, otherwise we leave a WHITEHOLE in
+        // the heap (#6103)
+        SET_HDR(msg, &stg_MSG_THROWTO_info, CCS_SYSTEM);
         return NULL;
+
     case THROWTO_BLOCKED:
     default:
+        // the caller will unlock the message when it is ready.  We
+        // cannot unlock it yet, because the calling thread will need
+        // to tidy up its state first.
         return msg;
     }
 }
@@ -288,6 +291,7 @@ check_target:
     }
 
     case BlockedOnMVar:
+    case BlockedOnMVarRead:
     {
 	/*
 	  To establish ownership of this TSO, we need to acquire a
@@ -300,7 +304,7 @@ check_target:
 
 	// ASSUMPTION: tso->block_info must always point to a
 	// closure.  In the threaded RTS it does.
-        switch (get_itbl(mvar)->type) {
+        switch (get_itbl((StgClosure *)mvar)->type) {
         case MVAR_CLEAN:
         case MVAR_DIRTY:
             break;
@@ -312,7 +316,7 @@ check_target:
 
         // we have the MVar, let's check whether the thread
 	// is still blocked on the same MVar.
-	if (target->why_blocked != BlockedOnMVar
+	if ((target->why_blocked != BlockedOnMVar && target->why_blocked != BlockedOnMVarRead)
 	    || (StgMVar *)target->block_info.closure != mvar) {
 	    unlockClosure((StgClosure *)mvar, info);
 	    goto retry;
@@ -460,7 +464,7 @@ throwToSendMsg (Capability *cap STG_UNUSED,
 // Block a throwTo message on the target TSO's blocked_exceptions
 // queue.  The current Capability must own the target TSO in order to
 // modify the blocked_exceptions queue.
-static void
+void
 blockedThrowTo (Capability *cap, StgTSO *target, MessageThrowTo *msg)
 {
     debugTraceCap(DEBUG_sched, cap, "throwTo: blocking on thread %lu",
@@ -631,6 +635,7 @@ removeFromQueues(Capability *cap, StgTSO *tso)
     goto done;
 
   case BlockedOnMVar:
+  case BlockedOnMVarRead:
       removeFromMVarBlockedQueue(tso);
       goto done;
 
@@ -737,9 +742,9 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
      * See also Exception.cmm:stg_raisezh.
      * This wasn't done for asynchronous exceptions originally; see #1450 
      */
-    if (RtsFlags.ProfFlags.showCCSOnException)
+    if (RtsFlags.ProfFlags.showCCSOnException && exception != NULL)
     {
-        fprintCCS_stderr(tso->prof.CCCS);
+        fprintCCS_stderr(tso->prof.cccs,exception,tso);
     }
 #endif
     // ASSUMES: the thread is not already complete or dead
@@ -823,7 +828,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 	    
 	    SET_HDR(ap,&stg_AP_STACK_info,
 		    ((StgClosure *)frame)->header.prof.ccs /* ToDo */); 
-	    TICK_ALLOC_UP_THK(words+1,0);
+	    TICK_ALLOC_UP_THK(WDS(words+1),0);
 	    
 	    //IF_DEBUG(scheduler,
 	    //	     debugBelch("sched: Updating ");
@@ -874,7 +879,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 	    
             SET_HDR(ap,&stg_AP_STACK_NOUPD_info,
 		    ((StgClosure *)frame)->header.prof.ccs /* ToDo */); 
-            TICK_ALLOC_SE_THK(words+1,0);
+            TICK_ALLOC_SE_THK(WDS(words+1),0);
 
             stack->sp = sp;
             threadStackUnderflow(cap,tso);
@@ -910,7 +915,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 	    // handler in this frame.
 	    //
 	    raise = (StgThunk *)allocate(cap,sizeofW(StgThunk)+1);
-	    TICK_ALLOC_SE_THK(1,0);
+	    TICK_ALLOC_SE_THK(WDS(1),0);
 	    SET_HDR(raise,&stg_raise_info,cf->header.prof.ccs);
 	    raise->payload[0] = exception;
 	    
@@ -918,7 +923,7 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 	    //
 	    sp = frame - 1;
 	    
-	    /* Ensure that async excpetions are blocked now, so we don't get
+	    /* Ensure that async exceptions are blocked now, so we don't get
 	     * a surprise exception before we get around to executing the
 	     * handler.
 	     */
@@ -953,23 +958,68 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
                 // transactions, but I don't fully understand the
                 // interaction with STM invariants.
                 stack->sp[1] = (W_)&stg_NO_TREC_closure;
-                stack->sp[0] = (W_)&stg_gc_unpt_r1_info;
+                stack->sp[0] = (W_)&stg_ret_p_info;
                 tso->what_next = ThreadRunGHC;
                 goto done;
 	    }
-	    // Not stop_at_atomically... fall through and abort the
-	    // transaction.
-	    
-	case CATCH_STM_FRAME:
+            else
+            {
+                // Freezing an STM transaction.  Just aborting the
+                // transaction would be wrong; this is what we used to
+                // do, and it goes wrong if the ATOMICALLY_FRAME ever
+                // gets back onto the stack again, which it will do if
+                // the transaction is inside unsafePerformIO or
+                // unsafeInterleaveIO and hence inside an UPDATE_FRAME.
+                //
+                // So we want to make it so that if the enclosing
+                // computation is resumed, we will re-execute the
+                // transaction.  We therefore:
+                //
+                //   1. abort the current transaction
+                //   3. replace the stack up to and including the
+                //      atomically frame with a closure representing
+                //      a call to "atomically x", where x is the code
+                //      of the transaction.
+                //   4. continue stripping the stack
+                //
+                StgTRecHeader *trec = tso->trec;
+                StgTRecHeader *outer = trec->enclosing_trec;
+
+                StgThunk *atomically;
+                StgAtomicallyFrame *af = (StgAtomicallyFrame*)frame;
+
+                debugTraceCap(DEBUG_stm, cap,
+                              "raiseAsync: freezing atomically frame")
+                stmAbortTransaction(cap, trec);
+                stmFreeAbortedTRec(cap, trec);
+                tso->trec = outer;
+
+                atomically = (StgThunk*)allocate(cap,sizeofW(StgThunk)+1);
+                TICK_ALLOC_SE_THK(1,0);
+                SET_HDR(atomically,&stg_atomically_info,af->header.prof.ccs);
+                atomically->payload[0] = af->code;
+
+                // discard stack up to and including the ATOMICALLY_FRAME
+                frame += sizeofW(StgAtomicallyFrame);
+                sp = frame - 1;
+
+                // replace the ATOMICALLY_FRAME with call to atomically#
+                sp[0] = (W_)atomically;
+                continue;
+            }
+
+        case CATCH_STM_FRAME:
 	case CATCH_RETRY_FRAME:
-	    // IF we find an ATOMICALLY_FRAME then we abort the
-	    // current transaction and propagate the exception.  In
-	    // this case (unlike ordinary exceptions) we do not care
+            // CATCH frames within an atomically block: abort the
+            // inner transaction and continue.  Eventually we will
+            // hit the outer transaction that will get frozen (see
+            // above).
+            //
+            // In this case (unlike ordinary exceptions) we do not care
 	    // whether the transaction is valid or not because its
 	    // possible validity cannot have caused the exception
 	    // and will not be visible after the abort.
-
-		{
+        {
             StgTRecHeader *trec = tso -> trec;
             StgTRecHeader *outer = trec -> enclosing_trec;
 	    debugTraceCap(DEBUG_stm, cap,
@@ -978,8 +1028,8 @@ raiseAsync(Capability *cap, StgTSO *tso, StgClosure *exception,
 	    stmFreeAbortedTRec(cap, trec);
             tso -> trec = outer;
             break;
-	    };
-	    
+        };
+
 	default:
 	    break;
 	}

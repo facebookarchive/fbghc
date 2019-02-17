@@ -11,6 +11,7 @@
 #include "Rts.h"
 
 #include "Stable.h"
+#include "Task.h"
 
 // hs_init and hs_exit are defined in RtsStartup.c
 
@@ -27,6 +28,16 @@ hs_perform_gc(void)
     performMajorGC();
 }
 
+void hs_lock_stable_tables (void)
+{
+    stableLock();
+}
+
+void hs_unlock_stable_tables (void)
+{
+    stableUnlock();
+}
+
 void
 hs_free_stable_ptr(HsStablePtr sp)
 {
@@ -36,8 +47,22 @@ hs_free_stable_ptr(HsStablePtr sp)
 }
 
 void
+hs_free_stable_ptr_unsafe(HsStablePtr sp)
+{
+    /* The cast is for clarity only, both HsStablePtr and StgStablePtr are
+       typedefs for void*. */
+    freeStablePtrUnsafe((StgStablePtr)sp);
+}
+
+void
 hs_free_fun_ptr(HsFunPtr fp)
 {
     /* I simply *love* all these similar names... */
     freeHaskellFunctionPtr(fp);
+}
+
+void
+hs_thread_done(void)
+{
+    freeMyTask();
 }

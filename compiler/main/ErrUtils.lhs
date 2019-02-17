@@ -4,259 +4,301 @@
 \section[ErrsUtils]{Utilities for error reporting}
 
 \begin{code}
+
 module ErrUtils (
-	Message, mkLocMessage, printError, pprMessageBag,
-	Severity(..),
+        ErrMsg, WarnMsg, Severity(..),
+        Messages, ErrorMessages, WarningMessages,
+        errMsgSpan, errMsgContext, errMsgShortDoc, errMsgExtraInfo,
+        MsgDoc, mkLocMessage, pprMessageBag, pprErrMsgBag, pprErrMsgBagWithLoc,
+        pprLocErrMsg, makeIntoWarning,
+        
+        errorsFound, emptyMessages, isEmptyMessages,
+        mkErrMsg, mkPlainErrMsg, mkLongErrMsg, mkWarnMsg, mkPlainWarnMsg,
+        printBagOfErrors, 
+        warnIsErrorMsg, mkLongWarnMsg,
 
-	ErrMsg, WarnMsg,
-        ErrorMessages, WarningMessages,
-        errMsgSpans, errMsgContext, errMsgShortDoc, errMsgExtraInfo,
-	Messages, errorsFound, emptyMessages,
-	mkErrMsg, mkPlainErrMsg, mkLongErrMsg, mkWarnMsg, mkPlainWarnMsg,
-	printBagOfErrors, printBagOfWarnings,
-	warnIsErrorMsg, mkLongWarnMsg,
-
-	ghcExit,
-	doIfSet, doIfSet_dyn, 
-	dumpIfSet, dumpIfSet_dyn, dumpIfSet_dyn_or,
+        ghcExit,
+        doIfSet, doIfSet_dyn,
+        dumpIfSet, dumpIfSet_dyn,
         mkDumpDoc, dumpSDoc,
 
-	--  * Messages during compilation
+        --  * Messages during compilation
         putMsg, putMsgWith,
-	errorMsg,
-	fatalErrorMsg,
-	compilationProgressMsg,
-	showPass,
-	debugTraceMsg,	
+        errorMsg,
+        fatalErrorMsg, fatalErrorMsg', fatalErrorMsg'',
+        compilationProgressMsg,
+        showPass,
+        debugTraceMsg,
+
+        prettyPrintGhcErrors,
     ) where
 
 #include "HsVersions.h"
 
-import Bag		( Bag, bagToList, isEmptyBag, emptyBag )
-import Util		( sortLe )
+import Bag              ( Bag, bagToList, isEmptyBag, emptyBag )
+import Exception
 import Outputable
+import Panic
+import FastString
 import SrcLoc
-import DynFlags		( DynFlags(..), DynFlag(..), dopt )
-import StaticFlags	( opt_ErrorSpans )
+import DynFlags
 
-import System.Exit	( ExitCode(..), exitWith )
+import System.Directory
+import System.Exit      ( ExitCode(..), exitWith )
+import System.FilePath
 import Data.List
+import qualified Data.Set as Set
+import Data.IORef
+import Data.Ord
+import Data.Time
+import Control.Monad
+import Control.Monad.IO.Class
 import System.IO
 
 -- -----------------------------------------------------------------------------
 -- Basic error messages: just render a message with a source location.
 
-type Message = SDoc
+type Messages        = (WarningMessages, ErrorMessages)
+type WarningMessages = Bag WarnMsg
+type ErrorMessages   = Bag ErrMsg
 
-pprMessageBag :: Bag Message -> SDoc
-pprMessageBag msgs = vcat (punctuate blankLine (bagToList msgs))
+data ErrMsg = ErrMsg {
+        errMsgSpan      :: SrcSpan,
+        errMsgContext   :: PrintUnqualified,
+        errMsgShortDoc  :: MsgDoc,   -- errMsgShort* should always
+        errMsgShortString :: String, -- contain the same text
+        errMsgExtraInfo :: MsgDoc,
+        errMsgSeverity  :: Severity
+        }
+        -- The SrcSpan is used for sorting errors into line-number order
+
+type WarnMsg = ErrMsg
+type MsgDoc = SDoc
 
 data Severity
   = SevOutput
+  | SevDump
+  | SevInteractive
   | SevInfo
   | SevWarning
   | SevError
   | SevFatal
 
-mkLocMessage :: SrcSpan -> Message -> Message
-mkLocMessage locn msg
-  | opt_ErrorSpans = hang (ppr locn <> colon) 4 msg
-  | otherwise      = hang (ppr (srcSpanStart locn) <> colon) 4 msg
-  -- always print the location, even if it is unhelpful.  Error messages
+instance Show ErrMsg where
+    show em = errMsgShortString em
+
+pprMessageBag :: Bag MsgDoc -> SDoc
+pprMessageBag msgs = vcat (punctuate blankLine (bagToList msgs))
+
+mkLocMessage :: Severity -> SrcSpan -> MsgDoc -> MsgDoc
+  -- Always print the location, even if it is unhelpful.  Error messages
   -- are supposed to be in a standard format, and one without a location
   -- would look strange.  Better to say explicitly "<no location info>".
+mkLocMessage severity locn msg
+    = sdocWithDynFlags $ \dflags ->
+      let locn' = if gopt Opt_ErrorSpans dflags
+                  then ppr locn
+                  else ppr (srcSpanStart locn)
+      in hang (locn' <> colon <+> sev_info) 4 msg
+  where
+    sev_info = case severity of
+                 SevWarning -> ptext (sLit "Warning:")
+                 _other     -> empty                 
+      -- For warnings, print    Foo.hs:34: Warning:
+      --                           <the warning message>
 
-printError :: SrcSpan -> Message -> IO ()
-printError span msg = printErrs (mkLocMessage span msg $ defaultErrStyle)
-
+makeIntoWarning :: ErrMsg -> ErrMsg
+makeIntoWarning err = err { errMsgSeverity = SevWarning }
 
 -- -----------------------------------------------------------------------------
 -- Collecting up messages for later ordering and printing.
 
-data ErrMsg = ErrMsg { 
-	errMsgSpans     :: [SrcSpan],
-	errMsgContext   :: PrintUnqualified,
-	errMsgShortDoc  :: Message,
-	errMsgExtraInfo :: Message
-	}
-	-- The SrcSpan is used for sorting errors into line-number order
+mk_err_msg :: DynFlags -> Severity -> SrcSpan -> PrintUnqualified -> MsgDoc -> SDoc -> ErrMsg
+mk_err_msg  dflags sev locn print_unqual msg extra
+ = ErrMsg { errMsgSpan = locn, errMsgContext = print_unqual
+          , errMsgShortDoc = msg , errMsgShortString = showSDoc dflags msg
+          , errMsgExtraInfo = extra
+          , errMsgSeverity = sev }
 
-instance Show ErrMsg where
-    show em = showSDoc (errMsgShortDoc em)
-
-type WarnMsg = ErrMsg
-
--- A short (one-line) error message, with context to tell us whether
--- to qualify names in the message or not.
-mkErrMsg :: SrcSpan -> PrintUnqualified -> Message -> ErrMsg
-mkErrMsg locn print_unqual msg
-  = ErrMsg { errMsgSpans = [locn], errMsgContext = print_unqual
-           , errMsgShortDoc = msg, errMsgExtraInfo = empty }
-
+mkLongErrMsg, mkLongWarnMsg   :: DynFlags -> SrcSpan -> PrintUnqualified -> MsgDoc -> MsgDoc -> ErrMsg
+-- A long (multi-line) error message
+mkErrMsg, mkWarnMsg           :: DynFlags -> SrcSpan -> PrintUnqualified -> MsgDoc            -> ErrMsg
+-- A short (one-line) error message
+mkPlainErrMsg, mkPlainWarnMsg :: DynFlags -> SrcSpan ->                     MsgDoc            -> ErrMsg
 -- Variant that doesn't care about qualified/unqualified names
-mkPlainErrMsg :: SrcSpan -> Message -> ErrMsg
-mkPlainErrMsg locn msg
-  = ErrMsg { errMsgSpans = [locn], errMsgContext = alwaysQualify
-           , errMsgShortDoc = msg, errMsgExtraInfo = empty }
 
--- A long (multi-line) error message, with context to tell us whether
--- to qualify names in the message or not.
-mkLongErrMsg :: SrcSpan -> PrintUnqualified -> Message -> Message -> ErrMsg
-mkLongErrMsg locn print_unqual msg extra 
- = ErrMsg { errMsgSpans = [locn], errMsgContext = print_unqual
-          , errMsgShortDoc = msg, errMsgExtraInfo = extra }
+mkLongErrMsg   dflags locn unqual msg extra = mk_err_msg dflags SevError   locn unqual        msg extra
+mkErrMsg       dflags locn unqual msg       = mk_err_msg dflags SevError   locn unqual        msg empty
+mkPlainErrMsg  dflags locn        msg       = mk_err_msg dflags SevError   locn alwaysQualify msg empty
+mkLongWarnMsg  dflags locn unqual msg extra = mk_err_msg dflags SevWarning locn unqual        msg extra
+mkWarnMsg      dflags locn unqual msg       = mk_err_msg dflags SevWarning locn unqual        msg empty
+mkPlainWarnMsg dflags locn        msg       = mk_err_msg dflags SevWarning locn alwaysQualify msg empty
 
-mkWarnMsg :: SrcSpan -> PrintUnqualified -> Message -> WarnMsg
-mkWarnMsg = mkErrMsg
-
-mkLongWarnMsg :: SrcSpan -> PrintUnqualified -> Message -> Message -> ErrMsg
-mkLongWarnMsg = mkLongErrMsg
-
--- Variant that doesn't care about qualified/unqualified names
-mkPlainWarnMsg :: SrcSpan -> Message -> ErrMsg
-mkPlainWarnMsg locn msg = mkWarnMsg locn alwaysQualify msg
-
-type Messages = (Bag WarnMsg, Bag ErrMsg)
-
-type WarningMessages = Bag WarnMsg
-type ErrorMessages   = Bag ErrMsg
-
+----------------
 emptyMessages :: Messages
 emptyMessages = (emptyBag, emptyBag)
 
-warnIsErrorMsg :: ErrMsg
-warnIsErrorMsg = mkPlainErrMsg noSrcSpan (text "\nFailing due to -Werror.")
+isEmptyMessages :: Messages -> Bool
+isEmptyMessages (warns, errs) = isEmptyBag warns && isEmptyBag errs
+
+warnIsErrorMsg :: DynFlags -> ErrMsg
+warnIsErrorMsg dflags
+    = mkPlainErrMsg dflags noSrcSpan (text "\nFailing due to -Werror.")
 
 errorsFound :: DynFlags -> Messages -> Bool
 errorsFound _dflags (_warns, errs) = not (isEmptyBag errs)
 
 printBagOfErrors :: DynFlags -> Bag ErrMsg -> IO ()
-printBagOfErrors dflags bag_of_errors = 
-  printMsgBag dflags bag_of_errors SevError
+printBagOfErrors dflags bag_of_errors
+  = printMsgBag dflags bag_of_errors
 
-printBagOfWarnings :: DynFlags -> Bag WarnMsg -> IO ()
-printBagOfWarnings dflags bag_of_warns = 
-  printMsgBag dflags bag_of_warns SevWarning
+pprErrMsgBag :: Bag ErrMsg -> [SDoc]
+pprErrMsgBag bag
+  = [ sdocWithDynFlags $ \dflags ->
+      let style = mkErrStyle dflags unqual
+      in withPprStyle style (d $$ e)
+    | ErrMsg { errMsgShortDoc  = d,
+               errMsgExtraInfo = e,
+               errMsgContext   = unqual } <- sortMsgBag bag ]
 
-printMsgBag :: DynFlags -> Bag ErrMsg -> Severity -> IO ()
-printMsgBag dflags bag sev
-  = sequence_   [ let style = mkErrStyle unqual
-		  in log_action dflags sev s style (d $$ e)
-		| ErrMsg { errMsgSpans = s:_,
-			   errMsgShortDoc = d,
-			   errMsgExtraInfo = e,
-			   errMsgContext = unqual } <- sorted_errs ]
-    where
-      bag_ls	  = bagToList bag
-      sorted_errs = sortLe occ'ed_before bag_ls
+pprErrMsgBagWithLoc :: Bag ErrMsg -> [SDoc]
+pprErrMsgBagWithLoc bag = [ pprLocErrMsg item | item <- sortMsgBag bag ]
 
-      occ'ed_before err1 err2 = 
-         case compare (head (errMsgSpans err1)) (head (errMsgSpans err2)) of
-		LT -> True
-		EQ -> True
-		GT -> False
+pprLocErrMsg :: ErrMsg -> SDoc
+pprLocErrMsg (ErrMsg { errMsgSpan      = s
+                     , errMsgShortDoc  = d
+                     , errMsgExtraInfo = e
+                     , errMsgSeverity  = sev
+                     , errMsgContext   = unqual })
+  = sdocWithDynFlags $ \dflags ->
+    withPprStyle (mkErrStyle dflags unqual) (mkLocMessage sev s (d $$ e))
+
+printMsgBag :: DynFlags -> Bag ErrMsg -> IO ()
+printMsgBag dflags bag
+  = sequence_ [ let style = mkErrStyle dflags unqual
+                in log_action dflags dflags sev s style (d $$ e)
+              | ErrMsg { errMsgSpan      = s,
+                         errMsgShortDoc  = d,
+                         errMsgSeverity  = sev,
+                         errMsgExtraInfo = e,
+                         errMsgContext   = unqual } <- sortMsgBag bag ]
+
+sortMsgBag :: Bag ErrMsg -> [ErrMsg]
+sortMsgBag bag = sortBy (comparing errMsgSpan) $ bagToList bag
 
 ghcExit :: DynFlags -> Int -> IO ()
 ghcExit dflags val
   | val == 0  = exitWith ExitSuccess
   | otherwise = do errorMsg dflags (text "\nCompilation had errors\n\n")
-	           exitWith (ExitFailure val)
+                   exitWith (ExitFailure val)
 
 doIfSet :: Bool -> IO () -> IO ()
 doIfSet flag action | flag      = action
-		    | otherwise = return ()
+                    | otherwise = return ()
 
-doIfSet_dyn :: DynFlags -> DynFlag -> IO () -> IO()
-doIfSet_dyn dflags flag action | dopt flag dflags = action
-		               | otherwise        = return ()
+doIfSet_dyn :: DynFlags -> GeneralFlag -> IO () -> IO()
+doIfSet_dyn dflags flag action | gopt flag dflags = action
+                               | otherwise        = return ()
 
 -- -----------------------------------------------------------------------------
 -- Dumping
 
-dumpIfSet :: Bool -> String -> SDoc -> IO ()
-dumpIfSet flag hdr doc
+dumpIfSet :: DynFlags -> Bool -> String -> SDoc -> IO ()
+dumpIfSet dflags flag hdr doc
   | not flag   = return ()
-  | otherwise  = printDump (mkDumpDoc hdr doc)
+  | otherwise  = log_action dflags dflags SevDump noSrcSpan defaultDumpStyle (mkDumpDoc hdr doc)
 
-dumpIfSet_dyn :: DynFlags -> DynFlag -> String -> SDoc -> IO ()
+dumpIfSet_dyn :: DynFlags -> DumpFlag -> String -> SDoc -> IO ()
 dumpIfSet_dyn dflags flag hdr doc
-  | dopt flag dflags || verbosity dflags >= 4 
+  | dopt flag dflags
   = dumpSDoc dflags flag hdr doc
   | otherwise
   = return ()
 
-dumpIfSet_dyn_or :: DynFlags -> [DynFlag] -> String -> SDoc -> IO ()
-dumpIfSet_dyn_or dflags flags hdr doc
-  | or [dopt flag dflags | flag <- flags]
-  || verbosity dflags >= 4 
-  = printDump (mkDumpDoc hdr doc)
-  | otherwise = return ()
-
 mkDumpDoc :: String -> SDoc -> SDoc
-mkDumpDoc hdr doc 
+mkDumpDoc hdr doc
    = vcat [blankLine,
-	   line <+> text hdr <+> line,
-	   doc,
-	   blankLine]
-     where 
+           line <+> text hdr <+> line,
+           doc,
+           blankLine]
+     where
         line = text (replicate 20 '=')
 
 
 -- | Write out a dump.
---	If --dump-to-file is set then this goes to a file.
---	otherwise emit to stdout.
-dumpSDoc :: DynFlags -> DynFlag -> String -> SDoc -> IO ()
-dumpSDoc dflags dflag hdr doc
- = do	let mFile	= chooseDumpFile dflags dflag
- 	case mFile of
-		-- write the dump to a file
-		--	don't add the header in this case, we can see what kind
-		--	of dump it is from the filename.
-		Just fileName
-		 -> do	handle	<- openFile fileName AppendMode
-		 	hPrintDump handle doc
-		 	hClose handle
+--      If --dump-to-file is set then this goes to a file.
+--      otherwise emit to stdout.
+-- 
+-- When hdr is empty, we print in a more compact format (no separators and
+-- blank lines)
+dumpSDoc :: DynFlags -> DumpFlag -> String -> SDoc -> IO ()
+dumpSDoc dflags flag hdr doc
+ = do let mFile = chooseDumpFile dflags flag
+      case mFile of
+            Just fileName
+                 -> do
+                        let gdref = generatedDumps dflags
+                        gd <- readIORef gdref
+                        let append = Set.member fileName gd
+                            mode = if append then AppendMode else WriteMode
+                        when (not append) $
+                            writeIORef gdref (Set.insert fileName gd)
+                        createDirectoryIfMissing True (takeDirectory fileName)
+                        handle <- openFile fileName mode
+                        doc' <- if null hdr
+                                then return doc
+                                else do t <- getCurrentTime
+                                        let d = text (show t)
+                                             $$ blankLine
+                                             $$ doc
+                                        return $ mkDumpDoc hdr d
+                        defaultLogActionHPrintDoc dflags handle doc' defaultDumpStyle
+                        hClose handle
 
-		-- write the dump to stdout
-		Nothing
-		 -> do	printDump (mkDumpDoc hdr doc)
+            -- write the dump to stdout
+            Nothing -> do
+              let (doc', severity)
+                    | null hdr  = (doc, SevOutput)
+                    | otherwise = (mkDumpDoc hdr doc, SevDump)
+              log_action dflags dflags severity noSrcSpan defaultDumpStyle doc'
 
 
 -- | Choose where to put a dump file based on DynFlags
 --
-chooseDumpFile :: DynFlags -> DynFlag -> Maybe String
-chooseDumpFile dflags dflag
+chooseDumpFile :: DynFlags -> DumpFlag -> Maybe String
+chooseDumpFile dflags flag
 
-	-- dump file location is being forced
-	--	by the --ddump-file-prefix flag.
- 	| dumpToFile
-	, Just prefix	<- dumpPrefixForce dflags
-	= Just $ prefix ++ (beautifyDumpName dflag)
+        | gopt Opt_DumpToFile dflags
+        , Just prefix <- getPrefix
+        = Just $ setDir (prefix ++ (beautifyDumpName flag))
 
-	-- dump file location chosen by DriverPipeline.runPipeline
-	| dumpToFile
-	, Just prefix	<- dumpPrefix dflags
-	= Just $ prefix ++ (beautifyDumpName dflag)
+        | otherwise
+        = Nothing
 
-	-- we haven't got a place to put a dump file.
-	| otherwise
-	= Nothing
+        where getPrefix
+                 -- dump file location is being forced
+                 --      by the --ddump-file-prefix flag.
+               | Just prefix <- dumpPrefixForce dflags
+                  = Just prefix
+                 -- dump file location chosen by DriverPipeline.runPipeline
+               | Just prefix <- dumpPrefix dflags
+                  = Just prefix
+                 -- we haven't got a place to put a dump file.
+               | otherwise
+                  = Nothing
+              setDir f = case dumpDir dflags of
+                         Just d  -> d </> f
+                         Nothing ->       f
 
-	where	dumpToFile = dopt Opt_DumpToFile dflags
-
-
--- | Build a nice file name from name of a DynFlag constructor
-beautifyDumpName :: DynFlag -> String
-beautifyDumpName dflag
- = let	str	= show dflag
- 	cut	= if isPrefixOf "Opt_D_" str
-			 then drop 6 str
-			 else str
-	dash	= map	(\c -> case c of
-				'_'	-> '-'
-				_	-> c)
-			cut
-   in	dash
+-- | Build a nice file name from name of a GeneralFlag constructor
+beautifyDumpName :: DumpFlag -> String
+beautifyDumpName flag
+ = let str = show flag
+       suff = case stripPrefix "Opt_D_" str of
+              Just x -> x
+              Nothing -> panic ("Bad flag name: " ++ str)
+       dash = map (\c -> if c == '_' then '-' else c) suff
+   in dash
 
 
 -- -----------------------------------------------------------------------------
@@ -272,31 +314,51 @@ ifVerbose dflags val act
   | verbosity dflags >= val = act
   | otherwise               = return ()
 
-putMsg :: DynFlags -> Message -> IO ()
-putMsg dflags msg = log_action dflags SevInfo noSrcSpan defaultUserStyle msg
+putMsg :: DynFlags -> MsgDoc -> IO ()
+putMsg dflags msg = log_action dflags dflags SevInfo noSrcSpan defaultUserStyle msg
 
-putMsgWith :: DynFlags -> PrintUnqualified -> Message -> IO ()
+putMsgWith :: DynFlags -> PrintUnqualified -> MsgDoc -> IO ()
 putMsgWith dflags print_unqual msg
-  = log_action dflags SevInfo noSrcSpan sty msg
+  = log_action dflags dflags SevInfo noSrcSpan sty msg
   where
     sty = mkUserStyle print_unqual AllTheWay
 
-errorMsg :: DynFlags -> Message -> IO ()
-errorMsg dflags msg = log_action dflags SevError noSrcSpan defaultErrStyle msg
+errorMsg :: DynFlags -> MsgDoc -> IO ()
+errorMsg dflags msg =
+    log_action dflags dflags SevError noSrcSpan (defaultErrStyle dflags) msg
 
-fatalErrorMsg :: DynFlags -> Message -> IO ()
-fatalErrorMsg dflags msg = log_action dflags SevFatal noSrcSpan defaultErrStyle msg
+fatalErrorMsg :: DynFlags -> MsgDoc -> IO ()
+fatalErrorMsg dflags msg = fatalErrorMsg' (log_action dflags) dflags msg
+
+fatalErrorMsg' :: LogAction -> DynFlags -> MsgDoc -> IO ()
+fatalErrorMsg' la dflags msg =
+    la dflags SevFatal noSrcSpan (defaultErrStyle dflags) msg
+
+fatalErrorMsg'' :: FatalMessager -> String -> IO ()
+fatalErrorMsg'' fm msg = fm msg
 
 compilationProgressMsg :: DynFlags -> String -> IO ()
 compilationProgressMsg dflags msg
-  = ifVerbose dflags 1 (log_action dflags SevOutput noSrcSpan defaultUserStyle (text msg))
+  = ifVerbose dflags 1 (log_action dflags dflags SevOutput noSrcSpan defaultUserStyle (text msg))
 
 showPass :: DynFlags -> String -> IO ()
-showPass dflags what 
-  = ifVerbose dflags 2 (log_action dflags SevInfo noSrcSpan defaultUserStyle (text "***" <+> text what <> colon))
+showPass dflags what
+  = ifVerbose dflags 2 (log_action dflags dflags SevInfo noSrcSpan defaultUserStyle (text "***" <+> text what <> colon))
 
-debugTraceMsg :: DynFlags -> Int -> Message -> IO ()
+debugTraceMsg :: DynFlags -> Int -> MsgDoc -> IO ()
 debugTraceMsg dflags val msg
-  = ifVerbose dflags val (log_action dflags SevInfo noSrcSpan defaultDumpStyle msg)
+  = ifVerbose dflags val (log_action dflags dflags SevInfo noSrcSpan defaultDumpStyle msg)
 
+prettyPrintGhcErrors :: ExceptionMonad m => DynFlags -> m a -> m a
+prettyPrintGhcErrors dflags
+    = ghandle $ \e -> case e of
+                      PprPanic str doc ->
+                          pprDebugAndThen dflags panic str doc
+                      PprSorry str doc ->
+                          pprDebugAndThen dflags sorry str doc
+                      PprProgramError str doc ->
+                          pprDebugAndThen dflags pgmError str doc
+                      _ ->
+                          liftIO $ throwIO e
 \end{code}
+

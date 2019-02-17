@@ -1,81 +1,68 @@
 -- -----------------------------------------------------------------------------
 --
 -- (c) The University of Glasgow 1993-2004
--- 
+--
 -- This is the top-level module in the native code generator.
 --
 -- -----------------------------------------------------------------------------
 
 \begin{code}
+{-# LANGUAGE GADTs #-}
 module AsmCodeGen ( nativeCodeGen ) where
 
 #include "HsVersions.h"
 #include "nativeGen/NCG.h"
 
 
-#if   alpha_TARGET_ARCH
-import Alpha.CodeGen
-import Alpha.Regs
-import Alpha.RegInfo
-import Alpha.Instr
+import qualified X86.CodeGen
+import qualified X86.Regs
+import qualified X86.Instr
+import qualified X86.Ppr
 
-#elif i386_TARGET_ARCH || x86_64_TARGET_ARCH
-import X86.CodeGen
-import X86.Regs
-import X86.Instr
-import X86.Ppr
+import qualified SPARC.CodeGen
+import qualified SPARC.Regs
+import qualified SPARC.Instr
+import qualified SPARC.Ppr
+import qualified SPARC.ShortcutJump
+import qualified SPARC.CodeGen.Expand
 
-#elif sparc_TARGET_ARCH
-import SPARC.CodeGen
-import SPARC.CodeGen.Expand
-import SPARC.Regs
-import SPARC.Instr
-import SPARC.Ppr
-import SPARC.ShortcutJump
-
-#elif powerpc_TARGET_ARCH
-import PPC.CodeGen
-import PPC.Cond
-import PPC.Regs
-import PPC.RegInfo
-import PPC.Instr
-import PPC.Ppr
-
-#else
-#error "AsmCodeGen: unknown architecture"
-
-#endif
+import qualified PPC.CodeGen
+import qualified PPC.Regs
+import qualified PPC.RegInfo
+import qualified PPC.Instr
+import qualified PPC.Ppr
 
 import RegAlloc.Liveness
-import qualified RegAlloc.Linear.Main		as Linear
+import qualified RegAlloc.Linear.Main           as Linear
 
-import qualified GraphColor			as Color
-import qualified RegAlloc.Graph.Main		as Color
-import qualified RegAlloc.Graph.Stats		as Color
-import qualified RegAlloc.Graph.TrivColorable	as Color
+import qualified GraphColor                     as Color
+import qualified RegAlloc.Graph.Main            as Color
+import qualified RegAlloc.Graph.Stats           as Color
+import qualified RegAlloc.Graph.TrivColorable   as Color
 
 import TargetReg
 import Platform
+import Config
 import Instruction
 import PIC
 import Reg
 import NCGMonad
 
 import BlockId
-import CgUtils		( fixStgRegisters )
-import OldCmm
-import CmmOpt		( cmmMiniInline, cmmMachOpFold )
-import OldPprCmm
+import CgUtils          ( fixStgRegisters )
+import Cmm
+import CmmUtils
+import Hoopl
+import CmmOpt           ( cmmMachOpFold )
+import PprCmm
 import CLabel
 
 import UniqFM
-import Unique		( Unique, getUnique )
 import UniqSupply
 import DynFlags
-import StaticFlags
 import Util
-import Config
 
+import BasicTypes       ( Alignment )
 import Digraph
 import qualified Pretty
 import BufWrite
@@ -84,15 +71,18 @@ import FastString
 import UniqSet
 import ErrUtils
 import Module
+import Stream (Stream)
+import qualified Stream
 
 -- DEBUGGING ONLY
 --import OrdList
 
 import Data.List
 import Data.Maybe
+import Control.Exception
+import Control.Applicative (Applicative(..))
 import Control.Monad
 import System.IO
-import Distribution.System
 
 {-
 The native-code generator has machine-independent and
@@ -127,7 +117,7 @@ The machine-dependent bits break down as follows:
     machine instructions.
 
   * ["PprMach"] 'pprInstr' turns an 'Instr' into text (well, really
-    a 'Doc').
+    a 'SDoc').
 
   * ["RegAllocInfo"] In the register allocator, we manipulate
     'MRegsState's, which are 'BitSet's, one bit per machine register.
@@ -145,348 +135,508 @@ The machine-dependent bits break down as follows:
 -- -----------------------------------------------------------------------------
 -- Top-level of the native codegen
 
---------------------
-nativeCodeGen :: DynFlags -> Handle -> UniqSupply -> [RawCmm] -> IO ()
-nativeCodeGen dflags h us cmms
- = do
-	let split_cmms	= concat $ map add_split cmms
+data NcgImpl statics instr jumpDest = NcgImpl {
+    cmmTopCodeGen             :: RawCmmDecl -> NatM [NatCmmDecl statics instr],
+    generateJumpTableForInstr :: instr -> Maybe (NatCmmDecl statics instr),
+    getJumpDestBlockId        :: jumpDest -> Maybe BlockId,
+    canShortcut               :: instr -> Maybe jumpDest,
+    shortcutStatics           :: (BlockId -> Maybe jumpDest) -> statics -> statics,
+    shortcutJump              :: (BlockId -> Maybe jumpDest) -> instr -> instr,
+    pprNatCmmDecl             :: NatCmmDecl statics instr -> SDoc,
+    maxSpillSlots             :: Int,
+    allocatableRegs           :: [RealReg],
+    ncg_x86fp_kludge          :: [NatCmmDecl statics instr] -> [NatCmmDecl statics instr],
+    ncgExpandTop              :: [NatCmmDecl statics instr] -> [NatCmmDecl statics instr],
+    ncgAllocMoreStack         :: Int -> NatCmmDecl statics instr -> UniqSM (NatCmmDecl statics instr),
+    ncgMakeFarBranches        :: BlockEnv CmmStatics -> [NatBasicBlock instr] -> [NatBasicBlock instr]
+    }
 
+--------------------
+nativeCodeGen :: DynFlags -> Module -> Handle -> UniqSupply
+              -> Stream IO RawCmmGroup ()
+              -> IO UniqSupply
+nativeCodeGen dflags this_mod h us cmms
+ = let platform = targetPlatform dflags
+       nCG' :: (Outputable statics, Outputable instr, Instruction instr)
+            => NcgImpl statics instr jumpDest -> IO UniqSupply
+       nCG' ncgImpl = nativeCodeGen' dflags this_mod ncgImpl h us cmms
+   in case platformArch platform of
+      ArchX86     -> nCG' (x86NcgImpl    dflags)
+      ArchX86_64  -> nCG' (x86_64NcgImpl dflags)
+      ArchPPC     -> nCG' (ppcNcgImpl    dflags)
+      ArchSPARC   -> nCG' (sparcNcgImpl  dflags)
+      ArchARM {}  -> panic "nativeCodeGen: No NCG for ARM"
+      ArchPPC_64  -> panic "nativeCodeGen: No NCG for PPC 64"
+      ArchAlpha   -> panic "nativeCodeGen: No NCG for Alpha"
+      ArchMipseb  -> panic "nativeCodeGen: No NCG for mipseb"
+      ArchMipsel  -> panic "nativeCodeGen: No NCG for mipsel"
+      ArchUnknown -> panic "nativeCodeGen: No NCG for unknown arch"
+      ArchJavaScript -> panic "nativeCodeGen: No NCG for JavaScript"
+
+x86NcgImpl :: DynFlags -> NcgImpl (Alignment, CmmStatics) X86.Instr.Instr X86.Instr.JumpDest
+x86NcgImpl dflags
+ = (x86_64NcgImpl dflags) { ncg_x86fp_kludge = map x86fp_kludge }
+
+x86_64NcgImpl :: DynFlags -> NcgImpl (Alignment, CmmStatics) X86.Instr.Instr X86.Instr.JumpDest
+x86_64NcgImpl dflags
+ = NcgImpl {
+        cmmTopCodeGen             = X86.CodeGen.cmmTopCodeGen
+       ,generateJumpTableForInstr = X86.CodeGen.generateJumpTableForInstr dflags
+       ,getJumpDestBlockId        = X86.Instr.getJumpDestBlockId
+       ,canShortcut               = X86.Instr.canShortcut
+       ,shortcutStatics           = X86.Instr.shortcutStatics
+       ,shortcutJump              = X86.Instr.shortcutJump
+       ,pprNatCmmDecl             = X86.Ppr.pprNatCmmDecl
+       ,maxSpillSlots             = X86.Instr.maxSpillSlots dflags
+       ,allocatableRegs           = X86.Regs.allocatableRegs platform
+       ,ncg_x86fp_kludge          = id
+       ,ncgAllocMoreStack         = X86.Instr.allocMoreStack platform
+       ,ncgExpandTop              = id
+       ,ncgMakeFarBranches        = const id
+   }
+    where platform = targetPlatform dflags
+
+ppcNcgImpl :: DynFlags -> NcgImpl CmmStatics PPC.Instr.Instr PPC.RegInfo.JumpDest
+ppcNcgImpl dflags
+ = NcgImpl {
+        cmmTopCodeGen             = PPC.CodeGen.cmmTopCodeGen
+       ,generateJumpTableForInstr = PPC.CodeGen.generateJumpTableForInstr dflags
+       ,getJumpDestBlockId        = PPC.RegInfo.getJumpDestBlockId
+       ,canShortcut               = PPC.RegInfo.canShortcut
+       ,shortcutStatics           = PPC.RegInfo.shortcutStatics
+       ,shortcutJump              = PPC.RegInfo.shortcutJump
+       ,pprNatCmmDecl             = PPC.Ppr.pprNatCmmDecl
+       ,maxSpillSlots             = PPC.Instr.maxSpillSlots dflags
+       ,allocatableRegs           = PPC.Regs.allocatableRegs platform
+       ,ncg_x86fp_kludge          = id
+       ,ncgAllocMoreStack         = PPC.Instr.allocMoreStack platform
+       ,ncgExpandTop              = id
+       ,ncgMakeFarBranches        = PPC.Instr.makeFarBranches
+   }
+    where platform = targetPlatform dflags
+
+sparcNcgImpl :: DynFlags -> NcgImpl CmmStatics SPARC.Instr.Instr SPARC.ShortcutJump.JumpDest
+sparcNcgImpl dflags
+ = NcgImpl {
+        cmmTopCodeGen             = SPARC.CodeGen.cmmTopCodeGen
+       ,generateJumpTableForInstr = SPARC.CodeGen.generateJumpTableForInstr dflags
+       ,getJumpDestBlockId        = SPARC.ShortcutJump.getJumpDestBlockId
+       ,canShortcut               = SPARC.ShortcutJump.canShortcut
+       ,shortcutStatics           = SPARC.ShortcutJump.shortcutStatics
+       ,shortcutJump              = SPARC.ShortcutJump.shortcutJump
+       ,pprNatCmmDecl             = SPARC.Ppr.pprNatCmmDecl
+       ,maxSpillSlots             = SPARC.Instr.maxSpillSlots dflags
+       ,allocatableRegs           = SPARC.Regs.allocatableRegs
+       ,ncg_x86fp_kludge          = id
+       ,ncgAllocMoreStack         = noAllocMoreStack
+       ,ncgExpandTop              = map SPARC.CodeGen.Expand.expandTop
+       ,ncgMakeFarBranches        = const id
+   }
+
+--
+-- Allocating more stack space for spilling is currently only
+-- supported for the linear register allocator on x86/x86_64, the rest
+-- default to the panic below.  To support allocating extra stack on
+-- more platforms provide a definition of ncgAllocMoreStack.
+--
+noAllocMoreStack :: Int -> NatCmmDecl statics instr -> UniqSM (NatCmmDecl statics instr)
+noAllocMoreStack amount _
+  = panic $   "Register allocator: out of stack slots (need " ++ show amount ++ ")\n"
+        ++  "   If you are trying to compile SHA1.hs from the crypto library then this\n"
+        ++  "   is a known limitation in the linear allocator.\n"
+        ++  "\n"
+        ++  "   Try enabling the graph colouring allocator with -fregs-graph instead."
+        ++  "   You can still file a bug report if you like.\n"
+
+
+type NativeGenAcc statics instr
+        = ([[CLabel]],
+           [([NatCmmDecl statics instr],
+             Maybe [Color.RegAllocStats statics instr],
+             Maybe [Linear.RegAllocStats])])
+
+nativeCodeGen' :: (Outputable statics, Outputable instr, Instruction instr)
+               => DynFlags
+               -> Module
+               -> NcgImpl statics instr jumpDest
+               -> Handle
+               -> UniqSupply
+               -> Stream IO RawCmmGroup ()
+               -> IO UniqSupply
+nativeCodeGen' dflags this_mod ncgImpl h us cmms
+ = do
+        let split_cmms  = Stream.map add_split cmms
         -- BufHandle is a performance hack.  We could hide it inside
         -- Pretty if it weren't for the fact that we do lots of little
         -- printDocs here (in order to do codegen in constant space).
         bufh <- newBufHandle h
- 	(imports, prof) <- cmmNativeGens dflags bufh us split_cmms [] [] 0
+        (ngs, us') <- cmmNativeGenStream dflags this_mod ncgImpl bufh us split_cmms ([], [])
+        finishNativeGen dflags ncgImpl bufh ngs
+
+        return us'
+
+ where  add_split tops
+                | gopt Opt_SplitObjs dflags = split_marker : tops
+                | otherwise                 = tops
+
+        split_marker = CmmProc mapEmpty mkSplitMarkerLabel []
+                               (ofBlockList (panic "split_marker_entry") [])
+
+
+finishNativeGen :: Instruction instr
+                => DynFlags
+                -> NcgImpl statics instr jumpDest
+                -> BufHandle
+                -> NativeGenAcc statics instr
+                -> IO ()
+finishNativeGen dflags ncgImpl bufh@(BufHandle _ _ h) (imports, prof)
+ = do
         bFlush bufh
 
-	let (native, colorStats, linearStats)
-		= unzip3 prof
+        let platform = targetPlatform dflags
+        let (native, colorStats, linearStats)
+                = unzip3 prof
 
-	-- dump native code
-	dumpIfSet_dyn dflags
-		Opt_D_dump_asm "Asm code"
-		(vcat $ map (docToSDoc . pprNatCmmTop) $ concat native)
+        -- dump native code
+        dumpIfSet_dyn dflags
+                Opt_D_dump_asm "Asm code"
+                (vcat $ map (pprNatCmmDecl ncgImpl) $ concat native)
 
-	-- dump global NCG stats for graph coloring allocator
-	(case concat $ catMaybes colorStats of
-	  []	-> return ()
-	  stats	-> do	
-	   	-- build the global register conflict graph
-		let graphGlobal	
-			= foldl Color.union Color.initGraph
-			$ [ Color.raGraph stat
-				| stat@Color.RegAllocStatsStart{} <- stats]
-	   
-	   	dumpSDoc dflags Opt_D_dump_asm_stats "NCG stats"
-			$ Color.pprStats stats graphGlobal
+        -- dump global NCG stats for graph coloring allocator
+        (case concat $ catMaybes colorStats of
+          []    -> return ()
+          stats -> do
+                -- build the global register conflict graph
+                let graphGlobal
+                        = foldl Color.union Color.initGraph
+                        $ [ Color.raGraph stat
+                                | stat@Color.RegAllocStatsStart{} <- stats]
 
-		dumpIfSet_dyn dflags
-			Opt_D_dump_asm_conflicts "Register conflict graph"
-			$ Color.dotGraph 
-				targetRegDotColor 
-				(Color.trivColorable 
-					targetVirtualRegSqueeze 
-					targetRealRegSqueeze)
-			$ graphGlobal)
+                dumpSDoc dflags Opt_D_dump_asm_stats "NCG stats"
+                        $ Color.pprStats stats graphGlobal
+
+                dumpIfSet_dyn dflags
+                        Opt_D_dump_asm_conflicts "Register conflict graph"
+                        $ Color.dotGraph
+                                (targetRegDotColor platform)
+                                (Color.trivColorable platform
+                                        (targetVirtualRegSqueeze platform)
+                                        (targetRealRegSqueeze platform))
+                        $ graphGlobal)
 
 
-	-- dump global NCG stats for linear allocator
-	(case concat $ catMaybes linearStats of
-		[]	-> return ()
-		stats	-> dumpSDoc dflags Opt_D_dump_asm_stats "NCG stats"
-				$ Linear.pprStats (concat native) stats)
+        -- dump global NCG stats for linear allocator
+        (case concat $ catMaybes linearStats of
+                []      -> return ()
+                stats   -> dumpSDoc dflags Opt_D_dump_asm_stats "NCG stats"
+                                $ Linear.pprStats (concat native) stats)
 
-	-- write out the imports
-	Pretty.printDoc Pretty.LeftMode h
-		$ makeImportsDoc dflags (concat imports)
+        -- write out the imports
+        Pretty.printDoc Pretty.LeftMode (pprCols dflags) h
+                $ withPprStyleDoc dflags (mkCodeStyle AsmStyle)
+                $ makeImportsDoc dflags (concat imports)
 
-	return	()
+cmmNativeGenStream :: (Outputable statics, Outputable instr, Instruction instr)
+              => DynFlags
+              -> Module
+              -> NcgImpl statics instr jumpDest
+              -> BufHandle
+              -> UniqSupply
+              -> Stream IO RawCmmGroup ()
+              -> NativeGenAcc statics instr
+              -> IO (NativeGenAcc statics instr, UniqSupply)
 
- where	add_split (Cmm tops)
-		| dopt Opt_SplitObjs dflags = split_marker : tops
-		| otherwise		    = tops
-
-	split_marker = CmmProc [] mkSplitMarkerLabel (ListGraph [])
-
+cmmNativeGenStream dflags this_mod ncgImpl h us cmm_stream ngs@(impAcc, profAcc)
+ = do r <- Stream.runStream cmm_stream
+      case r of
+          Left () ->
+              return ((reverse impAcc, reverse profAcc) , us)
+          Right (cmms, cmm_stream') -> do
+              (ngs',us') <- cmmNativeGens dflags this_mod ncgImpl h us cmms ngs 0
+              cmmNativeGenStream dflags this_mod ncgImpl h us' cmm_stream' ngs'
 
 -- | Do native code generation on all these cmms.
 --
-cmmNativeGens :: DynFlags
+cmmNativeGens :: (Outputable statics, Outputable instr, Instruction instr)
+              => DynFlags
+              -> Module
+              -> NcgImpl statics instr jumpDest
               -> BufHandle
               -> UniqSupply
-              -> [RawCmmTop]
-              -> [[CLabel]]
-              -> [ ([NatCmmTop Instr],
-                   Maybe [Color.RegAllocStats Instr],
-                   Maybe [Linear.RegAllocStats]) ]
+              -> [RawCmmDecl]
+              -> NativeGenAcc statics instr
               -> Int
-              -> IO ( [[CLabel]],
-                      [([NatCmmTop Instr],
-                      Maybe [Color.RegAllocStats Instr],
-                      Maybe [Linear.RegAllocStats])] )
+              -> IO (NativeGenAcc statics instr, UniqSupply)
 
-cmmNativeGens _ _ _ [] impAcc profAcc _
-	= return (reverse impAcc, reverse profAcc)
+cmmNativeGens _ _ _ _ us [] ngs _
+        = return (ngs, us)
 
-cmmNativeGens dflags h us (cmm : cmms) impAcc profAcc count
+cmmNativeGens dflags this_mod ncgImpl h us (cmm : cmms) (impAcc, profAcc) count
  = do
- 	(us', native, imports, colorStats, linearStats)
-		<- cmmNativeGen dflags us cmm count
+        (us', native, imports, colorStats, linearStats)
+                <- {-# SCC "cmmNativeGen" #-} cmmNativeGen dflags this_mod ncgImpl us cmm count
 
-	Pretty.bufLeftRender h
-		$ {-# SCC "pprNativeCode" #-} Pretty.vcat $ map pprNatCmmTop native
+        {-# SCC "pprNativeCode" #-} Pretty.bufLeftRender h
+                $ withPprStyleDoc dflags (mkCodeStyle AsmStyle)
+                $ vcat $ map (pprNatCmmDecl ncgImpl) native
 
-           -- carefully evaluate this strictly.  Binding it with 'let'
-           -- and then using 'seq' doesn't work, because the let
-           -- apparently gets inlined first.
-	lsPprNative <- return $!
-		if  dopt Opt_D_dump_asm       dflags
-	         || dopt Opt_D_dump_asm_stats dflags
-			then native
-			else []
+        let !lsPprNative =
+                if  dopt Opt_D_dump_asm       dflags
+                 || dopt Opt_D_dump_asm_stats dflags
+                        then native
+                        else []
 
-	count' <- return $! count + 1;
+        let !count' = count + 1
 
-	-- force evaulation all this stuff to avoid space leaks
-	seqString (showSDoc $ vcat $ map ppr imports) `seq` return ()
+        -- force evaluation all this stuff to avoid space leaks
+        {-# SCC "seqString" #-} evaluate $ seqString (showSDoc dflags $ vcat $ map ppr imports)
 
-	cmmNativeGens dflags h us' cmms
-			(imports : impAcc)
-			((lsPprNative, colorStats, linearStats) : profAcc)
-			count'
+        cmmNativeGens dflags this_mod ncgImpl h
+            us' cmms ((imports : impAcc),
+                      ((lsPprNative, colorStats, linearStats) : profAcc))
+                     count'
 
- where	seqString []		= ()
-	seqString (x:xs)	= x `seq` seqString xs `seq` ()
+ where  seqString []            = ()
+        seqString (x:xs)        = x `seq` seqString xs
 
 
 -- | Complete native code generation phase for a single top-level chunk of Cmm.
---	Dumping the output of each stage along the way.
---	Global conflict graph and NGC stats
-cmmNativeGen 
-	:: DynFlags
-	-> UniqSupply
-	-> RawCmmTop					-- ^ the cmm to generate code for
-	-> Int						-- ^ sequence number of this top thing
-	-> IO	( UniqSupply
-		, [NatCmmTop Instr]			-- native code
-		, [CLabel]				-- things imported by this cmm
-		, Maybe [Color.RegAllocStats Instr]	-- stats for the coloring register allocator
-		, Maybe [Linear.RegAllocStats])		-- stats for the linear register allocators
+--      Dumping the output of each stage along the way.
+--      Global conflict graph and NGC stats
+cmmNativeGen
+        :: (Outputable statics, Outputable instr, Instruction instr)
+    => DynFlags
+    -> Module
+    -> NcgImpl statics instr jumpDest
+        -> UniqSupply
+        -> RawCmmDecl                                   -- ^ the cmm to generate code for
+        -> Int                                          -- ^ sequence number of this top thing
+        -> IO   ( UniqSupply
+                , [NatCmmDecl statics instr]                -- native code
+                , [CLabel]                                  -- things imported by this cmm
+                , Maybe [Color.RegAllocStats statics instr] -- stats for the coloring register allocator
+                , Maybe [Linear.RegAllocStats])             -- stats for the linear register allocators
 
-cmmNativeGen dflags us cmm count
+cmmNativeGen dflags this_mod ncgImpl us cmm count
  = do
+        let platform = targetPlatform dflags
 
-	-- rewrite assignments to global regs
- 	let fixed_cmm =
-		{-# SCC "fixStgRegisters" #-}
-		fixStgRegisters cmm
+        -- rewrite assignments to global regs
+        let fixed_cmm =
+                {-# SCC "fixStgRegisters" #-}
+                fixStgRegisters dflags cmm
 
-	-- cmm to cmm optimisations
-	let (opt_cmm, imports) =
-		{-# SCC "cmmToCmm" #-}
-		cmmToCmm dflags fixed_cmm
+        -- cmm to cmm optimisations
+        let (opt_cmm, imports) =
+                {-# SCC "cmmToCmm" #-}
+                cmmToCmm dflags this_mod fixed_cmm
 
-	dumpIfSet_dyn dflags
-		Opt_D_dump_opt_cmm "Optimised Cmm"
-		(pprCmm $ Cmm [opt_cmm])
+        dumpIfSet_dyn dflags
+                Opt_D_dump_opt_cmm "Optimised Cmm"
+                (pprCmmGroup [opt_cmm])
 
-	-- generate native code from cmm
-	let ((native, lastMinuteImports), usGen) =
-		{-# SCC "genMachCode" #-}
-		initUs us $ genMachCode dflags opt_cmm
+        -- generate native code from cmm
+        let ((native, lastMinuteImports), usGen) =
+                {-# SCC "genMachCode" #-}
+                initUs us $ genMachCode dflags this_mod (cmmTopCodeGen ncgImpl) opt_cmm
 
-	dumpIfSet_dyn dflags
-		Opt_D_dump_asm_native "Native code"
-		(vcat $ map (docToSDoc . pprNatCmmTop) native)
+        dumpIfSet_dyn dflags
+                Opt_D_dump_asm_native "Native code"
+                (vcat $ map (pprNatCmmDecl ncgImpl) native)
 
-	-- tag instructions with register liveness information
-	let (withLiveness, usLive) =
-		{-# SCC "regLiveness" #-}
-		initUs usGen 
-			$ mapUs regLiveness 
-			$ map natCmmTopToLive native
+        -- tag instructions with register liveness information
+        let (withLiveness, usLive) =
+                {-# SCC "regLiveness" #-}
+                initUs usGen
+                        $ mapM (regLiveness platform)
+                        $ map natCmmTopToLive native
 
-	dumpIfSet_dyn dflags
-		Opt_D_dump_asm_liveness "Liveness annotations added"
-		(vcat $ map ppr withLiveness)
-		
-	-- allocate registers
-	(alloced, usAlloc, ppr_raStatsColor, ppr_raStatsLinear) <-
-	 if ( dopt Opt_RegsGraph dflags
-	   || dopt Opt_RegsIterative dflags)
-	  then do
-	  	-- the regs usable for allocation
-		let (alloc_regs :: UniqFM (UniqSet RealReg))
-			= foldr (\r -> plusUFM_C unionUniqSets
-					$ unitUFM (targetClassOfRealReg r) (unitUniqSet r))
-				emptyUFM
-			$ allocatableRegs
+        dumpIfSet_dyn dflags
+                Opt_D_dump_asm_liveness "Liveness annotations added"
+                (vcat $ map ppr withLiveness)
 
-		-- do the graph coloring register allocation
-		let ((alloced, regAllocStats), usAlloc)
-			= {-# SCC "RegAlloc" #-}
-			  initUs usLive
-			  $ Color.regAlloc
-				dflags
-				alloc_regs
-				(mkUniqSet [0..maxSpillSlots])
-				withLiveness
+        -- allocate registers
+        (alloced, usAlloc, ppr_raStatsColor, ppr_raStatsLinear) <-
+         if False
+           -- Disabled, see #7679, #8657
+           --  ( gopt Opt_RegsGraph dflags
+           --  || gopt Opt_RegsIterative dflags)
+          then do
+                -- the regs usable for allocation
+                let (alloc_regs :: UniqFM (UniqSet RealReg))
+                        = foldr (\r -> plusUFM_C unionUniqSets
+                                        $ unitUFM (targetClassOfRealReg platform r) (unitUniqSet r))
+                                emptyUFM
+                        $ allocatableRegs ncgImpl
 
-		-- dump out what happened during register allocation
-		dumpIfSet_dyn dflags
-			Opt_D_dump_asm_regalloc "Registers allocated"
-			(vcat $ map (docToSDoc . pprNatCmmTop) alloced)
+                -- do the graph coloring register allocation
+                let ((alloced, regAllocStats), usAlloc)
+                        = {-# SCC "RegAlloc" #-}
+                          initUs usLive
+                          $ Color.regAlloc
+                                dflags
+                                alloc_regs
+                                (mkUniqSet [0 .. maxSpillSlots ncgImpl])
+                                withLiveness
 
-		dumpIfSet_dyn dflags
-			Opt_D_dump_asm_regalloc_stages "Build/spill stages"
-			(vcat 	$ map (\(stage, stats)
-					-> text "# --------------------------"
-					$$ text "#  cmm " <> int count <> text " Stage " <> int stage
-					$$ ppr stats)
-				$ zip [0..] regAllocStats)
+                -- dump out what happened during register allocation
+                dumpIfSet_dyn dflags
+                        Opt_D_dump_asm_regalloc "Registers allocated"
+                        (vcat $ map (pprNatCmmDecl ncgImpl) alloced)
 
-		let mPprStats =
-			if dopt Opt_D_dump_asm_stats dflags
-			 then Just regAllocStats else Nothing
+                dumpIfSet_dyn dflags
+                        Opt_D_dump_asm_regalloc_stages "Build/spill stages"
+                        (vcat   $ map (\(stage, stats)
+                                        -> text "# --------------------------"
+                                        $$ text "#  cmm " <> int count <> text " Stage " <> int stage
+                                        $$ ppr stats)
+                                $ zip [0..] regAllocStats)
 
-		-- force evaluation of the Maybe to avoid space leak
-		mPprStats `seq` return ()
+                let mPprStats =
+                        if dopt Opt_D_dump_asm_stats dflags
+                         then Just regAllocStats else Nothing
 
-		return	( alloced, usAlloc
-			, mPprStats
-			, Nothing)
+                -- force evaluation of the Maybe to avoid space leak
+                mPprStats `seq` return ()
 
-	  else do
-	  	-- do linear register allocation
-		let ((alloced, regAllocStats), usAlloc) 
-			= {-# SCC "RegAlloc" #-}
-  			  initUs usLive
- 			  $ liftM unzip
-			  $ mapUs Linear.regAlloc withLiveness
+                return  ( alloced, usAlloc
+                        , mPprStats
+                        , Nothing)
 
-		dumpIfSet_dyn dflags
-			Opt_D_dump_asm_regalloc "Registers allocated"
-			(vcat $ map (docToSDoc . pprNatCmmTop) alloced)
+          else do
+                -- do linear register allocation
+                let reg_alloc proc = do
+                       (alloced, maybe_more_stack, ra_stats) <-
+                               Linear.regAlloc dflags proc
+                       case maybe_more_stack of
+                         Nothing -> return ( alloced, ra_stats )
+                         Just amount -> do
+                           alloced' <- ncgAllocMoreStack ncgImpl amount alloced
+                           return (alloced', ra_stats )
 
-		let mPprStats =
-			if dopt Opt_D_dump_asm_stats dflags
-			 then Just (catMaybes regAllocStats) else Nothing
+                let ((alloced, regAllocStats), usAlloc)
+                        = {-# SCC "RegAlloc" #-}
+                          initUs usLive
+                          $ liftM unzip
+                          $ mapM reg_alloc withLiveness
 
-		-- force evaluation of the Maybe to avoid space leak
-		mPprStats `seq` return ()
+                dumpIfSet_dyn dflags
+                        Opt_D_dump_asm_regalloc "Registers allocated"
+                        (vcat $ map (pprNatCmmDecl ncgImpl) alloced)
 
-		return	( alloced, usAlloc
-			, Nothing
-			, mPprStats)
+                let mPprStats =
+                        if dopt Opt_D_dump_asm_stats dflags
+                         then Just (catMaybes regAllocStats) else Nothing
 
-	---- generate jump tables
-	let tabled	=
-		{-# SCC "generateJumpTables" #-}
-		alloced ++ generateJumpTables alloced
+                -- force evaluation of the Maybe to avoid space leak
+                mPprStats `seq` return ()
 
-	---- shortcut branches
-	let shorted	=
-	 	{-# SCC "shortcutBranches" #-}
-	 	shortcutBranches dflags tabled
+                return  ( alloced, usAlloc
+                        , Nothing
+                        , mPprStats)
 
-	---- sequence blocks
-	let sequenced	=
-	 	{-# SCC "sequenceBlocks" #-}
-	 	map sequenceTop shorted
+        ---- x86fp_kludge.  This pass inserts ffree instructions to clear
+        ---- the FPU stack on x86.  The x86 ABI requires that the FPU stack
+        ---- is clear, and library functions can return odd results if it
+        ---- isn't.
+        ----
+        ---- NB. must happen before shortcutBranches, because that
+        ---- generates JXX_GBLs which we can't fix up in x86fp_kludge.
+        let kludged = {-# SCC "x86fp_kludge" #-} ncg_x86fp_kludge ncgImpl alloced
 
-	---- x86fp_kludge
-	let kludged =
-#if i386_TARGET_ARCH
-	 	{-# SCC "x86fp_kludge" #-}
-	 	map x86fp_kludge sequenced
-#else
-		sequenced
-#endif
+        ---- generate jump tables
+        let tabled      =
+                {-# SCC "generateJumpTables" #-}
+                generateJumpTables ncgImpl kludged
 
-	---- expansion of SPARC synthetic instrs
-#if sparc_TARGET_ARCH
-	let expanded = 
-		{-# SCC "sparc_expand" #-}
-		map expandTop kludged
+        ---- shortcut branches
+        let shorted     =
+                {-# SCC "shortcutBranches" #-}
+                shortcutBranches dflags ncgImpl tabled
 
-	dumpIfSet_dyn dflags
-		Opt_D_dump_asm_expanded "Synthetic instructions expanded"
-		(vcat $ map (docToSDoc . pprNatCmmTop) expanded)
-#else
-	let expanded = 
-		kludged
-#endif
+        ---- sequence blocks
+        let sequenced   =
+                {-# SCC "sequenceBlocks" #-}
+                map (sequenceTop ncgImpl) shorted
 
-	return 	( usAlloc
-		, expanded
-		, lastMinuteImports ++ imports
-		, ppr_raStatsColor
-		, ppr_raStatsLinear)
+        ---- expansion of SPARC synthetic instrs
+        let expanded =
+                {-# SCC "sparc_expand" #-}
+                ncgExpandTop ncgImpl sequenced
+
+        dumpIfSet_dyn dflags
+                Opt_D_dump_asm_expanded "Synthetic instructions expanded"
+                (vcat $ map (pprNatCmmDecl ncgImpl) expanded)
+
+        return  ( usAlloc
+                , expanded
+                , lastMinuteImports ++ imports
+                , ppr_raStatsColor
+                , ppr_raStatsLinear)
 
 
-#if i386_TARGET_ARCH
-x86fp_kludge :: NatCmmTop Instr -> NatCmmTop Instr
+x86fp_kludge :: NatCmmDecl (Alignment, CmmStatics) X86.Instr.Instr -> NatCmmDecl (Alignment, CmmStatics) X86.Instr.Instr
 x86fp_kludge top@(CmmData _ _) = top
-x86fp_kludge (CmmProc info lbl (ListGraph code)) = 
-	CmmProc info lbl (ListGraph $ i386_insert_ffrees code)
-#endif
+x86fp_kludge (CmmProc info lbl live (ListGraph code)) =
+        CmmProc info lbl live (ListGraph $ X86.Instr.i386_insert_ffrees code)
 
 
 -- | Build a doc for all the imports.
 --
-makeImportsDoc :: DynFlags -> [CLabel] -> Pretty.Doc
+makeImportsDoc :: DynFlags -> [CLabel] -> SDoc
 makeImportsDoc dflags imports
  = dyld_stubs imports
-
-#if HAVE_SUBSECTIONS_VIA_SYMBOLS
-                -- On recent versions of Darwin, the linker supports
-                -- dead-stripping of code and data on a per-symbol basis.
-                -- There's a hack to make this work in PprMach.pprNatCmmTop.
-            Pretty.$$ Pretty.text ".subsections_via_symbols"
-#endif
-#if HAVE_GNU_NONEXEC_STACK
+            $$
+            -- On recent versions of Darwin, the linker supports
+            -- dead-stripping of code and data on a per-symbol basis.
+            -- There's a hack to make this work in PprMach.pprNatCmmDecl.
+            (if platformHasSubsectionsViaSymbols platform
+             then text ".subsections_via_symbols"
+             else empty)
+            $$
                 -- On recent GNU ELF systems one can mark an object file
                 -- as not requiring an executable stack. If all objects
                 -- linked into a program have this note then the program
                 -- will not use an executable stack, which is good for
                 -- security. GHC generated code does not need an executable
                 -- stack so add the note in:
-            Pretty.$$ Pretty.text ".section .note.GNU-stack,\"\",@progbits"
-#endif
-#if !defined(darwin_TARGET_OS)
+            (if platformHasGnuNonexecStack platform
+             then text ".section .note.GNU-stack,\"\",@progbits"
+             else empty)
+            $$
                 -- And just because every other compiler does, lets stick in
-		-- an identifier directive: .ident "GHC x.y.z"
-	    Pretty.$$ let compilerIdent = Pretty.text "GHC" Pretty.<+>
-	                                  Pretty.text cProjectVersion
-                       in Pretty.text ".ident" Pretty.<+>
-                          Pretty.doubleQuotes compilerIdent
-#endif
+                -- an identifier directive: .ident "GHC x.y.z"
+            (if platformHasIdentDirective platform
+             then let compilerIdent = text "GHC" <+> text cProjectVersion
+                   in text ".ident" <+> doubleQuotes compilerIdent
+             else empty)
 
  where
-	-- Generate "symbol stubs" for all external symbols that might
-	-- come from a dynamic library.
-	dyld_stubs :: [CLabel] -> Pretty.Doc
-{-      dyld_stubs imps = Pretty.vcat $ map pprDyldSymbolStub $
-				    map head $ group $ sort imps-}
+        platform = targetPlatform dflags
+        arch = platformArch platform
+        os   = platformOS   platform
 
-	arch	= platformArch	$ targetPlatform dflags
-	os	= platformOS	$ targetPlatform dflags
-	
-	-- (Hack) sometimes two Labels pretty-print the same, but have
-	-- different uniques; so we compare their text versions...
-	dyld_stubs imps
-		| needImportedSymbols arch os
-		= Pretty.vcat $
-			(pprGotDeclaration arch os :) $
-			map ( pprImportedSymbol arch os . fst . head) $
-			groupBy (\(_,a) (_,b) -> a == b) $
-			sortBy (\(_,a) (_,b) -> compare a b) $
-			map doPpr $
-			imps
-		| otherwise
-		= Pretty.empty
+        -- Generate "symbol stubs" for all external symbols that might
+        -- come from a dynamic library.
+        dyld_stubs :: [CLabel] -> SDoc
+{-      dyld_stubs imps = vcat $ map pprDyldSymbolStub $
+                                    map head $ group $ sort imps-}
+        -- (Hack) sometimes two Labels pretty-print the same, but have
+        -- different uniques; so we compare their text versions...
+        dyld_stubs imps
+                | needImportedSymbols dflags arch os
+                = vcat $
+                        (pprGotDeclaration dflags arch os :) $
+                        map ( pprImportedSymbol dflags platform . fst . head) $
+                        groupBy (\(_,a) (_,b) -> a == b) $
+                        sortBy (\(_,a) (_,b) -> compare a b) $
+                        map doPpr $
+                        imps
+                | otherwise
+                = empty
 
-	doPpr lbl = (lbl, Pretty.render $ pprCLabel lbl astyle)
-	astyle = mkCodeStyle AsmStyle
+        doPpr lbl = (lbl, renderWithStyle dflags (pprCLabel platform lbl) astyle)
+        astyle = mkCodeStyle AsmStyle
 
 
 -- -----------------------------------------------------------------------------
@@ -498,13 +648,13 @@ makeImportsDoc dflags imports
 -- such that as many of the local jumps as possible turn into
 -- fallthroughs.
 
-sequenceTop 
-	:: NatCmmTop Instr
-	-> NatCmmTop Instr
+sequenceTop
+        :: Instruction instr
+    => NcgImpl statics instr jumpDest -> NatCmmDecl statics instr -> NatCmmDecl statics instr
 
-sequenceTop top@(CmmData _ _) = top
-sequenceTop (CmmProc info lbl (ListGraph blocks)) = 
-  CmmProc info lbl (ListGraph $ makeFarBranches $ sequenceBlocks blocks)
+sequenceTop _       top@(CmmData _ _) = top
+sequenceTop ncgImpl (CmmProc info lbl live (ListGraph blocks)) =
+  CmmProc info lbl live (ListGraph $ ncgMakeFarBranches ncgImpl info $ sequenceBlocks info blocks)
 
 -- The algorithm is very simple (and stupid): we make a graph out of
 -- the blocks where there is an edge from one block to another iff the
@@ -516,54 +666,57 @@ sequenceTop (CmmProc info lbl (ListGraph blocks)) =
 -- FYI, the classic layout for basic blocks uses postorder DFS; this
 -- algorithm is implemented in Hoopl.
 
-sequenceBlocks 
-	:: Instruction instr
-	=> [NatBasicBlock instr] 
-	-> [NatBasicBlock instr]
+sequenceBlocks
+        :: Instruction instr
+        => BlockEnv i
+        -> [NatBasicBlock instr]
+        -> [NatBasicBlock instr]
 
-sequenceBlocks [] = []
-sequenceBlocks (entry:blocks) = 
-  seqBlocks (mkNode entry : reverse (flattenSCCs (sccBlocks blocks)))
+sequenceBlocks _ [] = []
+sequenceBlocks infos (entry:blocks) =
+  seqBlocks infos (mkNode entry : reverse (flattenSCCs (sccBlocks blocks)))
   -- the first block is the entry point ==> it must remain at the start.
 
 
-sccBlocks 
-	:: Instruction instr
-	=> [NatBasicBlock instr] 
-	-> [SCC ( NatBasicBlock instr
-		, Unique
-		, [Unique])]
+sccBlocks
+        :: Instruction instr
+        => [NatBasicBlock instr]
+        -> [SCC ( NatBasicBlock instr
+                , BlockId
+                , [BlockId])]
 
 sccBlocks blocks = stronglyConnCompFromEdgedVerticesR (map mkNode blocks)
 
 -- we're only interested in the last instruction of
 -- the block, and only if it has a single destination.
-getOutEdges 
-	:: Instruction instr
-	=> [instr] -> [Unique]
+getOutEdges
+        :: Instruction instr
+        => [instr] -> [BlockId]
 
-getOutEdges instrs 
-	= case jumpDestsOfInstr (last instrs) of
-		[one] -> [getUnique one]
-		_many -> []
+getOutEdges instrs
+        = case jumpDestsOfInstr (last instrs) of
+                [one] -> [one]
+                _many -> []
 
 mkNode :: (Instruction t)
        => GenBasicBlock t
-       -> (GenBasicBlock t, Unique, [Unique])
-mkNode block@(BasicBlock id instrs) = (block, getUnique id, getOutEdges instrs)
+       -> (GenBasicBlock t, BlockId, [BlockId])
+mkNode block@(BasicBlock id instrs) = (block, id, getOutEdges instrs)
 
-seqBlocks :: (Eq t) => [(GenBasicBlock t1, t, [t])] -> [GenBasicBlock t1]
-seqBlocks [] = []
-seqBlocks ((block,_,[]) : rest)
-  = block : seqBlocks rest
-seqBlocks ((block@(BasicBlock id instrs),_,[next]) : rest)
-  | can_fallthrough = BasicBlock id (init instrs) : seqBlocks rest'
-  | otherwise       = block : seqBlocks rest'
+seqBlocks :: BlockEnv i -> [(GenBasicBlock t1, BlockId, [BlockId])]
+                        -> [GenBasicBlock t1]
+seqBlocks _ [] = []
+seqBlocks infos ((block,_,[]) : rest)
+  = block : seqBlocks infos rest
+seqBlocks infos ((block@(BasicBlock id instrs),_,[next]) : rest)
+  | can_fallthrough = BasicBlock id (init instrs) : seqBlocks infos rest'
+  | otherwise       = block : seqBlocks infos rest'
   where
-	(can_fallthrough, rest') = reorder next [] rest
-	  -- TODO: we should do a better job for cycles; try to maximise the
-	  -- fallthroughs within a loop.
-seqBlocks _ = panic "AsmCodegen:seqBlocks"
+        can_fallthrough = not (mapMember next infos) && can_reorder
+        (can_reorder, rest') = reorder next [] rest
+          -- TODO: we should do a better job for cycles; try to maximise the
+          -- fallthroughs within a loop.
+seqBlocks _ _ = panic "AsmCodegen:seqBlocks"
 
 reorder :: (Eq a) => a -> [(t, a, t1)] -> [(t, a, t1)] -> (Bool, [(t, a, t1)])
 reorder  _ accum [] = (False, reverse accum)
@@ -573,80 +726,42 @@ reorder id accum (b@(block,id',out) : rest)
 
 
 -- -----------------------------------------------------------------------------
--- Making far branches
-
--- Conditional branches on PowerPC are limited to +-32KB; if our Procs get too
--- big, we have to work around this limitation.
-
-makeFarBranches 
-	:: [NatBasicBlock Instr] 
-	-> [NatBasicBlock Instr]
-
-#if powerpc_TARGET_ARCH
-makeFarBranches blocks
-    | last blockAddresses < nearLimit = blocks
-    | otherwise = zipWith handleBlock blockAddresses blocks
-    where
-        blockAddresses = scanl (+) 0 $ map blockLen blocks
-        blockLen (BasicBlock _ instrs) = length instrs
-        
-        handleBlock addr (BasicBlock id instrs)
-                = BasicBlock id (zipWith makeFar [addr..] instrs)
-        
-        makeFar _ (BCC ALWAYS tgt) = BCC ALWAYS tgt
-        makeFar addr (BCC cond tgt)
-            | abs (addr - targetAddr) >= nearLimit
-            = BCCFAR cond tgt
-            | otherwise
-            = BCC cond tgt
-            where Just targetAddr = lookupUFM blockAddressMap tgt
-        makeFar _ other            = other
-        
-        nearLimit = 7000 -- 8192 instructions are allowed; let's keep some
-                         -- distance, as we have a few pseudo-insns that are
-                         -- pretty-printed as multiple instructions,
-                         -- and it's just not worth the effort to calculate
-                         -- things exactly
-        
-        blockAddressMap = listToUFM $ zip (map blockId blocks) blockAddresses
-#else
-makeFarBranches = id
-#endif
-
--- -----------------------------------------------------------------------------
 -- Generate jump tables
 
 -- Analyzes all native code and generates data sections for all jump
 -- table instructions.
 generateJumpTables
-	:: [NatCmmTop Instr] -> [NatCmmTop Instr]
-generateJumpTables xs = concatMap f xs
-    where f (CmmProc _ _ (ListGraph xs)) = concatMap g xs
-          f _ = []
-          g (BasicBlock _ xs) = catMaybes (map generateJumpTableForInstr xs)
+        :: NcgImpl statics instr jumpDest
+        -> [NatCmmDecl statics instr] -> [NatCmmDecl statics instr]
+generateJumpTables ncgImpl xs = concatMap f xs
+    where f p@(CmmProc _ _ _ (ListGraph xs)) = p : concatMap g xs
+          f p = [p]
+          g (BasicBlock _ xs) = catMaybes (map (generateJumpTableForInstr ncgImpl) xs)
 
 -- -----------------------------------------------------------------------------
 -- Shortcut branches
 
-shortcutBranches 
-	:: DynFlags 
-	-> [NatCmmTop Instr] 
-	-> [NatCmmTop Instr]
+shortcutBranches
+        :: DynFlags
+    -> NcgImpl statics instr jumpDest
+        -> [NatCmmDecl statics instr]
+        -> [NatCmmDecl statics instr]
 
-shortcutBranches dflags tops
+shortcutBranches dflags ncgImpl tops
   | optLevel dflags < 1 = tops    -- only with -O or higher
-  | otherwise           = map (apply_mapping mapping) tops'
+  | otherwise           = map (apply_mapping ncgImpl mapping) tops'
   where
-    (tops', mappings) = mapAndUnzip build_mapping tops
+    (tops', mappings) = mapAndUnzip (build_mapping ncgImpl) tops
     mapping = foldr plusUFM emptyUFM mappings
 
-build_mapping :: GenCmmTop d t (ListGraph Instr)
-              -> (GenCmmTop d t (ListGraph Instr), UniqFM JumpDest)
-build_mapping top@(CmmData _ _) = (top, emptyUFM)
-build_mapping (CmmProc info lbl (ListGraph []))
-  = (CmmProc info lbl (ListGraph []), emptyUFM)
-build_mapping (CmmProc info lbl (ListGraph (head:blocks)))
-  = (CmmProc info lbl (ListGraph (head:others)), mapping)
+build_mapping :: NcgImpl statics instr jumpDest
+              -> GenCmmDecl d (BlockEnv t) (ListGraph instr)
+              -> (GenCmmDecl d (BlockEnv t) (ListGraph instr), UniqFM jumpDest)
+build_mapping _ top@(CmmData _ _) = (top, emptyUFM)
+build_mapping _ (CmmProc info lbl live (ListGraph []))
+  = (CmmProc info lbl live (ListGraph []), emptyUFM)
+build_mapping ncgImpl (CmmProc info lbl live (ListGraph (head:blocks)))
+  = (CmmProc info lbl live (ListGraph (head:others)), mapping)
         -- drop the shorted blocks, but don't ever drop the first one,
         -- because it is pointed to by a global label.
   where
@@ -655,31 +770,35 @@ build_mapping (CmmProc info lbl (ListGraph (head:blocks)))
     -- Don't completely eliminate loops here -- that can leave a dangling jump!
     (_, shortcut_blocks, others) = foldl split (emptyBlockSet, [], []) blocks
     split (s, shortcut_blocks, others) b@(BasicBlock id [insn])
-        | Just (DestBlockId dest) <- canShortcut insn,
+        | Just jd <- canShortcut ncgImpl insn,
+          Just dest <- getJumpDestBlockId ncgImpl jd,
+          not (has_info id),
           (setMember dest s) || dest == id -- loop checks
         = (s, shortcut_blocks, b : others)
     split (s, shortcut_blocks, others) (BasicBlock id [insn])
-        | Just dest <- canShortcut insn
+        | Just dest <- canShortcut ncgImpl insn,
+          not (has_info id)
         = (setInsert id s, (id,dest) : shortcut_blocks, others)
     split (s, shortcut_blocks, others) other = (s, shortcut_blocks, other : others)
 
+    -- do not eliminate blocks that have an info table
+    has_info l = mapMember l info
 
     -- build a mapping from BlockId to JumpDest for shorting branches
     mapping = foldl add emptyUFM shortcut_blocks
     add ufm (id,dest) = addToUFM ufm id dest
-    
-apply_mapping :: UniqFM JumpDest
-              -> GenCmmTop CmmStatic h (ListGraph Instr)
-              -> GenCmmTop CmmStatic h (ListGraph Instr)
-apply_mapping ufm (CmmData sec statics) 
-  = CmmData sec (map (shortcutStatic (lookupUFM ufm)) statics)
-  -- we need to get the jump tables, so apply the mapping to the entries
-  -- of a CmmData too.
-apply_mapping ufm (CmmProc info lbl (ListGraph blocks))
-  = CmmProc info lbl (ListGraph $ map short_bb blocks)
+
+apply_mapping :: NcgImpl statics instr jumpDest
+              -> UniqFM jumpDest
+              -> GenCmmDecl statics h (ListGraph instr)
+              -> GenCmmDecl statics h (ListGraph instr)
+apply_mapping ncgImpl ufm (CmmData sec statics)
+  = CmmData sec (shortcutStatics ncgImpl (lookupUFM ufm) statics)
+apply_mapping ncgImpl ufm (CmmProc info lbl live (ListGraph blocks))
+  = CmmProc info lbl live (ListGraph $ map short_bb blocks)
   where
     short_bb (BasicBlock id insns) = BasicBlock id $! map short_insn insns
-    short_insn i = shortcutJump (lookupUFM ufm) i
+    short_insn i = shortcutJump ncgImpl (lookupUFM ufm) i
                  -- shortcutJump should apply the mapping repeatedly,
                  -- just in case we can short multiple branches.
 
@@ -703,20 +822,22 @@ apply_mapping ufm (CmmProc info lbl (ListGraph blocks))
 -- Switching between the two monads whilst carrying along the same
 -- Unique supply breaks abstraction.  Is that bad?
 
-genMachCode 
-	:: DynFlags 
-	-> RawCmmTop 
-	-> UniqSM 
-		( [NatCmmTop Instr]
-		, [CLabel])
+genMachCode
+        :: DynFlags
+        -> Module
+        -> (RawCmmDecl -> NatM [NatCmmDecl statics instr])
+        -> RawCmmDecl
+        -> UniqSM
+                ( [NatCmmDecl statics instr]
+                , [CLabel])
 
-genMachCode dflags cmm_top
-  = do	{ initial_us <- getUs
-	; let initial_st           = mkNatM_State initial_us 0 dflags
-	      (new_tops, final_st) = initNat initial_st (cmmTopCodeGen dflags cmm_top)
-	      final_delta          = natm_delta final_st
-	      final_imports        = natm_imports final_st
-	; if   final_delta == 0
+genMachCode dflags this_mod cmmTopCodeGen cmm_top
+  = do  { initial_us <- getUs
+        ; let initial_st           = mkNatM_State initial_us 0 dflags this_mod
+              (new_tops, final_st) = initNat initial_st (cmmTopCodeGen cmm_top)
+              final_delta          = natm_delta final_st
+              final_imports        = natm_imports final_st
+        ; if   final_delta == 0
           then return (new_tops, final_imports)
           else pprPanic "genMachCode: nonzero final delta" (int final_delta)
     }
@@ -728,141 +849,188 @@ genMachCode dflags cmm_top
 Here we do:
 
   (a) Constant folding
-  (b) Simple inlining: a temporary which is assigned to and then
-      used, once, can be shorted.
   (c) Position independent code and dynamic linking
         (i)  introduce the appropriate indirections
              and position independent refs
         (ii) compile a list of imported symbols
+  (d) Some arch-specific optimizations
 
-Ideas for other things we could do (ToDo):
+(a) will be moving to the new Hoopl pipeline, however, (c) and
+(d) are only needed by the native backend and will continue to live
+here.
+
+Ideas for other things we could do (put these in Hoopl please!):
 
   - shortcut jumps-to-jumps
-  - eliminate dead code blocks
   - simple CSE: if an expr is assigned to a temp, then replace later occs of
     that expr with the temp, until the expr is no longer valid (can push through
     temp assignments, and certain assigns to mem...)
 -}
 
-cmmToCmm :: DynFlags -> RawCmmTop -> (RawCmmTop, [CLabel])
-cmmToCmm _ top@(CmmData _ _) = (top, [])
-cmmToCmm dflags (CmmProc info lbl (ListGraph blocks)) = runCmmOpt dflags $ do
-  blocks' <- mapM cmmBlockConFold (cmmMiniInline blocks)
-  return $ CmmProc info lbl (ListGraph blocks')
+cmmToCmm :: DynFlags -> Module -> RawCmmDecl -> (RawCmmDecl, [CLabel])
+cmmToCmm _ _ top@(CmmData _ _) = (top, [])
+cmmToCmm dflags this_mod (CmmProc info lbl live graph)
+    = runCmmOpt dflags this_mod $
+      do blocks' <- mapM cmmBlockConFold (toBlockList graph)
+         return $ CmmProc info lbl live (ofBlockList (g_entry graph) blocks')
 
-newtype CmmOptM a = CmmOptM (([CLabel], DynFlags) -> (# a, [CLabel] #))
+newtype CmmOptM a = CmmOptM (DynFlags -> Module -> [CLabel] -> (# a, [CLabel] #))
+
+instance Functor CmmOptM where
+    fmap = liftM
+
+instance Applicative CmmOptM where
+    pure = return
+    (<*>) = ap
 
 instance Monad CmmOptM where
-  return x = CmmOptM $ \(imports, _) -> (# x,imports #)
+  return x = CmmOptM $ \_ _ imports -> (# x, imports #)
   (CmmOptM f) >>= g =
-    CmmOptM $ \(imports, dflags) ->
-                case f (imports, dflags) of
+    CmmOptM $ \dflags this_mod imports ->
+                case f dflags this_mod imports of
                   (# x, imports' #) ->
                     case g x of
-                      CmmOptM g' -> g' (imports', dflags)
+                      CmmOptM g' -> g' dflags this_mod imports'
+
+instance CmmMakeDynamicReferenceM CmmOptM where
+    addImport = addImportCmmOpt
+    getThisModule = CmmOptM $ \_ this_mod imports -> (# this_mod, imports #)
 
 addImportCmmOpt :: CLabel -> CmmOptM ()
-addImportCmmOpt lbl = CmmOptM $ \(imports, _dflags) -> (# (), lbl:imports #)
+addImportCmmOpt lbl = CmmOptM $ \_ _ imports -> (# (), lbl:imports #)
 
-getDynFlagsCmmOpt :: CmmOptM DynFlags
-getDynFlagsCmmOpt = CmmOptM $ \(imports, dflags) -> (# dflags, imports #)
+instance HasDynFlags CmmOptM where
+    getDynFlags = CmmOptM $ \dflags _ imports -> (# dflags, imports #)
 
-runCmmOpt :: DynFlags -> CmmOptM a -> (a, [CLabel])
-runCmmOpt dflags (CmmOptM f) = case f ([], dflags) of
+runCmmOpt :: DynFlags -> Module -> CmmOptM a -> (a, [CLabel])
+runCmmOpt dflags this_mod (CmmOptM f) = case f dflags this_mod [] of
                         (# result, imports #) -> (result, imports)
 
-cmmBlockConFold :: CmmBasicBlock -> CmmOptM CmmBasicBlock
-cmmBlockConFold (BasicBlock id stmts) = do
+cmmBlockConFold :: CmmBlock -> CmmOptM CmmBlock
+cmmBlockConFold block = do
+  let (entry, middle, last) = blockSplit block
+      stmts = blockToList middle
   stmts' <- mapM cmmStmtConFold stmts
-  return $ BasicBlock id stmts'
+  last' <- cmmStmtConFold last
+  return $ blockJoin entry (blockFromList stmts') last'
 
-cmmStmtConFold :: CmmStmt -> CmmOptM CmmStmt
+-- This does three optimizations, but they're very quick to check, so we don't
+-- bother turning them off even when the Hoopl code is active.  Since
+-- this is on the old Cmm representation, we can't reuse the code either:
+--  * reg = reg      --> nop
+--  * if 0 then jump --> nop
+--  * if 1 then jump --> jump
+-- We might be tempted to skip this step entirely of not Opt_PIC, but
+-- there is some PowerPC code for the non-PIC case, which would also
+-- have to be separated.
+cmmStmtConFold :: CmmNode e x -> CmmOptM (CmmNode e x)
 cmmStmtConFold stmt
    = case stmt of
         CmmAssign reg src
            -> do src' <- cmmExprConFold DataReference src
                  return $ case src' of
-		   CmmReg reg' | reg == reg' -> CmmNop
-		   new_src -> CmmAssign reg new_src
+                   CmmReg reg' | reg == reg' -> CmmComment (fsLit "nop")
+                   new_src -> CmmAssign reg new_src
 
         CmmStore addr src
            -> do addr' <- cmmExprConFold DataReference addr
                  src'  <- cmmExprConFold DataReference src
                  return $ CmmStore addr' src'
 
-        CmmJump addr regs
+        CmmCall { cml_target = addr }
            -> do addr' <- cmmExprConFold JumpReference addr
-                 return $ CmmJump addr' regs
+                 return $ stmt { cml_target = addr' }
 
-	CmmCall target regs args srt returns
-	   -> do target' <- case target of
-			      CmmCallee e conv -> do
-			        e' <- cmmExprConFold CallReference e
-			        return $ CmmCallee e' conv
-			      other -> return other
-                 args' <- mapM (\(CmmHinted arg hint) -> do
-                                  arg' <- cmmExprConFold DataReference arg
-                                  return (CmmHinted arg' hint)) args
-	         return $ CmmCall target' regs args' srt returns
+        CmmUnsafeForeignCall target regs args
+           -> do target' <- case target of
+                              ForeignTarget e conv -> do
+                                e' <- cmmExprConFold CallReference e
+                                return $ ForeignTarget e' conv
+                              PrimTarget _ ->
+                                return target
+                 args' <- mapM (cmmExprConFold DataReference) args
+                 return $ CmmUnsafeForeignCall target' regs args'
 
-        CmmCondBranch test dest
+        CmmCondBranch test true false
            -> do test' <- cmmExprConFold DataReference test
-	         return $ case test' of
-		   CmmLit (CmmInt 0 _) -> 
-		     CmmComment (mkFastString ("deleted: " ++ 
-					showSDoc (pprStmt stmt)))
+                 return $ case test' of
+                   CmmLit (CmmInt 0 _) -> CmmBranch false
+                   CmmLit (CmmInt _ _) -> CmmBranch true
+                   _other -> CmmCondBranch test' true false
 
-		   CmmLit (CmmInt _ _) -> CmmBranch dest
-		   _other -> CmmCondBranch test' dest
-
-	CmmSwitch expr ids
-	   -> do expr' <- cmmExprConFold DataReference expr
-	         return $ CmmSwitch expr' ids
+        CmmSwitch expr ids
+           -> do expr' <- cmmExprConFold DataReference expr
+                 return $ CmmSwitch expr' ids
 
         other
            -> return other
 
-
 cmmExprConFold :: ReferenceKind -> CmmExpr -> CmmOptM CmmExpr
-cmmExprConFold referenceKind expr
-   = case expr of
+cmmExprConFold referenceKind expr = do
+    dflags <- getDynFlags
+
+    -- With -O1 and greater, the cmmSink pass does constant-folding, so
+    -- we don't need to do it again here.
+    let expr' = if optLevel dflags >= 1
+                    then expr
+                    else cmmExprCon dflags expr
+
+    cmmExprNative referenceKind expr'
+
+cmmExprCon :: DynFlags -> CmmExpr -> CmmExpr
+cmmExprCon dflags (CmmLoad addr rep) = CmmLoad (cmmExprCon dflags addr) rep
+cmmExprCon dflags (CmmMachOp mop args)
+    = cmmMachOpFold dflags mop (map (cmmExprCon dflags) args)
+cmmExprCon _ other = other
+
+-- handles both PIC and non-PIC cases... a very strange mixture
+-- of things to do.
+cmmExprNative :: ReferenceKind -> CmmExpr -> CmmOptM CmmExpr
+cmmExprNative referenceKind expr = do
+     dflags <- getDynFlags
+     let platform = targetPlatform dflags
+         arch = platformArch platform
+     case expr of
         CmmLoad addr rep
-           -> do addr' <- cmmExprConFold DataReference addr
+           -> do addr' <- cmmExprNative DataReference addr
                  return $ CmmLoad addr' rep
 
         CmmMachOp mop args
-           -- For MachOps, we first optimize the children, and then we try 
-           -- our hand at some constant-folding.
-           -> do args' <- mapM (cmmExprConFold DataReference) args
-                 return $ cmmMachOpFold mop args'
+           -> do args' <- mapM (cmmExprNative DataReference) args
+                 return $ CmmMachOp mop args'
+
+        CmmLit (CmmBlock id)
+           -> cmmExprNative referenceKind (CmmLit (CmmLabel (infoTblLbl id)))
+           -- we must convert block Ids to CLabels here, because we
+           -- might have to do the PIC transformation.  Hence we must
+           -- not modify BlockIds beyond this point.
 
         CmmLit (CmmLabel lbl)
            -> do
-		dflags <- getDynFlagsCmmOpt
-		cmmMakeDynamicReference dflags addImportCmmOpt referenceKind lbl
+                cmmMakeDynamicReference dflags referenceKind lbl
         CmmLit (CmmLabelOff lbl off)
            -> do
-		 dflags <- getDynFlagsCmmOpt
-		 dynRef <- cmmMakeDynamicReference dflags addImportCmmOpt referenceKind lbl
-                 return $ cmmMachOpFold (MO_Add wordWidth) [
+                 dynRef <- cmmMakeDynamicReference dflags referenceKind lbl
+                 -- need to optimize here, since it's late
+                 return $ cmmMachOpFold dflags (MO_Add (wordWidth dflags)) [
                      dynRef,
-                     (CmmLit $ CmmInt (fromIntegral off) wordWidth)
+                     (CmmLit $ CmmInt (fromIntegral off) (wordWidth dflags))
                    ]
 
         -- On powerpc (non-PIC), it's easier to jump directly to a label than
         -- to use the register table, so we replace these registers
         -- with the corresponding labels:
         CmmReg (CmmGlobal EagerBlackholeInfo)
-          | cTargetArch == PPC && not opt_PIC
-          -> cmmExprConFold referenceKind $
+          | arch == ArchPPC && not (gopt Opt_PIC dflags)
+          -> cmmExprNative referenceKind $
              CmmLit (CmmLabel (mkCmmCodeLabel rtsPackageId (fsLit "__stg_EAGER_BLACKHOLE_info")))
         CmmReg (CmmGlobal GCEnter1)
-          | cTargetArch == PPC && not opt_PIC
-          -> cmmExprConFold referenceKind $
-             CmmLit (CmmLabel (mkCmmCodeLabel rtsPackageId (fsLit "__stg_gc_enter_1"))) 
+          | arch == ArchPPC && not (gopt Opt_PIC dflags)
+          -> cmmExprNative referenceKind $
+             CmmLit (CmmLabel (mkCmmCodeLabel rtsPackageId (fsLit "__stg_gc_enter_1")))
         CmmReg (CmmGlobal GCFun)
-          | cTargetArch == PPC && not opt_PIC
-          -> cmmExprConFold referenceKind $
+          | arch == ArchPPC && not (gopt Opt_PIC dflags)
+          -> cmmExprNative referenceKind $
              CmmLit (CmmLabel (mkCmmCodeLabel rtsPackageId (fsLit "__stg_gc_fun")))
 
         other

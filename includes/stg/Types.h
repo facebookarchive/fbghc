@@ -8,7 +8,7 @@
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * NOTE: assumes #include "ghcconfig.h"
  * 
@@ -43,9 +43,6 @@
 
 /*
  * First, platform-dependent definitions of size-specific integers.
- * Assume for now that the int type is 32 bits.
- * NOTE: Synch the following definitions with MachDeps.h!
- * ToDo: move these into a platform-dependent file.
  */
 
 typedef signed   char            StgInt8;
@@ -54,12 +51,18 @@ typedef unsigned char            StgWord8;
 typedef signed   short           StgInt16;
 typedef unsigned short           StgWord16;
 
-#if SIZEOF_LONG == 4
-typedef signed   long            StgInt32;
-typedef unsigned long            StgWord32;
-#elif SIZEOF_INT == 4
+#if SIZEOF_INT == 4
 typedef signed   int             StgInt32;
 typedef unsigned int             StgWord32;
+#define FMT_Word32    "u"
+#define FMT_HexWord32 "x"
+#define FMT_Int32     "d"
+#elif SIZEOF_LONG == 4
+typedef signed   long            StgInt32;
+typedef unsigned long            StgWord32;
+#define FMT_Word32    "lu"
+#define FMT_HexWord32 "lx"
+#define FMT_Int32     "ld"
 #else
 #error GHC untested on this architecture: sizeof(int) != 4
 #endif
@@ -67,25 +70,28 @@ typedef unsigned int             StgWord32;
 #if SIZEOF_LONG == 8
 typedef signed   long          StgInt64;
 typedef unsigned long          StgWord64;
-#elif defined(__MSVC__)
-typedef __int64                StgInt64;
-typedef unsigned __int64       StgWord64;
+#define FMT_Word64    "lu"
+#define FMT_HexWord64 "lx"
+#define FMT_Int64     "ld"
 #elif SIZEOF_LONG_LONG == 8
 typedef signed long long int   StgInt64;
 typedef unsigned long long int StgWord64;
+#define FMT_Word64    "llu"
+#define FMT_HexWord64 "llx"
+#define FMT_Int64     "lld"
 #else
 #error cannot find a way to define StgInt64
 #endif
 
+typedef struct { StgWord64 h; StgWord64 l; } StgWord128;
+
+typedef struct { StgWord128 h; StgWord128 l; } StgWord256;
+
+typedef struct { StgWord256 h; StgWord256 l; } StgWord512;
+
 /*
  * Define the standard word size we'll use on this machine: make it
  * big enough to hold a pointer.
- *
- * It's useful if StgInt/StgWord are always the same as long, so that
- * we can use a consistent printf format specifier without warnings on
- * any platform.  Fortunately this works at the moement; if it breaks
- * in the future we'll have to start using macros for format
- * specifiers (c.f. FMT_StgWord64 in Rts.h).
  */
 
 #if SIZEOF_VOID_P == 8
@@ -93,12 +99,18 @@ typedef StgInt64           StgInt;
 typedef StgWord64          StgWord;
 typedef StgInt32           StgHalfInt;
 typedef StgWord32          StgHalfWord;
+#define FMT_Word     FMT_Word64
+#define FMT_HexWord  FMT_HexWord64
+#define FMT_Int      FMT_Int64
 #else
 #if SIZEOF_VOID_P == 4
 typedef StgInt32           StgInt; 
 typedef StgWord32          StgWord;
 typedef StgInt16           StgHalfInt;
 typedef StgWord16          StgHalfWord;
+#define FMT_Word     FMT_Word32
+#define FMT_HexWord  FMT_HexWord32
+#define FMT_Int      FMT_Int32
 #else
 #error GHC untested on this architecture: sizeof(void *) != 4 or 8
 #endif
@@ -123,10 +135,11 @@ typedef void*		   StgStablePtr;
 typedef StgWord8*          StgByteArray;
 
 /*
-  Types for the generated C functions
-  take no arguments
-  return a pointer to the next function to be called
-  use: Ptr to Fun that returns a Ptr to Fun which returns Ptr to void
+  Types for generated C functions when compiling via C.
+
+  The C functions take no arguments, and return a pointer to the next
+  function to be called use: Ptr to Fun that returns a Ptr to Fun
+  which returns Ptr to void
 
   Note: Neither StgFunPtr not StgFun is quite right (that is, 
   StgFunPtr != StgFun*).  So, the functions we define all have type

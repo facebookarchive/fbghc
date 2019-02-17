@@ -198,7 +198,10 @@ rts_apply (Capability *cap, HaskellObj f, HaskellObj arg)
     StgThunk *ap;
 
     ap = (StgThunk *)allocate(cap,sizeofW(StgThunk) + 2);
-    SET_HDR(ap, (StgInfoTable *)&stg_ap_2_upd_info, CCS_SYSTEM);
+    // Here we don't want to use CCS_SYSTEM, because it's a hidden cost centre,
+    // and evaluating Haskell code under a hidden cost centre leads to
+    // confusing profiling output. (#7753)
+    SET_HDR(ap, (StgInfoTable *)&stg_ap_2_upd_info, CCS_MAIN);
     ap->payload[0] = f;
     ap->payload[1] = arg;
     return (StgClosure *)ap;
@@ -380,7 +383,7 @@ INLINE_HEADER void pushClosure   (StgTSO *tso, StgWord c) {
 }
 
 StgTSO *
-createGenThread (Capability *cap, nat stack_size,  StgClosure *closure)
+createGenThread (Capability *cap, W_ stack_size,  StgClosure *closure)
 {
   StgTSO *t;
   t = createThread (cap, stack_size);
@@ -390,7 +393,7 @@ createGenThread (Capability *cap, nat stack_size,  StgClosure *closure)
 }
 
 StgTSO *
-createIOThread (Capability *cap, nat stack_size,  StgClosure *closure)
+createIOThread (Capability *cap, W_ stack_size,  StgClosure *closure)
 {
   StgTSO *t;
   t = createThread (cap, stack_size);
@@ -406,7 +409,7 @@ createIOThread (Capability *cap, nat stack_size,  StgClosure *closure)
  */
 
 StgTSO *
-createStrictIOThread(Capability *cap, nat stack_size,  StgClosure *closure)
+createStrictIOThread(Capability *cap, W_ stack_size,  StgClosure *closure)
 {
   StgTSO *t;
   t = createThread(cap, stack_size);
@@ -421,36 +424,39 @@ createStrictIOThread(Capability *cap, nat stack_size,  StgClosure *closure)
    Evaluating Haskell expressions
    ------------------------------------------------------------------------- */
 
-Capability *
-rts_eval (Capability *cap, HaskellObj p, /*out*/HaskellObj *ret)
+void rts_eval (/* inout */ Capability **cap,
+               /* in    */ HaskellObj p,
+               /* out */   HaskellObj *ret)
 {
     StgTSO *tso;
     
-    tso = createGenThread(cap, RtsFlags.GcFlags.initialStkSize, p);
-    return scheduleWaitThread(tso,ret,cap);
+    tso = createGenThread(*cap, RtsFlags.GcFlags.initialStkSize, p);
+    scheduleWaitThread(tso,ret,cap);
 }
 
-Capability *
-rts_eval_ (Capability *cap, HaskellObj p, unsigned int stack_size, 
-	   /*out*/HaskellObj *ret)
+void rts_eval_ (/* inout */ Capability **cap,
+                /* in    */ HaskellObj p,
+                /* in    */ unsigned int stack_size,
+                /* out   */ HaskellObj *ret)
 {
     StgTSO *tso;
 
-    tso = createGenThread(cap, stack_size, p);
-    return scheduleWaitThread(tso,ret,cap);
+    tso = createGenThread(*cap, stack_size, p);
+    scheduleWaitThread(tso,ret,cap);
 }
 
 /*
  * rts_evalIO() evaluates a value of the form (IO a), forcing the action's
  * result to WHNF before returning.
  */
-Capability *
-rts_evalIO (Capability *cap, HaskellObj p, /*out*/HaskellObj *ret)
+void rts_evalIO (/* inout */ Capability **cap,
+                 /* in    */ HaskellObj p,
+                 /* out */   HaskellObj *ret)
 {
     StgTSO* tso; 
     
-    tso = createStrictIOThread(cap, RtsFlags.GcFlags.initialStkSize, p);
-    return scheduleWaitThread(tso,ret,cap);
+    tso = createStrictIOThread(*cap, RtsFlags.GcFlags.initialStkSize, p);
+    scheduleWaitThread(tso,ret,cap);
 }
 
 /*
@@ -459,49 +465,50 @@ rts_evalIO (Capability *cap, HaskellObj p, /*out*/HaskellObj *ret)
  * action's result to WHNF before returning.  The result is returned
  * in a StablePtr.
  */
-Capability *
-rts_evalStableIO (Capability *cap, HsStablePtr s, /*out*/HsStablePtr *ret)
+void rts_evalStableIO (/* inout */ Capability **cap,
+                       /* in    */ HsStablePtr s,
+                       /* out */   HsStablePtr *ret)
 {
     StgTSO* tso;
     StgClosure *p, *r;
     SchedulerStatus stat;
-    
+
     p = (StgClosure *)deRefStablePtr(s);
-    tso = createStrictIOThread(cap, RtsFlags.GcFlags.initialStkSize, p);
+    tso = createStrictIOThread(*cap, RtsFlags.GcFlags.initialStkSize, p);
     // async exceptions are always blocked by default in the created
     // thread.  See #1048.
     tso->flags |= TSO_BLOCKEX | TSO_INTERRUPTIBLE;
-    cap = scheduleWaitThread(tso,&r,cap);
-    stat = rts_getSchedStatus(cap);
+    scheduleWaitThread(tso,&r,cap);
+    stat = rts_getSchedStatus(*cap);
 
     if (stat == Success && ret != NULL) {
 	ASSERT(r != NULL);
 	*ret = getStablePtr((StgPtr)r);
     }
-
-    return cap;
 }
 
 /*
  * Like rts_evalIO(), but doesn't force the action's result.
  */
-Capability *
-rts_evalLazyIO (Capability *cap, HaskellObj p, /*out*/HaskellObj *ret)
+void rts_evalLazyIO (/* inout */ Capability **cap,
+                     /* in    */ HaskellObj p,
+                     /* out */   HaskellObj *ret)
 {
     StgTSO *tso;
 
-    tso = createIOThread(cap, RtsFlags.GcFlags.initialStkSize, p);
-    return scheduleWaitThread(tso,ret,cap);
+    tso = createIOThread(*cap, RtsFlags.GcFlags.initialStkSize, p);
+    scheduleWaitThread(tso,ret,cap);
 }
 
-Capability *
-rts_evalLazyIO_ (Capability *cap, HaskellObj p, unsigned int stack_size, 
-		 /*out*/HaskellObj *ret)
+void rts_evalLazyIO_ (/* inout */ Capability **cap,
+                      /* in    */ HaskellObj p,
+                      /* in    */ unsigned int stack_size,
+                      /* out   */ HaskellObj *ret)
 {
     StgTSO *tso;
 
-    tso = createIOThread(cap, stack_size, p);
-    return scheduleWaitThread(tso,ret,cap);
+    tso = createIOThread(*cap, stack_size, p);
+    scheduleWaitThread(tso,ret,cap);
 }
 
 /* Convenience function for decoding the returned status. */
@@ -518,7 +525,16 @@ rts_checkSchedStatus (char* site, Capability *cap)
 	stg_exit(EXIT_FAILURE);
     case Interrupted:
 	errorBelch("%s: interrupted", site);
-	stg_exit(EXIT_FAILURE);
+#ifdef THREADED_RTS
+        // The RTS is shutting down, and the process will probably
+        // soon exit.  We don't want to preempt the shutdown
+        // by exiting the whole process here, so we just terminate the
+        // current thread.  Don't forget to release the cap first though.
+        rts_unlock(cap);
+        shutdownThread();
+#else
+        stg_exit(EXIT_FAILURE);
+#endif
     default:
 	errorBelch("%s: Return code (%d) not ok",(site),(rc));	
 	stg_exit(EXIT_FAILURE);
@@ -549,6 +565,14 @@ rts_lock (void)
 
     cap = NULL;
     waitForReturnCapability(&cap, task);
+
+    if (task->incall->prev_stack == NULL) {
+      // This is a new outermost call from C into Haskell land.
+      // Until the corresponding call to rts_unlock, this task
+      // is doing work on behalf of the RTS.
+      traceTaskCreate(task, cap);
+    }
+
     return (Capability *)cap;
 }
 
@@ -582,4 +606,17 @@ rts_unlock (Capability *cap)
     // Finally, we can release the Task to the free list.
     boundTaskExiting(task);
     RELEASE_LOCK(&cap->lock);
+
+    if (task->incall == NULL) {
+      // This is the end of an outermost call from C into Haskell land.
+      // From here on, the task goes back to C land and we should not count
+      // it as doing work on behalf of the RTS.
+      traceTaskDelete(task);
+    }
 }
+
+void rts_done (void)
+{
+    freeMyTask();
+}
+

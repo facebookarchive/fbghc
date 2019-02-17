@@ -1,13 +1,13 @@
 /* ----------------------------------------------------------------------------
  *
- * (c) The GHC Team, 2005-2009
+ * (c) The GHC Team, 2005-2011
  *
  * Macros for multi-CPU support
  *
  * Do not #include this file directly: #include "Rts.h" instead.
  *
  * To understand the structure of the RTS headers, see the wiki:
- *   http://hackage.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
+ *   http://ghc.haskell.org/trac/ghc/wiki/Commentary/SourceTree/Includes
  *
  * -------------------------------------------------------------------------- */
 
@@ -15,6 +15,11 @@
 #define SMP_H
 
 #if defined(THREADED_RTS)
+
+#if arm_HOST_ARCH && defined(arm_HOST_ARCH_PRE_ARMv6)
+void arm_atomic_spin_lock(void);
+void arm_atomic_spin_unlock(void);
+#endif
 
 /* ----------------------------------------------------------------------------
    Atomic operations
@@ -47,13 +52,14 @@ EXTERN_INLINE StgWord xchg(StgPtr p, StgWord w);
 EXTERN_INLINE StgWord cas(StgVolatilePtr p, StgWord o, StgWord n);
 
 /*
- * Atomic increment
+ * Atomic addition by the provided quantity
  *
- * atomic_inc(p) {
- *   return ++(*p);
+ * atomic_inc(p, n) {
+ *   return ((*p) += n);
  * }
  */
-EXTERN_INLINE StgWord atomic_inc(StgVolatilePtr p);
+EXTERN_INLINE StgWord atomic_inc(StgVolatilePtr p, StgWord n);
+
 
 /*
  * Atomic decrement
@@ -83,7 +89,7 @@ EXTERN_INLINE void busy_wait_nop(void);
  * http://gee.cs.oswego.edu/dl/jmm/cookbook.html
  *
  * To check whether you got these right, try the test in 
- *   testsuite/tests/ghc-regress/rts/testwsdeque.c
+ *   testsuite/tests/rts/testwsdeque.c
  * This tests the work-stealing deque implementation, which relies on
  * properly working store_load and load_load memory barriers.
  */ 
@@ -125,6 +131,29 @@ xchg(StgPtr p, StgWord w)
 	: "+r" (result), "+m" (*p)
 	: /* no input-only operands */
       );
+#elif arm_HOST_ARCH && defined(arm_HOST_ARCH_PRE_ARMv6)
+    __asm__ __volatile__ ("swp %0, %1, [%2]"
+                         : "=&r" (result)
+                         : "r" (w), "r" (p) : "memory");
+#elif arm_HOST_ARCH && !defined(arm_HOST_ARCH_PRE_ARMv6)
+    // swp instruction which is used in pre-ARMv6 code above
+    // is deprecated in AMRv6 and later. ARM, Ltd. *highly* recommends
+    // to use ldrex/strex instruction pair for the same purpose
+    // see chapter: Synchronization and semaphores in ARM Architecture
+    // Reference manual
+    StgWord tmp;
+    __asm__ __volatile__ (
+                          "1:    ldrex  %0, [%3]\n"
+                          "      strex  %1, %2, [%3]\n"
+                          "      teq    %1, #1\n"
+                          "      beq    1b\n"
+#if !defined(arm_HOST_ARCH_PRE_ARMv7)
+                          "      dmb\n"
+#endif
+                          : "=&r" (result), "=&r" (tmp)
+                          : "r" (w), "r" (p)
+                          : "memory"
+                          );
 #elif !defined(WITHSMP)
     result = *p;
     *p = w;
@@ -144,7 +173,7 @@ cas(StgVolatilePtr p, StgWord o, StgWord n)
 #if i386_HOST_ARCH || x86_64_HOST_ARCH
     __asm__ __volatile__ (
  	  "lock\ncmpxchg %3,%1"
-          :"=a"(o), "=m" (*(volatile unsigned int *)p) 
+          :"=a"(o), "+m" (*(volatile unsigned int *)p)
           :"0" (o), "r" (n));
     return o;
 #elif powerpc_HOST_ARCH
@@ -169,6 +198,33 @@ cas(StgVolatilePtr p, StgWord o, StgWord n)
 	: "memory"
     );
     return n;
+#elif arm_HOST_ARCH && defined(arm_HOST_ARCH_PRE_ARMv6)
+    StgWord r;
+    arm_atomic_spin_lock();
+    r  = *p; 
+    if (r == o) { *p = n; } 
+    arm_atomic_spin_unlock();
+    return r;
+#elif arm_HOST_ARCH && !defined(arm_HOST_ARCH_PRE_ARMv6)
+    StgWord result,tmp;
+
+    __asm__ __volatile__(
+        "1:     ldrex   %1, [%2]\n"
+        "       mov     %0, #0\n"
+        "       teq     %1, %3\n"
+        "       it      eq\n"
+        "       strexeq %0, %4, [%2]\n"
+        "       teq     %0, #1\n"
+        "       it      eq\n"
+        "       beq     1b\n"
+#if !defined(arm_HOST_ARCH_PRE_ARMv7)
+        "       dmb\n"
+#endif
+                : "=&r"(tmp), "=&r"(result)
+                : "r"(p), "r"(o), "r"(n)
+                : "cc","memory");
+
+    return result;
 #elif !defined(WITHSMP)
     StgWord result;
     result = *p;
@@ -181,22 +237,24 @@ cas(StgVolatilePtr p, StgWord o, StgWord n)
 #endif
 }
 
+// RRN: Generalized to arbitrary increments to enable fetch-and-add in
+// Haskell code (fetchAddIntArray#).
 EXTERN_INLINE StgWord
-atomic_inc(StgVolatilePtr p)
+atomic_inc(StgVolatilePtr p, StgWord incr)
 {
 #if defined(i386_HOST_ARCH) || defined(x86_64_HOST_ARCH)
     StgWord r;
-    r = 1;
+    r = incr;
     __asm__ __volatile__ (
         "lock\nxadd %0,%1":
             "+r" (r), "+m" (*p):
     );
-    return r+1;
+    return r + incr;
 #else
     StgWord old, new;
     do {
         old = *p;
-        new = old + 1;
+        new = old + incr;
     } while (cas(p, old, new) != old);
     return new;
 #endif
@@ -251,6 +309,10 @@ write_barrier(void) {
 #elif sparc_HOST_ARCH
     /* Sparc in TSO mode does not require store/store barriers. */
     __asm__ __volatile__ ("" : : : "memory");
+#elif arm_HOST_ARCH && defined(arm_HOST_ARCH_PRE_ARMv7)
+    __asm__ __volatile__ ("" : : : "memory");
+#elif arm_HOST_ARCH && !defined(arm_HOST_ARCH_PRE_ARMv7)
+    __asm__ __volatile__ ("dmb  st" : : : "memory");
 #elif !defined(WITHSMP)
     return;
 #else
@@ -268,6 +330,8 @@ store_load_barrier(void) {
     __asm__ __volatile__ ("sync" : : : "memory");
 #elif sparc_HOST_ARCH
     __asm__ __volatile__ ("membar #StoreLoad" : : : "memory");
+#elif arm_HOST_ARCH && !defined(arm_HOST_ARCH_PRE_ARMv7)
+    __asm__ __volatile__ ("dmb" : : : "memory");
 #elif !defined(WITHSMP)
     return;
 #else
@@ -286,6 +350,8 @@ load_load_barrier(void) {
 #elif sparc_HOST_ARCH
     /* Sparc in TSO mode does not require load/load barriers. */
     __asm__ __volatile__ ("" : : : "memory");
+#elif arm_HOST_ARCH && !defined(arm_HOST_ARCH_PRE_ARMv7)
+    __asm__ __volatile__ ("dmb" : : : "memory");
 #elif !defined(WITHSMP)
     return;
 #else
@@ -302,10 +368,14 @@ load_load_barrier(void) {
 /* ---------------------------------------------------------------------- */
 #else /* !THREADED_RTS */
 
-#define write_barrier()      /* nothing */
-#define store_load_barrier() /* nothing */
-#define load_load_barrier()  /* nothing */
+EXTERN_INLINE void write_barrier(void);
+EXTERN_INLINE void store_load_barrier(void);
+EXTERN_INLINE void load_load_barrier(void);
+EXTERN_INLINE void write_barrier     () {} /* nothing */
+EXTERN_INLINE void store_load_barrier() {} /* nothing */
+EXTERN_INLINE void load_load_barrier () {} /* nothing */
 
+#if !IN_STG_CODE || IN_STGCRUN
 INLINE_HEADER StgWord
 xchg(StgPtr p, StgWord w)
 {
@@ -326,17 +396,20 @@ cas(StgVolatilePtr p, StgWord o, StgWord n)
     return result;
 }
 
-INLINE_HEADER StgWord
-atomic_inc(StgVolatilePtr p)
+EXTERN_INLINE StgWord atomic_inc(StgVolatilePtr p, StgWord incr);
+EXTERN_INLINE StgWord
+atomic_inc(StgVolatilePtr p, StgWord incr)
 {
-    return ++(*p);
+    return ((*p) += incr);
 }
+
 
 INLINE_HEADER StgWord
 atomic_dec(StgVolatilePtr p)
 {
     return --(*p);
 }
+#endif
 
 #define VOLATILE_LOAD(p) ((StgWord)*((StgWord*)(p)))
 

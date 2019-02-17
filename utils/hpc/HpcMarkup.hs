@@ -13,6 +13,7 @@ import HpcFlags
 import HpcUtils
 
 import System.Directory
+import System.IO (localeEncoding)
 import Data.List
 import Data.Maybe(fromJust)
 import Data.Array
@@ -28,6 +29,7 @@ markup_options
         . includeOpt
         . srcDirOpt
         . hpcDirOpt
+        . resetHpcDirsOpt
         . funTotalsOpt
         . altHighlightOpt
         . destDirOpt
@@ -79,6 +81,8 @@ markup_main flags (prog:modNames) = do
 
         writeFileUsing (dest_dir ++ "/" ++ filename ++ ".html") $
             "<html>" ++
+            "<head>" ++
+            charEncodingTag ++
             "<style type=\"text/css\">" ++
             "table.bar { background-color: #f25913; }\n" ++
             "td.bar { background-color: #60de51;  }\n" ++
@@ -87,6 +91,8 @@ markup_main flags (prog:modNames) = do
             ".dashboard td { border: solid 1px black }\n" ++
             ".dashboard th { border: solid 1px black }\n" ++
             "</style>\n" ++
+            "</head>" ++
+            "<body>" ++
             "<table class=\"dashboard\" width=\"100%\" border=1>\n" ++
             "<tr>" ++
             "<th rowspan=2><a href=\"" ++ index_name ++ ".html\">module</a></th>" ++
@@ -110,7 +116,7 @@ markup_main flags (prog:modNames) = do
                                  [ modSummary
                                  | (_,_,modSummary) <- mods'
                                  ])
-                   ++ "</table></html>\n"
+                   ++ "</table></body></html>\n"
 
   writeSummary index_name  $ \ (n1,_,_) (n2,_,_) -> compare n1 n2
 
@@ -129,6 +135,11 @@ markup_main flags (prog:modNames) = do
 
 markup_main _ []
     = hpcError markup_plugin $ "no .tix file or executable name specified"
+
+charEncodingTag :: String
+charEncodingTag =
+    "<meta http-equiv=\"Content-Type\" " ++
+          "content=\"text/html; " ++ "charset=" ++ show localeEncoding ++ "\">"
 
 genHtmlFromMod
   :: String
@@ -206,7 +217,10 @@ genHtmlFromMod dest_dir flags tix theFunTotals invertOutput = do
   let fileName = modName0 ++ ".hs.html"
   putStrLn $ "Writing: " ++ fileName
   writeFileUsing (dest_dir ++ "/" ++ fileName) $
-            unlines [ "<html><style type=\"text/css\">",
+            unlines ["<html>",
+                     "<head>",
+                     charEncodingTag,
+                     "<style type=\"text/css\">",
                      "span.lineno { color: white; background: #aaaaaa; border-right: solid white 12px }",
                      if invertOutput
                      then "span.nottickedoff { color: #404040; background: white; font-style: oblique }"
@@ -222,7 +236,10 @@ genHtmlFromMod dest_dir flags tix theFunTotals invertOutput = do
                      else "span.decl { font-weight: bold }",
                      "span.spaces    { background: white }",
                      "</style>",
-                     "<pre>"] ++ addLines content' ++ "\n</pre>\n</html>\n";
+                     "</head>",
+                     "<body>",
+                     "<pre>"] ++ addLines content' ++ "\n</pre>\n</body>\n</html>\n";
+
 
   modSummary `seq` return (modName0,fileName,modSummary)
 
@@ -406,7 +423,7 @@ showTotalSummary modSummary =
    showSummary (expTicked modSummary) (expTotal modSummary) ++
   "</tr>\n"
 
-showSummary :: (Integral t) => t -> t -> String
+showSummary :: (Integral t, Show t) => t -> t -> String
 showSummary ticked total =
                 "<td align=\"right\">" ++ showP (percent ticked total) ++ "</td>" ++
                 "<td>" ++ show ticked ++ "/" ++ show total ++ "</td>" ++

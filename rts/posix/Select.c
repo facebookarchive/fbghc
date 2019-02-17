@@ -2,7 +2,10 @@
  *
  * (c) The GHC Team 1995-2002
  *
- * Support for concurrent non-blocking I/O and thread waiting.
+ * Support for concurrent non-blocking I/O and thread waiting in the
+ * non-threaded RTS.  In the threded RTS, this file is not used at
+ * all, instead we use the IO manager thread implemented in Haskell in
+ * the base package.
  *
  * ---------------------------------------------------------------------------*/
 
@@ -16,6 +19,8 @@
 #include "Capability.h"
 #include "Select.h"
 #include "AwaitEvent.h"
+#include "Stats.h"
+#include "GetTime.h"
 
 # ifdef HAVE_SYS_SELECT_H
 #  include <sys/select.h>
@@ -25,24 +30,56 @@
 #  include <sys/types.h>
 # endif
 
-# ifdef HAVE_SYS_TIME_H
-#  include <sys/time.h>
-# endif
-
 #include <errno.h>
 #include <string.h>
 
-#ifdef HAVE_UNISTD_H
-#include <unistd.h>
-#endif
+#include "Clock.h"
 
 #if !defined(THREADED_RTS)
-/* last timestamp */
-lnat timestamp = 0;
 
-/* 
- * The threaded RTS uses an IO-manager thread in Haskell instead (see GHC.Conc) 
+// The target time for a threadDelay is stored in a one-word quantity
+// in the TSO (tso->block_info.target).  On a 32-bit machine we
+// therefore can't afford to use nanosecond resolution because it
+// would overflow too quickly, so instead we use millisecond
+// resolution.
+
+#if SIZEOF_VOID_P == 4
+#define LowResTimeToTime(t)          (USToTime((t) * 1000))
+#define TimeToLowResTimeRoundDown(t) ((LowResTime)(TimeToUS(t) / 1000))
+#define TimeToLowResTimeRoundUp(t)   ((TimeToUS(t) + 1000-1) / 1000)
+#else
+#define LowResTimeToTime(t) (t)
+#define TimeToLowResTimeRoundDown(t) (t)
+#define TimeToLowResTimeRoundUp(t)   (t)
+#endif
+
+/*
+ * Return the time since the program started, in LowResTime,
+ * rounded down.
  */
+static LowResTime getLowResTimeOfDay(void)
+{
+    return TimeToLowResTimeRoundDown(getProcessElapsedTime());
+}
+
+/*
+ * For a given microsecond delay, return the target time in LowResTime.
+ */
+LowResTime getDelayTarget (HsInt us)
+{
+    Time elapsed;
+    elapsed = getProcessElapsedTime();
+
+    // If the desired target would be larger than the maximum Time,
+    // default to the maximum Time. (#7087)
+    if (us > TimeToUS(TIME_MAX - elapsed)) {
+        return TimeToLowResTimeRoundDown(TIME_MAX);
+    } else {
+        // round up the target time, because we never want to sleep *less*
+        // than the desired amount.
+        return TimeToLowResTimeRoundUp(elapsed + USToTime(us));
+    }
+}
 
 /* There's a clever trick here to avoid problems when the time wraps
  * around.  Since our maximum delay is smaller than 31 bits of ticks
@@ -55,15 +92,14 @@ lnat timestamp = 0;
  * if this is true, then our time has expired.
  * (idea due to Andy Gill).
  */
-static rtsBool
-wakeUpSleepingThreads(lnat ticks)
+static rtsBool wakeUpSleepingThreads (LowResTime now)
 {
     StgTSO *tso;
     rtsBool flag = rtsFalse;
 
     while (sleeping_queue != END_TSO_QUEUE) {
 	tso = sleeping_queue;
-        if (((long)ticks - (long)tso->block_info.target) < 0) {
+        if (((long)now - (long)tso->block_info.target) < 0) {
             break;
         }
 	sleeping_queue = tso->_link;
@@ -107,12 +143,9 @@ awaitEvent(rtsBool wait)
     int maxfd = -1;
     rtsBool select_succeeded = rtsTrue;
     rtsBool unblock_all = rtsFalse;
-    struct timeval tv;
-    lnat min, ticks;
+    struct timeval tv, *ptv;
+    LowResTime now;
 
-    tv.tv_sec  = 0;
-    tv.tv_usec = 0;
-    
     IF_DEBUG(scheduler,
 	     debugBelch("scheduler: checking for threads blocked on I/O");
 	     if (wait) {
@@ -128,21 +161,12 @@ awaitEvent(rtsBool wait)
      */
     do {
 
-      ticks = timestamp = getourtimeofday();
-      if (wakeUpSleepingThreads(ticks)) { 
+      now = getLowResTimeOfDay();
+      if (wakeUpSleepingThreads(now)) {
 	  return;
       }
 
-      if (!wait) {
-	  min = 0;
-      } else if (sleeping_queue != END_TSO_QUEUE) {
-	  min = (sleeping_queue->block_info.target - ticks) 
-	      * RtsFlags.MiscFlags.tickInterval * 1000;
-      } else {
-	  min = 0x7ffffff;
-      }
-
-      /* 
+      /*
        * Collect all of the fd's that we're interested in
        */
       FD_ZERO(&rfd);
@@ -183,12 +207,23 @@ awaitEvent(rtsBool wait)
 	}
       }
 
+      if (!wait) {
+          // just poll
+          tv.tv_sec  = 0;
+          tv.tv_usec = 0;
+          ptv = &tv;
+      } else if (sleeping_queue != END_TSO_QUEUE) {
+          Time min = LowResTimeToTime(sleeping_queue->block_info.target - now);
+          tv.tv_sec  = TimeToSeconds(min);
+          tv.tv_usec = TimeToUS(min) % 1000000;
+          ptv = &tv;
+      } else {
+          ptv = NULL;
+      }
+
       /* Check for any interesting events */
       
-      tv.tv_sec  = min / 1000000;
-      tv.tv_usec = min % 1000000;
-
-      while ((numFound = select(maxfd+1, &rfd, &wfd, NULL, &tv)) < 0) {
+      while ((numFound = select(maxfd+1, &rfd, &wfd, NULL, ptv)) < 0) {
 	  if (errno != EINTR) {
 	    /* Handle bad file descriptors by unblocking all the
 	       waiting threads. Why? Because a thread might have been
@@ -208,12 +243,12 @@ awaitEvent(rtsBool wait)
 	       the RTS won't loop.
 	    */
 	    if ( errno == EBADF ) {
-	      unblock_all = rtsTrue;
-	      break;
+                unblock_all = rtsTrue;
+                break;
 	    } else {
- 	      perror("select");
-	      barf("select failed");
-	    }
+                sysErrorBelch("select");
+                stg_exit(EXIT_FAILURE);
+            }
 	  }
 
 	  /* We got a signal; could be one of ours.  If so, we need
@@ -236,8 +271,8 @@ awaitEvent(rtsBool wait)
 	  
 	  /* check for threads that need waking up 
 	   */
-	  wakeUpSleepingThreads(getourtimeofday());
-	  
+          wakeUpSleepingThreads(getLowResTimeOfDay());
+
 	  /* If new runnable threads have arrived, stop waiting for
 	   * I/O and run them.
 	   */
