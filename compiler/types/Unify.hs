@@ -37,6 +37,7 @@ import Coercion hiding ( getCvSubstEnv )
 import TyCon
 import TyCoRep hiding ( getTvSubstEnv, getCvSubstEnv )
 import FV( FV, fvVarSet, fvVarList )
+import RoughMap
 import Util
 import Pair
 import Outputable
@@ -228,24 +229,19 @@ matchBindFun tvs tv = if tv `elemVarSet` tvs then BindMe else Skolem
 
 -- See Note [Rough match] field in InstEnv
 
-roughMatchTcs :: [Type] -> [Maybe Name]
-roughMatchTcs tys = map rough tys
-  where
-    rough ty
-      | Just (ty', _) <- splitCastTy_maybe ty   = rough ty'
-      | Just (tc,_)   <- splitTyConApp_maybe ty = Just (tyConName tc)
-      | otherwise                               = Nothing
+roughMatchTcs :: [Type] -> [RoughMatchTc]
+roughMatchTcs tys = map typeToRoughMatchTc tys
 
-instanceCantMatch :: [Maybe Name] -> [Maybe Name] -> Bool
+instanceCantMatch :: [RoughMatchTc] -> [RoughMatchTc] -> Bool
 -- (instanceCantMatch tcs1 tcs2) returns True if tcs1 cannot
 -- possibly be instantiated to actual, nor vice versa;
 -- False is non-committal
 instanceCantMatch (mt : ts) (ma : as) = itemCantMatch mt ma || instanceCantMatch ts as
 instanceCantMatch _         _         =  False  -- Safe
 
-itemCantMatch :: Maybe Name -> Maybe Name -> Bool
-itemCantMatch (Just t) (Just a) = t /= a
-itemCantMatch _        _        = False
+itemCantMatch :: RoughMatchTc -> RoughMatchTc -> Bool
+itemCantMatch (KnownTc t) (KnownTc a) = t /= a
+itemCantMatch _           _           = False
 
 
 {-

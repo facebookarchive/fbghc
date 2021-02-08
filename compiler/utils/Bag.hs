@@ -6,7 +6,7 @@
 Bag: an unordered collection with duplicates
 -}
 
-{-# LANGUAGE ScopedTypeVariables, CPP #-}
+{-# LANGUAGE ScopedTypeVariables, CPP, BangPatterns #-}
 
 module Bag (
         Bag, -- abstract type
@@ -33,6 +33,7 @@ import Util
 import MonadUtils
 import Control.Monad
 import Data.Data
+import Data.Semigroup
 import Data.Maybe( mapMaybe )
 import Data.List ( partition, mapAccumL )
 import qualified Data.Foldable as Foldable
@@ -45,6 +46,13 @@ data Bag a
   | UnitBag a
   | TwoBags (Bag a) (Bag a) -- INVARIANT: neither branch is empty
   | ListBag [a]             -- INVARIANT: the list is non-empty
+
+instance Semigroup (Bag a) where
+    (<>) = unionBags
+
+instance Monoid (Bag a) where
+    mappend = (Data.Semigroup.<>)
+    mempty = emptyBag
 
 emptyBag :: Bag a
 emptyBag = EmptyBag
@@ -349,3 +357,11 @@ instance Functor Bag where
 
 instance Foldable.Foldable Bag where
     foldr = foldrBag
+
+    foldl' k = go
+      where
+        go !z EmptyBag       = z
+        go z (UnitBag x)     = k z x
+        go z (TwoBags b1 b2) = let r1 = go z b1 in r1 `seq` go r1 b2
+        go z (ListBag xs)    = foldl' k z xs
+    {-# INLINEABLE foldl' #-}

@@ -32,6 +32,7 @@ import FamInst( injTyVarsOfTypes )
 import InstEnv
 import VarSet
 import VarEnv
+import RoughMap
 import Outputable
 import ErrUtils( Validity(..), allValid )
 import SrcLoc
@@ -206,7 +207,7 @@ improveFromInstEnv inst_env mk_loc pred
                        getClassPredTys_maybe pred
   , let (cls_tvs, cls_fds) = classTvsFds cls
         instances          = classInstances inst_env cls
-        rough_tcs          = roughMatchTcs tys
+        rough_tcs          = KnownTc (className cls) : roughMatchTcs tys
   = [ FDEqn { fd_qtvs = meta_tvs, fd_eqs = eqs
             , fd_pred1 = p_inst, fd_pred2 = pred
             , fd_loc = mk_loc p_inst (getSrcSpan (is_dfun ispec)) }
@@ -227,7 +228,7 @@ improveFromInstEnv _ _ _ = []
 
 improveClsFD :: [TyVar] -> FunDep TyVar    -- One functional dependency from the class
              -> ClsInst                    -- An instance template
-             -> [Type] -> [Maybe Name]     -- Arguments of this (C tys) predicate
+             -> [Type] -> [RoughMatchTc]   -- Arguments of this (C tys) predicate
              -> [([TyCoVar], [TypeEqn])]   -- Empty or singleton
 
 improveClsFD clas_tvs fd
@@ -659,7 +660,7 @@ checkFunDeps inst_envs (ClsInst { is_tvs = qtvs1, is_cls = cls
         --      instance C Int Char Char
         -- The second instance conflicts with the first by *both* fundeps
 
-trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [Maybe Name] -> [Maybe Name]
+trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [RoughMatchTc] -> [RoughMatchTc]
 -- Computing rough_tcs for a particular fundep
 --     class C a b c | a -> b where ...
 -- For each instance .... => C ta tb tc
@@ -668,8 +669,9 @@ trimRoughMatchTcs :: [TyVar] -> FunDep TyVar -> [Maybe Name] -> [Maybe Name]
 -- Hence, we Nothing-ise the tb and tc types right here
 --
 -- Result list is same length as input list, just with more Nothings
-trimRoughMatchTcs clas_tvs (ltvs, _) mb_tcs
-  = zipWith select clas_tvs mb_tcs
+trimRoughMatchTcs _clas_tvs _ [] = panic "trimRoughMatchTcs: nullary [RoughMatchTc]"
+trimRoughMatchTcs clas_tvs (ltvs, _) (cls:mb_tcs)
+  = cls : zipWith select clas_tvs mb_tcs
   where
     select clas_tv mb_tc | clas_tv `elem` ltvs = mb_tc
-                         | otherwise           = Nothing
+                         | otherwise           = OtherTc

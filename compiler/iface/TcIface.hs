@@ -56,6 +56,7 @@ import TysWiredIn
 import Literal
 import Var
 import VarSet
+import RoughMap
 import Name
 import NameEnv
 import NameSet
@@ -184,7 +185,7 @@ typecheckIface iface
                          -- an example where this would cause non-termination.
                          text "Type envt:" <+> ppr (map fst names_w_things)])
         ; return $ ModDetails { md_types     = type_env
-                              , md_insts     = insts
+                              , md_insts     = mkInstEnv insts
                               , md_fam_insts = fam_insts
                               , md_rules     = rules
                               , md_anns      = anns
@@ -390,7 +391,7 @@ typecheckIfacesForMerging mod ifaces tc_env_var =
         exports   <- ifaceExportNames (mi_exports iface)
         complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
         return $ ModDetails { md_types     = type_env
-                            , md_insts     = insts
+                            , md_insts     = mkInstEnv insts
                             , md_fam_insts = fam_insts
                             , md_rules     = rules
                             , md_anns      = anns
@@ -429,7 +430,7 @@ typecheckIfaceForInstantiate nsubst iface =
     exports   <- ifaceExportNames (mi_exports iface)
     complete_sigs <- tcIfaceCompleteSigs (mi_complete_sigs iface)
     return $ ModDetails { md_types     = type_env
-                        , md_insts     = insts
+                        , md_insts     = mkInstEnv insts
                         , md_fam_insts = fam_insts
                         , md_rules     = rules
                         , md_anns      = anns
@@ -1013,13 +1014,17 @@ look at it.
 ************************************************************************
 -}
 
+tcRoughTyCon :: Maybe IfaceTyCon -> RoughMatchTc
+tcRoughTyCon (Just tc) = KnownTc (ifaceTyConName tc)
+tcRoughTyCon Nothing   = OtherTc
+
 tcIfaceInst :: IfaceClsInst -> IfL ClsInst
 tcIfaceInst (IfaceClsInst { ifDFun = dfun_name, ifOFlag = oflag
                           , ifInstCls = cls, ifInstTys = mb_tcs
                           , ifInstOrph = orph })
   = do { dfun <- forkM (text "Dict fun" <+> ppr dfun_name) $
                     fmap tyThingId (tcIfaceImplicit dfun_name)
-       ; let mb_tcs' = map (fmap ifaceTyConName) mb_tcs
+       ; let mb_tcs' = map tcRoughTyCon mb_tcs
        ; return (mkImportedInstance cls mb_tcs' dfun_name dfun oflag orph) }
 
 tcIfaceFamInst :: IfaceFamInst -> IfL FamInst
@@ -1029,7 +1034,7 @@ tcIfaceFamInst (IfaceFamInst { ifFamInstFam = fam, ifFamInstTys = mb_tcs
                      tcIfaceCoAxiom axiom_name
              -- will panic if branched, but that's OK
          ; let axiom'' = toUnbranchedAxiom axiom'
-               mb_tcs' = map (fmap ifaceTyConName) mb_tcs
+               mb_tcs' = map tcRoughTyCon mb_tcs
          ; return (mkImportedFamInst fam mb_tcs' axiom'') }
 
 {-
