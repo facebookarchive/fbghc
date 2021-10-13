@@ -31,7 +31,7 @@ There are two ways to get a source tree:
   Note: cloning GHC from Github requires a special setup. See [Getting a GHC
   repository from Github][7].
 
-  *See the GHC team's working conventions regarding [how to contribute a patch to GHC](http://ghc.haskell.org/trac/ghc/wiki/WorkingConventions/FixingBugs).* First time contributors are encouraged to get started by just sending a Pull Request.
+  *See the GHC team's working conventions regarding [how to contribute a patch to GHC](http://ghc.haskell.org/trac/ghc/wiki/WorkingConventions/FixingBugs).* First-time contributors are encouraged to get started by just sending a Pull Request.
 
 
 Building & Installing
@@ -66,7 +66,7 @@ and Xelatex (only for PDF output).
     $ ./configure --enable-tarballs-autodownload
 
 (NB: **Do you have multiple cores? Be sure to tell that to `make`!** This can
-save you hours of build time depending on your system configuration, and is
+save you hours of build time depending on your system configuration and is
 almost always a win regardless of how many cores you have. As a simple rule,
 you should have about N+1 jobs, where `N` is the amount of cores you have.)
 
@@ -75,8 +75,8 @@ from git.  For source distributions downloaded from [GHC's web site][1],
 this step has already been performed.
 
 These steps give you the default build, which includes everything
-optimised and built in various ways (eg. profiling libs are built).
-It can take a long time.  To customise the build, see the file `HACKING.md`.
+optimized and built-in various ways (eg. profiling libs are built).
+It can take a long time.  To customize the build, see the file `HACKING.md`.
 
 Filing bugs and feature requests
 ================================
