@@ -443,7 +443,7 @@ initHeapProfiling(void)
 
   if (RtsFlags.ProfFlags.doHeapProfile) {
     /* Initialise the log file name */
-    hp_filename = stgMallocBytes(strlen(stem) + 6, "hpFileName");
+    hp_filename = stgMallocBytes(strlen(stem) + 4, "hpFileName");
     sprintf(hp_filename, "%s.hp", stem);
 
     /* open the log file */
