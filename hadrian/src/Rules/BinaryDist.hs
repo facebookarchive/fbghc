@@ -415,7 +415,7 @@ hsc2hsWrapper = do
     : wrapper )
 
 runGhcWrapper :: Action String
-runGhcWrapper = pure $ "exec \"$executablename\" -f \"$exedir/ghc\" ${1+\"$@\"}\n"
+runGhcWrapper = pure $ "exec \"$executablename\" -f \"$exedir/ghc\" -B\"$libdir\" ${1+\"$@\"}\n"
 
 -- | We need to ship ghci executable, which basically just calls ghc with
 -- | --interactive flag.
@@ -490,4 +490,3 @@ createGhcii outDir = do
       [ "#!/bin/sh"
       , "exec \"$(dirname \"$0\")\"/ghc --interactive \"$@\""
       ]
-
