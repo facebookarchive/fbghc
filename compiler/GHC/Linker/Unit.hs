@@ -35,9 +35,29 @@ collectLinkOpts :: DynFlags -> [UnitInfo] -> ([String], [String], [String])
 collectLinkOpts dflags ps =
     (
         concatMap (map ("-l" ++) . unitHsLibs (ghcNameVersion dflags) (ways dflags)) ps,
-        concatMap (map ("-l" ++) . map ST.unpack . unitExtDepLibsSys) ps,
+        reorderLibs $ concatMap (map ("-l" ++) . map ST.unpack . unitExtDepLibsSys) ps,
         concatMap (map ST.unpack . unitLinkerOptions) ps
     )
+
+reorderLibs :: [String] -> [String]
+reorderLibs opts
+  -- There is a bug in glibc < 2.34 which occurs when passing -lc before -lpthread.
+  -- See https://sourceware.org/bugzilla/show_bug.cgi?id=15648
+  --
+  -- This usually manifests with the error:
+  --   lowlevellock.c:28:0: error:
+  --   multiple definitions of `___lll_lock_wait_private'
+  | let (before, after) = break (== libc) opts
+  , not (pthread `elem` before)
+  , pthread `elem` after
+  = before ++ pthread_and_deps ++ after
+  | otherwise
+  = opts
+  where
+    libc = "-lc"
+    pthread = "-lpthread"
+    rt = "-lrt"
+    pthread_and_deps = [ rt, pthread ]
 
 collectArchives :: DynFlags -> UnitInfo -> IO [FilePath]
 collectArchives dflags pc =
